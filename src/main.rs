@@ -2353,6 +2353,10 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                     parse_include_file(value, &mut parsed.include_patterns)
                         .with_context(|| format!("invalid --include-from value '{value}'"))?;
                 }
+                "--files-from" => {
+                    parse_files_from_file(value, &mut parsed.include_patterns)
+                        .with_context(|| format!("invalid --files-from value '{value}'"))?;
+                }
                 "--filter" => {
                     parse_filter_rule(
                         value,
@@ -2453,6 +2457,11 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                     let value = next_value(&mut iter, &option)?;
                     parse_include_file(&value, &mut parsed.include_patterns)
                         .with_context(|| format!("invalid --include-from value '{value}'"))?;
+                }
+                "files-from" => {
+                    let value = next_value(&mut iter, &option)?;
+                    parse_files_from_file(&value, &mut parsed.include_patterns)
+                        .with_context(|| format!("invalid --files-from value '{value}'"))?;
                 }
                 "filter" => {
                     let value = next_value(&mut iter, &option)?;
@@ -2598,6 +2607,22 @@ fn parse_exclude_file(path: &str, excludes: &mut Vec<String>) -> Result<()> {
 
 fn parse_include_file(path: &str, includes: &mut Vec<String>) -> Result<()> {
     parse_pattern_file(path, includes, "include")
+}
+
+fn parse_files_from_file(path: &str, includes: &mut Vec<String>) -> Result<()> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read files-from file {path}"))?;
+    for line in text.lines() {
+        let value = line.trim();
+        if value.is_empty() || value.starts_with('#') {
+            continue;
+        }
+        let normalized = normalize_policy_path(value);
+        if !normalized.is_empty() {
+            includes.push(normalized);
+        }
+    }
+    Ok(())
 }
 
 fn parse_filter_file(
@@ -3375,7 +3400,7 @@ fn normalize_policy_path(value: &str) -> String {
         .trim()
         .trim_matches('/')
         .split('/')
-        .filter(|part| !part.is_empty())
+        .filter(|part| !part.is_empty() && *part != ".")
         .collect::<Vec<_>>()
         .join("/")
 }
@@ -3677,6 +3702,27 @@ mod tests {
                 .any(|p| p == "01_EXPLOITS/*")
         );
         assert!(runtime.include_patterns.iter().any(|p| p == "04_KEYS/**"));
+        fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_supports_files_from() -> Result<()> {
+        let root = temp_dir("files_from");
+        let files_from = root.join("files-from.txt");
+        fs::write(&files_from, "QCOM/a.bin\n./ARM64/b.bin\n#note\n")?;
+
+        let args = CompatCopyArgs {
+            compat_args: vec![
+                "--files-from".into(),
+                files_from.display().to_string(),
+                "source".into(),
+                "dest".into(),
+            ],
+        };
+        let runtime = parse_compat_copy_flags(&args, "rsync")?;
+        assert!(runtime.include_patterns.iter().any(|p| p == "QCOM/a.bin"));
+        assert!(runtime.include_patterns.iter().any(|p| p == "ARM64/b.bin"));
         fs::remove_dir_all(&root).ok();
         Ok(())
     }
