@@ -320,10 +320,47 @@ struct CompatRuntime {
     delete_mode: Option<DeleteMode>,
     inplace: bool,
     exclude_prefixes: Vec<String>,
-    include_patterns: Vec<String>,
-    filter_exclude_patterns: Vec<String>,
+    include_patterns: Vec<PatternSpec>,
+    filter_exclude_patterns: Vec<PatternSpec>,
     accepted_link_flags: Vec<String>,
     unsupported_args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PatternSpec {
+    pattern: String,
+    dir_only: bool,
+}
+
+impl PatternSpec {
+    fn parse(value: &str) -> Option<Self> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let dir_only = trimmed.ends_with('/');
+        let pattern = normalize_policy_path(trimmed);
+        if pattern.is_empty() {
+            return None;
+        }
+
+        Some(Self { pattern, dir_only })
+    }
+
+    fn display_value(&self) -> String {
+        if self.dir_only {
+            format!("{}/", self.pattern)
+        } else {
+            self.pattern.clone()
+        }
+    }
+}
+
+impl std::fmt::Display for PatternSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.display_value())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1864,8 +1901,8 @@ fn build_copy_missing_plan(
 
 fn filter_plan_by_patterns(
     plan: &CopyPlan,
-    include_patterns: &[String],
-    filter_exclude_patterns: &[String],
+    include_patterns: &[PatternSpec],
+    filter_exclude_patterns: &[PatternSpec],
 ) -> CopyPlan {
     if include_patterns.is_empty() && filter_exclude_patterns.is_empty() {
         return plan.clone();
@@ -1878,10 +1915,10 @@ fn filter_plan_by_patterns(
             let include_match = include_patterns.is_empty()
                 || include_patterns
                     .iter()
-                    .any(|pattern| path_pattern_matches(pattern, &item.rel_path));
+                    .any(|pattern| path_pattern_matches_spec(pattern, &item.rel_path));
             let exclude_match = filter_exclude_patterns
                 .iter()
-                .any(|pattern| path_pattern_matches(pattern, &item.rel_path));
+                .any(|pattern| path_pattern_matches_spec(pattern, &item.rel_path));
             include_match && !exclude_match
         })
         .cloned()
@@ -1895,20 +1932,37 @@ fn filter_plan_by_patterns(
     filtered
 }
 
-fn path_pattern_matches(pattern: &str, rel_path: &str) -> bool {
-    let pattern = normalize_policy_path(pattern);
+fn path_pattern_matches_spec(pattern: &PatternSpec, rel_path: &str) -> bool {
+    let dir_only = pattern.dir_only;
+    let pattern = normalize_policy_path(&pattern.pattern);
     let rel_path = normalize_policy_path(rel_path);
     if pattern.is_empty() || rel_path.is_empty() {
         return false;
     }
 
     if !pattern.contains('*') && !pattern.contains('?') {
-        return rel_path == pattern || rel_path.starts_with(&(pattern + "/"));
+        return if dir_only {
+            rel_path.starts_with(&(pattern + "/"))
+        } else {
+            rel_path == pattern || rel_path.starts_with(&(pattern + "/"))
+        };
     }
 
     let pattern_parts: Vec<&str> = pattern.split('/').collect();
     let path_parts: Vec<&str> = rel_path.split('/').collect();
-    match_path_components(&pattern_parts, &path_parts)
+    if dir_only {
+        if path_parts.len() < 2 {
+            return false;
+        }
+        for index in 1..path_parts.len() {
+            if match_path_components(&pattern_parts, &path_parts[..index]) {
+                return true;
+            }
+        }
+        false
+    } else {
+        match_path_components(&pattern_parts, &path_parts)
+    }
 }
 
 fn match_path_components(pattern_parts: &[&str], path_parts: &[&str]) -> bool {
@@ -2147,13 +2201,23 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
     if !runtime.include_patterns.is_empty() {
         eprintln!(
             "[nightindex {command}] include patterns: {}",
-            runtime.include_patterns.join(", ")
+            runtime
+                .include_patterns
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     if !runtime.filter_exclude_patterns.is_empty() {
         eprintln!(
             "[nightindex {command}] filter excludes: {}",
-            runtime.filter_exclude_patterns.join(", ")
+            runtime
+                .filter_exclude_patterns
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
 
@@ -2376,9 +2440,8 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                     &mut unsupported_seen,
                 ),
                 "--include" => {
-                    let normalized = normalize_policy_path(value);
-                    if !normalized.is_empty() {
-                        parsed.include_patterns.push(normalized);
+                    if let Some(pattern) = PatternSpec::parse(value) {
+                        parsed.include_patterns.push(pattern);
                     }
                 }
                 "--include-from" => {
@@ -2420,8 +2483,10 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                 "hash" => parsed.hash = true,
                 "copy-links" | "copy-unsafe-links" | "links" | "perms" | "times" | "group"
                 | "owner" | "progress" | "max-age" | "inplace" => {
-                    if matches!(stripped.as_str(), "copy-links" | "copy-unsafe-links" | "links")
-                    {
+                    if matches!(
+                        stripped.as_str(),
+                        "copy-links" | "copy-unsafe-links" | "links"
+                    ) {
                         parsed.accepted_link_flags.push(option.clone());
                     }
                     if stripped == "inplace" {
@@ -2475,9 +2540,8 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                 }
                 "include" => {
                     let value = next_value(&mut iter, &option)?;
-                    let normalized = normalize_policy_path(&value);
-                    if !normalized.is_empty() {
-                        parsed.include_patterns.push(normalized);
+                    if let Some(pattern) = PatternSpec::parse(&value) {
+                        parsed.include_patterns.push(pattern);
                     }
                 }
                 "include-from" => {
@@ -2581,7 +2645,7 @@ fn push_unsupported_arg(output: &mut Vec<String>, seen: &mut HashSet<String>, va
     }
 }
 
-fn parse_include_file(path: &str, includes: &mut Vec<String>) -> Result<()> {
+fn parse_include_file(path: &str, includes: &mut Vec<PatternSpec>) -> Result<()> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read include file {path}"))?;
     for line in text.lines() {
@@ -2589,9 +2653,8 @@ fn parse_include_file(path: &str, includes: &mut Vec<String>) -> Result<()> {
         if value.is_empty() || value.starts_with('#') {
             continue;
         }
-        let normalized = normalize_policy_path(value);
-        if !normalized.is_empty() {
-            includes.push(normalized);
+        if let Some(pattern) = PatternSpec::parse(value) {
+            includes.push(pattern);
         }
     }
     Ok(())
@@ -2599,8 +2662,8 @@ fn parse_include_file(path: &str, includes: &mut Vec<String>) -> Result<()> {
 
 fn parse_filter_file(
     path: &str,
-    filter_includes: &mut Vec<String>,
-    filter_excludes: &mut Vec<String>,
+    filter_includes: &mut Vec<PatternSpec>,
+    filter_excludes: &mut Vec<PatternSpec>,
     unsupported_args: &mut Vec<String>,
     unsupported_seen: &mut HashSet<String>,
 ) -> Result<()> {
@@ -2624,8 +2687,8 @@ fn parse_filter_file(
 
 fn parse_filter_rule(
     rule: &str,
-    filter_includes: &mut Vec<String>,
-    filter_excludes: &mut Vec<String>,
+    filter_includes: &mut Vec<PatternSpec>,
+    filter_excludes: &mut Vec<PatternSpec>,
     unsupported_args: &mut Vec<String>,
     unsupported_seen: &mut HashSet<String>,
 ) {
@@ -2634,14 +2697,12 @@ fn parse_filter_rule(
         return;
     }
     if let Some(rest) = trimmed.strip_prefix('+') {
-        let pattern = normalize_policy_path(rest);
-        if !pattern.is_empty() {
+        if let Some(pattern) = PatternSpec::parse(rest) {
             filter_includes.push(pattern);
             return;
         }
     } else if let Some(rest) = trimmed.strip_prefix('-') {
-        let pattern = normalize_policy_path(rest);
-        if !pattern.is_empty() {
+        if let Some(pattern) = PatternSpec::parse(rest) {
             filter_excludes.push(pattern);
             return;
         }
@@ -3552,20 +3613,25 @@ mod tests {
             runtime
                 .include_patterns
                 .iter()
-                .any(|item| item == "EXTRA/*.bin")
+                .any(|item| item.display_value() == "EXTRA/*.bin")
         );
-        assert!(runtime.include_patterns.iter().any(|item| item == "QCOM/*"));
         assert!(
             runtime
                 .include_patterns
                 .iter()
-                .any(|item| item == "ARM64/**")
+                .any(|item| item.display_value() == "QCOM/*")
+        );
+        assert!(
+            runtime
+                .include_patterns
+                .iter()
+                .any(|item| item.display_value() == "ARM64/**")
         );
         assert!(
             runtime
                 .filter_exclude_patterns
                 .iter()
-                .any(|item| item == "QCOM/tmp/*")
+                .any(|item| item.display_value() == "QCOM/tmp/*")
         );
         assert_eq!(runtime.source, PathBuf::from("source"));
         assert_eq!(runtime.destination, PathBuf::from("dest"));
@@ -3576,11 +3642,7 @@ mod tests {
     #[test]
     fn parse_compat_copy_flags_ignores_empty_include_values() -> Result<()> {
         let args = CompatCopyArgs {
-            compat_args: vec![
-                "--include=/".into(),
-                "source".into(),
-                "dest".into(),
-            ],
+            compat_args: vec!["--include=/".into(), "source".into(), "dest".into()],
         };
 
         let runtime = parse_compat_copy_flags(&args, "rsync")?;
@@ -3588,6 +3650,67 @@ mod tests {
         assert_eq!(runtime.source, PathBuf::from("source"));
         assert_eq!(runtime.destination, PathBuf::from("dest"));
         Ok(())
+    }
+
+    #[test]
+    fn filter_plan_by_patterns_respects_directory_only_patterns() {
+        let plan = CopyPlan {
+            mode: "copy-missing".to_string(),
+            left_label: "left".to_string(),
+            right_label: "right".to_string(),
+            left_db: None,
+            right_db: None,
+            generated_at_ns: 0,
+            summary: CopyPlanSummary {
+                files_to_copy: 3,
+                bytes_to_copy: 12,
+                left_files: 3,
+                right_files: 0,
+            },
+            items: vec![
+                CopyPlanItem {
+                    rel_path: "QCOM".to_string(),
+                    size: 1,
+                    mtime_ns: 1,
+                    fast_hash: None,
+                },
+                CopyPlanItem {
+                    rel_path: "QCOM/readme.md".to_string(),
+                    size: 2,
+                    mtime_ns: 2,
+                    fast_hash: None,
+                },
+                CopyPlanItem {
+                    rel_path: "QCOM/tools/helper.py".to_string(),
+                    size: 3,
+                    mtime_ns: 3,
+                    fast_hash: None,
+                },
+            ],
+        };
+
+        let filtered = filter_plan_by_patterns(
+            &plan,
+            &[PatternSpec::parse("QCOM/").expect("dir-only pattern")],
+            &[],
+        );
+
+        assert_eq!(filtered.summary.files_to_copy, 2);
+        assert_eq!(filtered.summary.bytes_to_copy, 5);
+        assert_eq!(filtered.items.len(), 2);
+        assert!(
+            filtered
+                .items
+                .iter()
+                .any(|item| item.rel_path == "QCOM/readme.md")
+        );
+        assert!(
+            filtered
+                .items
+                .iter()
+                .any(|item| item.rel_path == "QCOM/tools/helper.py")
+        );
+        assert!(!filtered.items.iter().any(|item| item.rel_path == "QCOM"));
     }
 
     #[test]
@@ -3684,8 +3807,11 @@ mod tests {
 
         let filtered = filter_plan_by_patterns(
             &plan,
-            &["QCOM/**".to_string(), "ARM64/*.bin".to_string()],
-            &["QCOM/tmp/*".to_string()],
+            &[
+                PatternSpec::parse("QCOM/**").expect("pattern"),
+                PatternSpec::parse("ARM64/*.bin").expect("pattern"),
+            ],
+            &[PatternSpec::parse("QCOM/tmp/*").expect("pattern")],
         );
 
         assert_eq!(filtered.summary.files_to_copy, 2);
