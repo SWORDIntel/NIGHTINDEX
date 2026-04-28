@@ -201,7 +201,8 @@ Common mapped options:
   conflict checks are made (helps when timestamps/mtime drift is common)
 - `--max-age <age>` → exclude files older than the specified age; accepts seconds or suffixes like
   `10m`, `2h`, or `7d`
-- Accepted and preserved as symlinks: `--copy-links`, `--copy-unsafe-links`, `--links`
+- `--copy-links`, `--copy-unsafe-links` → dereference symlinks and copy target contents
+- `--links` → preserve symlinks
 - Accepted and ignored: `--perms`, `--times`, `--group`, `--owner`, `--chmod`, `--progress`
 - Accepted compat flag: `--inplace`
 - Still unsupported in direct compat mode: `--rsh`, `--ssh`, `--dry-run-mode`

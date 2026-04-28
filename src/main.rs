@@ -488,6 +488,8 @@ struct CopyRunArgs {
     log: Option<PathBuf>,
     progress_every: usize,
     size_only: bool,
+    hash: bool,
+    copy_links_as_files: bool,
 }
 
 struct DeleteRunArgs {
@@ -2136,6 +2138,8 @@ fn execute_copy_missing_command(args: ExecuteCopyMissingArgs) -> Result<()> {
             log: args.log,
             progress_every: args.progress_every,
             size_only: false,
+            hash: false,
+            copy_links_as_files: false,
         },
         Some(&policy),
     )?;
@@ -2186,6 +2190,8 @@ fn execute_plan_command(args: ExecutePlanArgs) -> Result<()> {
                     log: args.log,
                     progress_every: args.progress_every,
                     size_only: false,
+                    hash: false,
+                    copy_links_as_files: false,
                 },
                 Some(&policy),
             )?;
@@ -2229,6 +2235,8 @@ fn sync_copy_missing_command(args: SyncCopyMissingArgs) -> Result<()> {
             log: args.log,
             progress_every: args.progress_every,
             size_only: false,
+            hash: false,
+            copy_links_as_files: false,
         },
         Some(&policy),
     )?;
@@ -2244,8 +2252,17 @@ fn sync_copy_missing_command(args: SyncCopyMissingArgs) -> Result<()> {
 fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
     let runtime = parse_compat_copy_flags(&args, command)?;
     if !runtime.accepted_link_flags.is_empty() {
+        let dereference_links = runtime
+            .accepted_link_flags
+            .iter()
+            .any(|flag| flag == "--copy-links" || flag == "--copy-unsafe-links");
+        let link_mode = if dereference_links {
+            "dereference symlinks into regular files"
+        } else {
+            "preserve symlinks"
+        };
         eprintln!(
-            "[nightindex {command}] compat symlink flags accepted but no-op for now: {}",
+            "[nightindex {command}] compat symlink flags: {} ({link_mode})",
             runtime.accepted_link_flags.join(", ")
         );
     }
@@ -2389,6 +2406,11 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
             log: runtime.log.clone(),
             progress_every: runtime.progress_every,
             size_only: runtime.size_only,
+            hash: runtime.hash,
+            copy_links_as_files: runtime
+                .accepted_link_flags
+                .iter()
+                .any(|flag| flag == "--copy-links" || flag == "--copy-unsafe-links"),
         },
         Some(&policy),
     )?;
@@ -2954,10 +2976,35 @@ fn run_copy_plan(
         }
 
         let is_symlink = item.file_type == "symlink";
+        let source_metadata_override = if is_symlink && args.copy_links_as_files {
+            Some(
+                fs::metadata(&source_path)
+                    .with_context(|| format!("failed to stat {}", source_path.display()))?,
+            )
+        } else {
+            None
+        };
+        let source_size = source_metadata_override
+            .as_ref()
+            .map_or(item.size, |metadata| metadata.len());
+        let source_mtime_ns = source_metadata_override
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(system_time_to_ns)
+            .unwrap_or(item.mtime_ns);
+        let source_hash = if args.hash {
+            if source_metadata_override.is_some() {
+                Some(blake3_file(&source_path)?)
+            } else {
+                item.fast_hash.clone()
+            }
+        } else {
+            item.fast_hash.clone()
+        };
         let is_overwrite = args.overwrite;
         let mut action = CopyEventAction::Copy;
 
-        if is_symlink {
+        if is_symlink && !args.copy_links_as_files {
             let target = match fs::read_link(&source_path) {
                 Ok(target) => target,
                 Err(err) => {
@@ -3160,16 +3207,16 @@ fn run_copy_plan(
             if let Some(metadata) = destination_metadata.as_ref() {
                 if metadata.is_file() {
                     let mut same_file = false;
-                    if metadata.len() == item.size {
+                    if metadata.len() == source_size {
                         let destination_mtime = metadata
                             .modified()
                             .ok()
                             .and_then(system_time_to_ns)
-                            .filter(|mtime| *mtime == item.mtime_ns);
+                            .filter(|mtime| *mtime == source_mtime_ns);
 
                         if destination_mtime.is_some() {
                             same_file = true;
-                        } else if let Some(expected_hash) = item.fast_hash.as_deref() {
+                        } else if let Some(expected_hash) = source_hash.as_deref() {
                             same_file = blake3_file(&destination_path)? == expected_hash;
                         }
                         if args.size_only {
@@ -3204,12 +3251,12 @@ fn run_copy_plan(
                                 rel_path: item.rel_path.clone(),
                                 action: CopyEventAction::SkipConflict,
                                 existing_bytes,
-                                bytes: metadata.len(),
+                                bytes: source_size,
                                 dry_run: args.dry_run,
                                 overwrite: args.overwrite,
                                 reason: Some(format!(
                                     "destination conflict: existing size {}",
-                                    metadata.len()
+                                    source_size
                                 )),
                             },
                         )?;
@@ -3242,7 +3289,7 @@ fn run_copy_plan(
 
         if args.dry_run {
             copied += 1;
-            copied_bytes += item.size;
+            copied_bytes += source_size;
 
             if (index + 1) % progress_every == 0 {
                 println!("[dry-run] planned={} copied={}", index + 1, copied);
@@ -3255,7 +3302,7 @@ fn run_copy_plan(
                     rel_path: item.rel_path.clone(),
                     action,
                     existing_bytes,
-                    bytes: item.size,
+                    bytes: source_size,
                     dry_run: true,
                     overwrite: args.overwrite,
                     reason: None,
@@ -4278,6 +4325,8 @@ mod tests {
                 log: None,
                 progress_every: 1,
                 size_only: false,
+                hash: false,
+                copy_links_as_files: false,
             },
             None,
         )?;
@@ -4286,6 +4335,73 @@ mod tests {
         let link_target = std::fs::read_link(destination_root.join("payload.link"))?;
         assert_eq!(link_target, PathBuf::from("payload.txt"));
         assert!(destination_root.join("payload.txt").exists());
+
+        fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_links_mode_copies_symlink_target_contents() -> Result<()> {
+        let root = temp_dir("copy_links_mode");
+        let source_root = root.join("source");
+        let destination_root = root.join("destination");
+        fs::create_dir_all(&source_root)?;
+        fs::create_dir_all(&destination_root)?;
+
+        fs::write(source_root.join("payload.txt"), b"payload")?;
+        std::os::unix::fs::symlink("payload.txt", source_root.join("payload.link"))?;
+
+        let source_db = root.join("source.sqlite");
+        let destination_db = root.join("destination.sqlite");
+
+        scan_command(ScanArgs {
+            db: source_db.clone(),
+            label: "left".to_string(),
+            root: source_root.clone(),
+            exclude_prefixes: Vec::new(),
+            policy: None,
+            hash: false,
+        })?;
+        scan_command(ScanArgs {
+            db: destination_db.clone(),
+            label: "right".to_string(),
+            root: destination_root.clone(),
+            exclude_prefixes: Vec::new(),
+            policy: None,
+            hash: false,
+        })?;
+
+        let plan = build_copy_missing_plan(&source_db, &destination_db, "left", "right", None)?;
+        let summary = execute_copy_missing_with_plan(
+            &plan,
+            CopyRunArgs {
+                source_root: source_root.clone(),
+                destination_root: destination_root.clone(),
+                overwrite: false,
+                dry_run: false,
+                stop_on_error: false,
+                log: None,
+                progress_every: 1,
+                size_only: false,
+                hash: false,
+                copy_links_as_files: true,
+            },
+            None,
+        )?;
+
+        assert_eq!(summary.copied_files, 2);
+        let payload_meta = std::fs::metadata(destination_root.join("payload.link"))?;
+        assert!(payload_meta.is_file());
+        assert!(
+            !std::fs::symlink_metadata(destination_root.join("payload.link"))?
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(destination_root.join("payload.link"))?,
+            b"payload"
+        );
 
         fs::remove_dir_all(&root).ok();
         Ok(())
