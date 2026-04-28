@@ -1,153 +1,192 @@
-# Nightindex Command Reference
+# Nightindex
 
-This file documents the proposed final CLI behavior for `nightindex`.
+Nightindex is an indexed, policy-aware replacement workflow for damaged file trees.
+It is designed for rescue/recovery jobs where directory trees are noisy, renamed, and partially
+corrupted but file content can still be matched reliably.
 
-## Core Commands
+The process is:
+1. Scan each side into a SQLite manifest.
+2. Diff/manually compare manifests.
+3. Execute a filtered copy plan.
 
-`scan`
+## Build
 
-Build or refresh a file manifest for one tree.
+```bash
+cargo build --release
+```
+
+Binary output: `target/release/nightindex`.
+
+## Recommended recovery use-case
+
+Example for your scenario: copy from NVMe backup source to `/tank/btrfs-recovery/BUGBOUNTY`, while
+keeping firmware folders out of the initial pass.
 
 ```bash
 nightindex scan \
-  --root /mnt/nvme1tb \
-  --db /var/tmp/nightindex/nvme1tb.sqlite \
-  --label nvme1tb \
+  --root /media/john/DSMIL1 \
+  --label dsmil1 \
+  --db /tank/nightindex/dsmil1.sqlite \
   --exclude 03_FIRMWARE \
-  --policy /home/user/.config/nightindex/policy.yaml
+  --hash
+
+nightindex scan \
+  --root /tank/btrfs-recovery/BUGBOUNTY \
+  --label tank \
+  --db /tank/nightindex/tank.sqlite \
+  --hash
+
+nightindex brief \
+  --left-db /tank/nightindex/dsmil1.sqlite \
+  --right-db /tank/nightindex/tank.sqlite \
+  --left dsmil1 \
+  --right tank
+
+nightindex sync \
+  --left-db /tank/nightindex/dsmil1.sqlite \
+  --right-db /tank/nightindex/tank.sqlite \
+  --left dsmil1 \
+  --right tank \
+  --from /media/john/DSMIL1 \
+  --to /tank/btrfs-recovery/BUGBOUNTY \
+  --write-plan /tank/nightindex/plan-dsmil1-tank.json \
+  --policy /home/john/.config/nightindex/policy.yaml \
+  --progress-every 500 \
+  --log /tank/nightindex/sync-dsmil1-tank.ndjson
 ```
 
-`plan`
+## Commands
 
-Compare two manifests and emit a frozen transfer plan.
+`scan`  
+Build or refresh a tree manifest.
+
+```bash
+nightindex scan --root <path> --label <name> --db <manifest.sqlite> \
+  [--exclude <prefix>] [--policy <policy.yaml|json>] [--hash]
+```
+
+`compare-summary`  
+Quick aggregate diff metrics for two manifests.
+
+```bash
+nightindex compare-summary \
+  --left-db <left.sqlite> \
+  --right-db <right.sqlite> \
+  --left <left_label> \
+  --right <right_label> \
+  [--out-json <file>] [--out-csv <file>]
+```
+
+`brief`  
+Compact aggregate diff with copy estimate.
+
+```bash
+nightindex brief \
+  --left-db <left.sqlite> \
+  --right-db <right.sqlite> \
+  --left <left_label> \
+  --right <right_label> \
+  [--out-json <file>] [--out-csv <file>]
+```
+
+`dossier` (alias: `intel`)  
+Read-only folder identity scoring between two manifests. Useful for matching renamed
+folders and renumbered exploit buckets.
+
+```bash
+nightindex dossier \
+  --left-db <left.sqlite> \
+  --right-db <right.sqlite> \
+  --left <left_label> \
+  --right <right_label> \
+  --top-k 15 \
+  --out-json <file> \
+  --out-csv <file> \
+  [--policy <policy>]
+```
+
+`extcheck`  
+Compare archive-like payload families and extraction potential between two trees.
+
+```bash
+nightindex extcheck \
+  --left-db <left.sqlite> \
+  --right-db <right.sqlite> \
+  --left <left_label> \
+  --right <right_label> \
+  [--out-json <file>] [--out-csv <file>]
+```
+
+`plan-copy-missing` (alias: `plan`)  
+Generate a deterministic copy plan for missing or changed files.
 
 ```bash
 nightindex plan \
-  --left-db /var/tmp/nightindex/nvme1tb.sqlite \
-  --right-db /var/tmp/nightindex/tank.sqlite \
-  --left nvme1tb \
-  --right tank \
-  --out-json /var/tmp/nightindex/plan.json
+  --left-db <left.sqlite> \
+  --right-db <right.sqlite> \
+  --left <left_label> \
+  --right <right_label> \
+  [--policy <policy>] \
+  --out-json /tmp/plan.json
 ```
 
-`execute`
-
-Apply a previously-generated plan.
+`execute`  
+Execute a saved plan.
 
 ```bash
 nightindex execute \
-  --plan /var/tmp/nightindex/plan.json \
-  --from /mnt/nvme1tb \
-  --to /tank/BUGBOUNTY \
-  --overwrite \
-  --progress-every 500 \
-  --log /var/tmp/nightindex/events/2026-04-28.ndjson
+  --plan /tmp/plan.json \
+  --from <left_root> \
+  --to <right_root> \
+  [--overwrite] [--dry-run] [--stop-on-error] \
+  [--progress-every <N>] \
+  [--log /tmp/events.ndjson] \
+  [--policy <policy>]
 ```
 
-`sync`
-
+`sync-copy-missing` (alias: `sync`)  
 Plan and execute in one command.
 
 ```bash
 nightindex sync \
-  --left-db /var/tmp/nightindex/nvme1tb.sqlite \
-  --right-db /var/tmp/nightindex/tank.sqlite \
-  --left nvme1tb \
-  --right tank \
-  --from /mnt/nvme1tb \
-  --to /tank/BUGBOUNTY \
-  --write-plan /var/tmp/nightindex/plan.json \
-  --dry-run \
-  --log /var/tmp/nightindex/events/2026-04-28.ndjson
-```
-`plan` and `sync` are aliases for `plan-copy-missing` and `sync-copy-missing`.
-
-`dossier` (alias `intel`)
-
-Compare folder signatures between two labels and emit top-k identity matches.
-`dossier` is read-only and only reads from the two manifest databases.
-
-```bash
-nightindex dossier \
-  --left-db /var/tmp/nightindex/nvme1tb.sqlite \
-  --right-db /var/tmp/nightindex/tank.sqlite \
-  --left nvme1tb \
-  --right tank \
-  --top-k 5 \
-  --out-json /var/tmp/nightindex/dossier.json \
-  --out-csv /var/tmp/nightindex/dossier.csv
+  --left-db <left.sqlite> \
+  --right-db <right.sqlite> \
+  --left <left_label> \
+  --right <right_label> \
+  --from <left_root> \
+  --to <right_root> \
+  [--overwrite] [--dry-run] [--stop-on-error] \
+  --write-plan <file> \
+  [--policy <policy>] \
+  [--log /tmp/events.ndjson]
 ```
 
-Example JSON output:
+## Policy format
 
-```json
-{
-  "left_db":"/var/tmp/nightindex/nvme1tb.sqlite",
-  "right_db":"/var/tmp/nightindex/tank.sqlite",
-  "left_label":"nvme1tb",
-  "right_label":"tank",
-  "top_k":5,
-  "left_folder_count":12,
-  "right_folder_count":9,
-  "candidates":[
-    {
-      "left_folder":"archives/2023",
-      "right_folder":"archives-2023",
-      "overlap_weight":12.7,
-      "left_weight":18.25,
-      "right_weight":14.55,
-      "overlap_ratio":0.437,
-      "shared_rel_file_count":8
-    }
-  ]
-}
-```
-
-Example CSV output:
-
-```text
-left_folder,right_folder,overlap_weight,left_weight,right_weight,overlap_ratio,shared_rel_file_count
-archives/2023,archives-2023,12.7000,18.2500,14.5500,0.437000,8
-```
-
-`scan` supports an optional `--policy` file to define ignore rules. The policy parser accepts
-YAML files (`.yml`/`.yaml`) and JSON/JSON5-like files (`.json`/`.json5`).
-
-Example YAML policy:
+`--policy` accepts YAML (`.yml/.yaml`), JSON, or JSON5-like files.
 
 ```yaml
-exclude_prefixes:
-  - "03_FIRMWARE"
-  - "tmp/cache"
+directory_prefixes:
+  - 03_FIRMWARE
+  - tmp/cache
 folder_name_additions:
-  - "cache"
-  - "lost+found"
+  - cache
+  - Recovered Files
 subtree_overrides:
-  "tmp/cache":
-    - "node_modules"
-    - ".cache"
+  tmp:
+    - .cache
+    - node_modules
 ```
 
-Example JSON/JSON5-like policy:
+`directory_prefixes` (a.k.a. `paths`, `prefix`, `exclude_prefixes`) are relative path prefixes.
 
-```json
-{
-  "exclude_prefixes": ["03_FIRMWARE", "tmp/cache"],
-  "folder_name_additions": ["cache", "lost+found"],
-  "subtree_overrides": {
-    "tmp/cache": ["node_modules", ".cache"]
-  }
-}
-```
+`folder_name_additions` (a.k.a. `tokens`, `noise_dirs`, `folder_overrides`, `ignore_tokens`)
+extends the noise-folder set anywhere in tree.
 
-`--policy` is also available on `plan`/`sync`/`execute` pipelines so the same per-subtree exclusions
-can be applied to candidate generation and copy execution.
+`subtree_overrides` (a.k.a. `overrides`, `subtree_rules`) adds noise folders only when traversal is
+already inside that subtree prefix.
 
-`exclude_prefixes` applies to relative path prefixes.
-`folder_name_additions` applies to matching folder names anywhere in a subtree when a folder is in the
-default noise set.
-
-Default noise folders:
+### Default noise folders
 
 - `.cache`
 - `.DS_Store`
@@ -165,32 +204,36 @@ Default noise folders:
 - `Thumbs.db`
 - `tmp`
 - `temp`
-- `Node_modules`
 
-If `--policy` is omitted, policy-based filtering is disabled except for explicit `--exclude` prefixes.
-CLI default using `--exclude` only.
+## Event logs
 
-## Optional Utilities
-
-- `compare-summary`: prints and optionally writes aggregate diff metrics.
-- `dossier`/`intel`: computes per-folder identity scores and outputs top-k folder rename candidates.
-## Event Log
-
-Execution logging uses NDJSON. With `--log`, one JSON object is written per line:
+Execution logging uses NDJSON (`schema_version:2`) when `--log` is provided:
 
 ```json
-{"schema_version":2,"rel_path":"03_FIRMWARE/akita_dump/vendor_boot_a.img","action":"copy","existing_bytes":null,"bytes":12345,"dry_run":false,"overwrite":false,"reason":null}
-{"schema_version":2,"rel_path":"03_FIRMWARE/legacy.bin","action":"skip_conflict","existing_bytes":4096,"bytes":4096,"dry_run":false,"overwrite":false,"reason":"destination conflict: existing size 4096"}
-{"schema_version":2,"rel_path":"03_FIRMWARE/missing.bin","action":"source_missing","existing_bytes":null,"bytes":0,"dry_run":false,"overwrite":false,"reason":"missing: /mnt/nvme1tb/03_FIRMWARE/missing.bin"}
+{"schema_version":2,"rel_path":"BUGBOUNTY/01_EXPLOITS/note.txt","action":"copy","existing_bytes":null,"bytes":1234,"dry_run":false,"overwrite":false,"reason":null}
+{"schema_version":2,"rel_path":"BUGBOUNTY/old.bin","action":"skip_conflict","existing_bytes":4096,"bytes":4096,"dry_run":false,"overwrite":false,"reason":"destination conflict: existing size 4096"}
+{"schema_version":2,"rel_path":"03_FIRMWARE/legacy.img","action":"source_missing","existing_bytes":null,"bytes":0,"dry_run":false,"overwrite":false,"reason":"source file missing"}
 ```
 
-`action` is one of:
-`source_missing`, `skip_existing`, `skip_conflict`, `copy`, `overwrite`, `fail`.
+`action` values:
 
-`bytes` is the bytes copied for `copy`/`overwrite`, destination bytes for conflict events, else `0`.
+- `source_missing`
+- `skip_existing`
+- `skip_conflict`
+- `copy`
+- `overwrite`
+- `fail`
 
-`reason` is optional and should describe the condition for non-success actions.
+Each execute/sync run prints one final summary JSON object with:
 
-Every `execute`/`sync` run should still print a final summary JSON object to stdout
-with counts such as `planned_files`, `copied_files`, `skipped_existing`,
-`skipped_conflict`, `failed_files`, and `copied_bytes`.
+- `mode`
+- `dry_run`
+- `overwrite`
+- `planned_files`
+- `copied_files`
+- `skipped_existing`
+- `skipped_conflict`
+- `overwritten_files`
+- `missing_source`
+- `failed_files`
+- `copied_bytes`
