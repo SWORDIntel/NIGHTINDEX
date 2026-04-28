@@ -310,6 +310,8 @@ struct CompatRuntime {
     source: PathBuf,
     destination: PathBuf,
     overwrite: bool,
+    ignore_existing: bool,
+    update_only: bool,
     dry_run: bool,
     stop_on_error: bool,
     policy: Option<PathBuf>,
@@ -431,6 +433,8 @@ struct CopyRunArgs {
     source_root: PathBuf,
     destination_root: PathBuf,
     overwrite: bool,
+    ignore_existing: bool,
+    update_only: bool,
     dry_run: bool,
     stop_on_error: bool,
     log: Option<PathBuf>,
@@ -1790,6 +1794,66 @@ fn build_copy_missing_plan(
         right_map.insert(row.rel_path.clone(), row);
     }
 
+    build_copy_plan_from_maps(
+        &left_map,
+        &right_map,
+        left_db,
+        right_db,
+        left,
+        right,
+        policy,
+        "copy-missing",
+        false,
+    )
+}
+
+fn build_copy_sync_plan(
+    left_db: &Path,
+    right_db: &Path,
+    left: &str,
+    right: &str,
+    policy: Option<&ExcludePolicy>,
+) -> Result<CopyPlan> {
+    let left_conn = open_db(left_db)?;
+    let right_conn = open_db(right_db)?;
+
+    let left_rows = load_label(&left_conn, left)?;
+    let right_rows = load_label(&right_conn, right)?;
+
+    let mut left_map: HashMap<String, FileRecord> = HashMap::with_capacity(left_rows.len());
+    let mut right_map: HashMap<String, FileRecord> = HashMap::with_capacity(right_rows.len());
+
+    for row in left_rows {
+        left_map.insert(row.rel_path.clone(), row);
+    }
+    for row in right_rows {
+        right_map.insert(row.rel_path.clone(), row);
+    }
+
+    build_copy_plan_from_maps(
+        &left_map,
+        &right_map,
+        left_db,
+        right_db,
+        left,
+        right,
+        policy,
+        "copy-sync",
+        true,
+    )
+}
+
+fn build_copy_plan_from_maps(
+    left_map: &HashMap<String, FileRecord>,
+    right_map: &HashMap<String, FileRecord>,
+    left_db: &Path,
+    right_db: &Path,
+    left: &str,
+    right: &str,
+    policy: Option<&ExcludePolicy>,
+    mode: &str,
+    include_changed: bool,
+) -> Result<CopyPlan> {
     let mut items = Vec::new();
     let mut bytes_to_copy = 0u64;
     let mut rel_paths: Vec<&String> = left_map.keys().collect();
@@ -1801,12 +1865,17 @@ fn build_copy_missing_plan(
                 continue;
             }
         }
-        if right_map.contains_key(rel_path) {
-            continue;
-        }
         let row = left_map
             .get(rel_path)
             .expect("left_map key list and map should stay aligned");
+        let include = match right_map.get(rel_path) {
+            None => true,
+            Some(existing) if include_changed => !file_records_equivalent(row, existing),
+            Some(_) => false,
+        };
+        if !include {
+            continue;
+        }
         bytes_to_copy += row.size;
         items.push(CopyPlanItem {
             rel_path: row.rel_path.clone(),
@@ -1817,7 +1886,7 @@ fn build_copy_missing_plan(
     }
 
     Ok(CopyPlan {
-        mode: "copy-missing".to_string(),
+        mode: mode.to_string(),
         left_label: left.to_string(),
         right_label: right.to_string(),
         left_db: Some(left_db.display().to_string()),
@@ -1831,6 +1900,19 @@ fn build_copy_missing_plan(
         },
         items,
     })
+}
+
+fn file_records_equivalent(left: &FileRecord, right: &FileRecord) -> bool {
+    if left.size != right.size {
+        return false;
+    }
+    if left.mtime_ns == right.mtime_ns {
+        return true;
+    }
+    match (left.fast_hash.as_deref(), right.fast_hash.as_deref()) {
+        (Some(left_hash), Some(right_hash)) => left_hash == right_hash,
+        _ => false,
+    }
 }
 
 fn plan_copy_missing_command(args: PlanCopyMissingArgs) -> Result<()> {
@@ -1870,6 +1952,8 @@ fn execute_copy_missing_command(args: ExecuteCopyMissingArgs) -> Result<()> {
             source_root,
             destination_root,
             overwrite: args.overwrite,
+            ignore_existing: false,
+            update_only: false,
             dry_run: args.dry_run,
             stop_on_error: args.stop_on_error,
             log: args.log,
@@ -1892,7 +1976,7 @@ fn execute_copy_missing_with_plan(
     args: CopyRunArgs,
     policy: Option<&ExcludePolicy>,
 ) -> Result<CopyExecutionSummary> {
-    if plan.mode != "copy-missing" {
+    if plan.mode != "copy-missing" && plan.mode != "copy-sync" {
         eprintln!(
             "[warn] executing plan with mode '{}' using copy-missing behavior",
             plan.mode
@@ -1910,7 +1994,7 @@ fn execute_plan_command(args: ExecutePlanArgs) -> Result<()> {
     let policy = load_exclude_policy(args.policy.as_deref())?;
 
     match plan.mode.as_str() {
-        "copy-missing" => {
+        "copy-missing" | "copy-sync" => {
             let source_root = resolve_copy_source_root(&args.from, "source")?;
             let destination_root = resolve_copy_destination_root(&args.to)?;
             let started_at_ns = now_ns()?;
@@ -1920,6 +2004,8 @@ fn execute_plan_command(args: ExecutePlanArgs) -> Result<()> {
                     source_root,
                     destination_root,
                     overwrite: args.overwrite,
+                    ignore_existing: false,
+                    update_only: false,
                     dry_run: args.dry_run,
                     stop_on_error: args.stop_on_error,
                     log: args.log,
@@ -1963,6 +2049,8 @@ fn sync_copy_missing_command(args: SyncCopyMissingArgs) -> Result<()> {
             source_root,
             destination_root,
             overwrite: args.overwrite,
+            ignore_existing: false,
+            update_only: false,
             dry_run: args.dry_run,
             stop_on_error: args.stop_on_error,
             log: args.log,
@@ -2044,7 +2132,7 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
         policy: runtime.policy.clone(),
         hash: runtime.hash,
     })?;
-    let plan = build_copy_missing_plan(
+    let plan = build_copy_sync_plan(
         &left_db,
         &right_db,
         &left_label,
@@ -2058,6 +2146,8 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
             source_root,
             destination_root,
             overwrite: runtime.overwrite,
+            ignore_existing: runtime.ignore_existing,
+            update_only: runtime.update_only,
             dry_run: runtime.dry_run,
             stop_on_error: runtime.stop_on_error,
             log: runtime.log,
@@ -2080,7 +2170,9 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
     let mut parsed = CompatRuntime {
         source: PathBuf::new(),
         destination: PathBuf::new(),
-        overwrite: false,
+        overwrite: true,
+        ignore_existing: false,
+        update_only: false,
         dry_run: false,
         stop_on_error: false,
         policy: None,
@@ -2117,7 +2209,8 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
 
             match key.as_str() {
                 "--dry-run" => parsed.dry_run = true,
-                "--ignore-existing" | "--update" => parsed.overwrite = false,
+                "--ignore-existing" => parsed.ignore_existing = true,
+                "--update" => parsed.update_only = true,
                 "--checksum" | "--hash" => parsed.hash = true,
                 "--copy-links"
                 | "--copy-unsafe-links"
@@ -2172,7 +2265,8 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
 
             match stripped.as_str() {
                 "dry-run" => parsed.dry_run = true,
-                "ignore-existing" | "update" => parsed.overwrite = false,
+                "ignore-existing" => parsed.ignore_existing = true,
+                "update" => parsed.update_only = true,
                 "checksum" => parsed.hash = true,
                 "overwrite" => parsed.overwrite = true,
                 "hash" => parsed.hash = true,
@@ -2221,7 +2315,7 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
             continue;
         }
 
-        if arg.starts_with('-') {
+        if arg.starts_with('-') && arg != "-" {
             let short = &arg[1..];
             let mut index = 0usize;
             while index < short.len() {
@@ -2247,7 +2341,7 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
 
                 match flag {
                     'n' => parsed.dry_run = true,
-                    'u' => parsed.overwrite = false,
+                    'u' => parsed.update_only = true,
                     'c' => parsed.hash = true,
                     'a' | 'r' | 'v' | 'l' | 't' | 'p' | 'h' | 'H' | 'L' | 'z' | 'R' | 'x' | 'q'
                     | 'I' | 'S' | 'k' | 'm' | 'D' | 'o' | 'g' | 'P' => {}
@@ -2468,6 +2562,52 @@ fn run_copy_plan(
                             },
                         )?;
                         continue;
+                    }
+
+                    if args.ignore_existing {
+                        skipped_existing += 1;
+                        write_event(
+                            &mut log,
+                            &CopyEvent {
+                                schema_version: 2,
+                                rel_path: item.rel_path.clone(),
+                                action: CopyEventAction::SkipExisting,
+                                existing_bytes,
+                                bytes: 0,
+                                dry_run: args.dry_run,
+                                overwrite: args.overwrite,
+                                reason: Some(
+                                    "destination exists and --ignore-existing is active"
+                                        .to_string(),
+                                ),
+                            },
+                        )?;
+                        continue;
+                    }
+
+                    if args.update_only {
+                        let destination_mtime =
+                            metadata.modified().ok().and_then(system_time_to_ns);
+                        if destination_mtime.is_some_and(|mtime| mtime >= item.mtime_ns) {
+                            skipped_existing += 1;
+                            write_event(
+                                &mut log,
+                                &CopyEvent {
+                                    schema_version: 2,
+                                    rel_path: item.rel_path.clone(),
+                                    action: CopyEventAction::SkipExisting,
+                                    existing_bytes,
+                                    bytes: 0,
+                                    dry_run: args.dry_run,
+                                    overwrite: args.overwrite,
+                                    reason: Some(
+                                        "destination is newer or same age under --update"
+                                            .to_string(),
+                                    ),
+                                },
+                            )?;
+                            continue;
+                        }
                     }
 
                     if !is_overwrite {
@@ -2930,7 +3070,9 @@ mod tests {
         assert!(runtime.dry_run);
         assert!(runtime.hash);
         assert!(runtime.size_only);
-        assert!(!runtime.overwrite);
+        assert!(runtime.overwrite);
+        assert!(!runtime.ignore_existing);
+        assert!(runtime.update_only);
         assert_eq!(runtime.progress_every, 42);
         assert_eq!(
             runtime.log,
@@ -3009,8 +3151,52 @@ mod tests {
 
         let runtime = parse_compat_copy_flags(&args, "rsync")?;
         assert!(runtime.stop_on_error);
-        assert!(runtime.unsupported_args.iter().any(|item| item == "--inplace"));
+        assert!(
+            runtime
+                .unsupported_args
+                .iter()
+                .any(|item| item == "--inplace")
+        );
         assert_eq!(runtime.source, PathBuf::from("source"));
+        assert_eq!(runtime.destination, PathBuf::from("dest"));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_ignore_existing_distinct_from_update() -> Result<()> {
+        let args = CompatCopyArgs {
+            compat_args: vec!["--ignore-existing".into(), "source".into(), "dest".into()],
+        };
+
+        let runtime = parse_compat_copy_flags(&args, "rsync")?;
+        assert!(runtime.overwrite);
+        assert!(runtime.ignore_existing);
+        assert!(!runtime.update_only);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_default_overwrites_changed_files() -> Result<()> {
+        let args = CompatCopyArgs {
+            compat_args: vec!["source".into(), "dest".into()],
+        };
+
+        let runtime = parse_compat_copy_flags(&args, "rclone")?;
+        assert!(runtime.overwrite);
+        assert!(!runtime.ignore_existing);
+        assert!(!runtime.update_only);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_treat_dash_as_path() -> Result<()> {
+        let args = CompatCopyArgs {
+            compat_args: vec!["-n".into(), "-".into(), "dest".into()],
+        };
+
+        let runtime = parse_compat_copy_flags(&args, "rsync")?;
+        assert!(runtime.dry_run);
+        assert_eq!(runtime.source, PathBuf::from("-"));
         assert_eq!(runtime.destination, PathBuf::from("dest"));
         Ok(())
     }
@@ -3078,6 +3264,60 @@ mod tests {
 
         let all = build_dossier_matches(&left_signatures, &right_signatures, 5);
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn build_copy_plan_from_maps_includes_changed_files_for_sync_mode() -> Result<()> {
+        let mut left_map = HashMap::new();
+        let mut right_map = HashMap::new();
+
+        left_map.insert(
+            "file.txt".to_string(),
+            FileRecord {
+                rel_path: "file.txt".to_string(),
+                size: 10,
+                mtime_ns: 200,
+                fast_hash: Some("left-hash".to_string()),
+            },
+        );
+        right_map.insert(
+            "file.txt".to_string(),
+            FileRecord {
+                rel_path: "file.txt".to_string(),
+                size: 10,
+                mtime_ns: 100,
+                fast_hash: Some("right-hash".to_string()),
+            },
+        );
+
+        let plan = build_copy_plan_from_maps(
+            &left_map,
+            &right_map,
+            Path::new("/tmp/left.sqlite"),
+            Path::new("/tmp/right.sqlite"),
+            "left",
+            "right",
+            None,
+            "copy-sync",
+            true,
+        )?;
+        assert_eq!(plan.mode, "copy-sync");
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].rel_path, "file.txt");
+
+        let missing_only = build_copy_plan_from_maps(
+            &left_map,
+            &right_map,
+            Path::new("/tmp/left.sqlite"),
+            Path::new("/tmp/right.sqlite"),
+            "left",
+            "right",
+            None,
+            "copy-missing",
+            false,
+        )?;
+        assert!(missing_only.items.is_empty());
+        Ok(())
     }
 
     #[test]
