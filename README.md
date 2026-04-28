@@ -199,6 +199,7 @@ Compatibility matrix:
 | mapped | `--checksum`, `-c` | enable hash-based matching |
 | mapped | `--exclude`, `--exclude-from` | imported into scan policy excludes |
 | mapped | `--include`, `--include-from` | include allowlist patterns applied to planned copy items |
+| mapped | `--files-from` | newline-delimited relative paths added to the include allowlist |
 | mapped subset | `--filter`, `--filter-from` | `+` rules add allowlist patterns, `-` rules add blocklist patterns |
 | mapped | `--log-file`, `--log`, `--policy`, `--progress-every` | map to compat runtime controls |
 | mapped | `--size-only`, `--ignore-times` | treat same-size files as equivalent during conflict checks |
