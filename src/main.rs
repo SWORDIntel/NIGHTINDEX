@@ -2114,6 +2114,7 @@ fn sync_copy_missing_command(args: SyncCopyMissingArgs) -> Result<()> {
 }
 
 fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
+    let total_started = now_ns()?;
     let runtime = parse_compat_copy_flags(&args, command)?;
     if !runtime.unsupported_args.is_empty() {
         eprintln!(
@@ -2175,6 +2176,7 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
         runtime.size_only
     );
 
+    let scan_started = now_ns()?;
     scan_command(ScanArgs {
         db: left_db.clone(),
         label: left_label.clone(),
@@ -2191,6 +2193,13 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
         policy: runtime.policy.clone(),
         hash: runtime.hash,
     })?;
+    let scan_elapsed = now_ns()? - scan_started;
+    eprintln!(
+        "[nightindex {command}] scan phase completed in {}",
+        format_duration_ns(scan_elapsed)
+    );
+
+    let plan_started = now_ns()?;
     let plan = build_copy_sync_plan(
         &left_db,
         &right_db,
@@ -2198,13 +2207,16 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
         &right_label,
         Some(&policy),
     )?;
+    let plan_elapsed = now_ns()? - plan_started;
     eprintln!(
-        "[nightindex {command}] plan mode={} files={} bytes={}",
+        "[nightindex {command}] plan mode={} files={} bytes={} in {}",
         plan.mode,
         plan.summary.files_to_copy,
-        format_bytes(plan.summary.bytes_to_copy)
+        format_bytes(plan.summary.bytes_to_copy),
+        format_duration_ns(plan_elapsed)
     );
 
+    let copy_started = now_ns()?;
     let summary = execute_copy_missing_with_plan(
         &plan,
         CopyRunArgs {
@@ -2221,19 +2233,22 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
         },
         Some(&policy),
     )?;
+    let copy_elapsed = now_ns()? - copy_started;
     let cleanup = fs::remove_dir_all(&work_root);
     if let Err(err) = cleanup {
         eprintln!("[nightindex {command}] cleanup warning: {err}");
     }
 
     eprintln!(
-        "[nightindex {command}] done copied={} overwritten={} skipped_existing={} skipped_conflict={} failed={} bytes={}",
+        "[nightindex {command}] done copied={} overwritten={} skipped_existing={} skipped_conflict={} failed={} bytes={} copy_time={} total_time={}",
         summary.copied_files,
         summary.overwritten_files,
         summary.skipped_existing,
         summary.skipped_conflict,
         summary.failed_files,
-        format_bytes(summary.copied_bytes)
+        format_bytes(summary.copied_bytes),
+        format_duration_ns(copy_elapsed),
+        format_duration_ns(now_ns()? - total_started)
     );
 
     let json = serde_json::to_string_pretty(&summary)?;
@@ -2258,6 +2273,7 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
         exclude_prefixes: Vec::new(),
         unsupported_args: Vec::new(),
     };
+    let mut unsupported_seen: HashSet<String> = HashSet::new();
     let mut positionals: Vec<String> = Vec::new();
 
     let mut iter = args.compat_args.clone().into_iter();
@@ -2318,13 +2334,25 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                     parsed.size_only = true;
                 }
                 "--delete" | "--delete-before" | "--delete-during" | "--delete-after" => {
-                    parsed.unsupported_args.push(format!("{key}"));
+                    push_unsupported_arg(
+                        &mut parsed.unsupported_args,
+                        &mut unsupported_seen,
+                        format!("{key}"),
+                    );
                 }
                 "--filter" | "--rsh" | "--ssh" | "--dry-run-mode" | "--include"
                 | "--include-from" => {
-                    parsed.unsupported_args.push(format!("{key}={value}"));
+                    push_unsupported_arg(
+                        &mut parsed.unsupported_args,
+                        &mut unsupported_seen,
+                        format!("{key}={value}"),
+                    );
                 }
-                _ => parsed.unsupported_args.push(format!("{key}={value}")),
+                _ => push_unsupported_arg(
+                    &mut parsed.unsupported_args,
+                    &mut unsupported_seen,
+                    format!("{key}={value}"),
+                ),
             }
             continue;
         }
@@ -2374,18 +2402,32 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                         .max(1);
                 }
                 "delete" | "delete-before" | "delete-during" | "delete-after" => {
-                    parsed.unsupported_args.push(format!("--{stripped}"));
+                    push_unsupported_arg(
+                        &mut parsed.unsupported_args,
+                        &mut unsupported_seen,
+                        format!("--{stripped}"),
+                    );
                 }
                 "rsh" | "ssh" | "filter" | "include" | "include-from" => {
                     let value = next_value(&mut iter, &option)?;
-                    parsed
-                        .unsupported_args
-                        .push(format!("--{stripped}={value}"));
+                    push_unsupported_arg(
+                        &mut parsed.unsupported_args,
+                        &mut unsupported_seen,
+                        format!("--{stripped}={value}"),
+                    );
                 }
                 "dry-run-mode" => {
-                    parsed.unsupported_args.push(format!("--{stripped}"));
+                    push_unsupported_arg(
+                        &mut parsed.unsupported_args,
+                        &mut unsupported_seen,
+                        format!("--{stripped}"),
+                    );
                 }
-                _ => parsed.unsupported_args.push(format!("--{stripped}")),
+                _ => push_unsupported_arg(
+                    &mut parsed.unsupported_args,
+                    &mut unsupported_seen,
+                    format!("--{stripped}"),
+                ),
             }
             continue;
         }
@@ -2407,9 +2449,21 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                         next_value(&mut iter, &format!("-{flag}"))?
                     };
                     match flag {
-                        'e' => parsed.unsupported_args.push(format!("--rsh={value}")),
-                        'f' => parsed.unsupported_args.push(format!("--filter={value}")),
-                        _ => parsed.unsupported_args.push(format!("-{flag}={value}")),
+                        'e' => push_unsupported_arg(
+                            &mut parsed.unsupported_args,
+                            &mut unsupported_seen,
+                            format!("--rsh={value}"),
+                        ),
+                        'f' => push_unsupported_arg(
+                            &mut parsed.unsupported_args,
+                            &mut unsupported_seen,
+                            format!("--filter={value}"),
+                        ),
+                        _ => push_unsupported_arg(
+                            &mut parsed.unsupported_args,
+                            &mut unsupported_seen,
+                            format!("-{flag}={value}"),
+                        ),
                     }
                     continue;
                 }
@@ -2420,7 +2474,11 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                     'c' => parsed.hash = true,
                     'a' | 'r' | 'v' | 'l' | 't' | 'p' | 'h' | 'H' | 'L' | 'z' | 'R' | 'x' | 'q'
                     | 'I' | 'S' | 'k' | 'm' | 'D' | 'o' | 'g' | 'P' => {}
-                    _ => parsed.unsupported_args.push(format!("-{flag}")),
+                    _ => push_unsupported_arg(
+                        &mut parsed.unsupported_args,
+                        &mut unsupported_seen,
+                        format!("-{flag}"),
+                    ),
                 }
             }
             continue;
@@ -2436,13 +2494,21 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
     parsed.destination = PathBuf::from(positionals[1].clone());
     if positionals.len() > 2 {
         for extra in &positionals[2..] {
-            parsed
-                .unsupported_args
-                .push(format!("extra positional: {extra}"));
+            push_unsupported_arg(
+                &mut parsed.unsupported_args,
+                &mut unsupported_seen,
+                format!("extra positional: {extra}"),
+            );
         }
     }
     parsed.progress_every = parsed.progress_every.max(1);
     Ok(parsed)
+}
+
+fn push_unsupported_arg(output: &mut Vec<String>, seen: &mut HashSet<String>, value: String) {
+    if seen.insert(value.clone()) {
+        output.push(value);
+    }
 }
 
 fn parse_exclude_file(path: &str, excludes: &mut Vec<String>) -> Result<()> {
@@ -2507,6 +2573,19 @@ fn format_bytes(bytes: u64) -> String {
         format!("{bytes} {}", UNITS[unit_index])
     } else {
         format!("{value:.2} {}", UNITS[unit_index])
+    }
+}
+
+fn format_duration_ns(duration_ns: i64) -> String {
+    let secs = duration_ns as f64 / 1_000_000_000.0;
+    if secs < 1.0 {
+        format!("{:.0} ms", secs * 1000.0)
+    } else if secs < 60.0 {
+        format!("{secs:.2} s")
+    } else {
+        let minutes = (secs / 60.0).floor() as u64;
+        let rem = secs - (minutes as f64 * 60.0);
+        format!("{minutes}m {rem:.1}s")
     }
 }
 
@@ -3286,6 +3365,34 @@ mod tests {
         );
         assert_eq!(runtime.source, PathBuf::from("source"));
         assert_eq!(runtime.destination, PathBuf::from("dest"));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_dedupes_unsupported_flags() -> Result<()> {
+        let args = CompatCopyArgs {
+            compat_args: vec![
+                "--delete".into(),
+                "--delete".into(),
+                "-QQ".into(),
+                "source".into(),
+                "dest".into(),
+            ],
+        };
+
+        let runtime = parse_compat_copy_flags(&args, "rsync")?;
+        let delete_count = runtime
+            .unsupported_args
+            .iter()
+            .filter(|item| item.as_str() == "--delete")
+            .count();
+        let q_count = runtime
+            .unsupported_args
+            .iter()
+            .filter(|item| item.as_str() == "-Q")
+            .count();
+        assert_eq!(delete_count, 1);
+        assert_eq!(q_count, 1);
         Ok(())
     }
 
