@@ -193,6 +193,7 @@ Common mapped options:
 - `--stop-on-error` → fail fast on the first copy error  
 - `--exclude <pattern>` and `--exclude-from <file>` → import excludes into scan policy  
 - `--delete`, `--delete-before`, `--delete-during`, `--delete-after` → delete destination-only files  
+- `--delete-excluded` → delete destination files matched by exclude policy as well
 - `--include <pattern>`, `--include-from <file>` → include allowlist patterns  
 - `--filter <rule>`, `--filter-from <file>` → `+` rules add allowlist patterns and `-` rules add blocklist patterns  
 - `--log-file <path>`, `--log <path>` and `--policy <path>`  

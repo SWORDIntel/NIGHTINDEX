@@ -318,6 +318,7 @@ struct CompatRuntime {
     progress_every: usize,
     size_only: bool,
     delete_mode: Option<DeleteMode>,
+    delete_excluded: bool,
     inplace: bool,
     exclude_prefixes: Vec<String>,
     include_patterns: Vec<PatternSpec>,
@@ -498,6 +499,7 @@ struct DeleteRunArgs {
     stop_on_error: bool,
     log: Option<PathBuf>,
     progress_every: usize,
+    delete_excluded: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2370,6 +2372,7 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
                 stop_on_error: runtime.stop_on_error,
                 log: runtime.log.clone(),
                 progress_every: runtime.progress_every,
+                delete_excluded: runtime.delete_excluded,
             },
             Some(&policy),
         )?;
@@ -2426,6 +2429,7 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
                 stop_on_error: runtime.stop_on_error,
                 log: runtime.log.clone(),
                 progress_every: runtime.progress_every,
+                delete_excluded: runtime.delete_excluded,
             },
             Some(&policy),
         )?;
@@ -2459,6 +2463,7 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
         progress_every: 1000,
         size_only: false,
         delete_mode: None,
+        delete_excluded: false,
         inplace: false,
         exclude_prefixes: Vec::new(),
         include_patterns: Vec::new(),
@@ -2523,6 +2528,7 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                         format!("invalid --max-age='{value}' in {command} compatibility parsing")
                     })?);
                 }
+                "--delete-excluded" => parsed.delete_excluded = true,
                 "--log-file" | "--log" => parsed.log = Some(PathBuf::from(value)),
                 "--policy" => parsed.policy = Some(PathBuf::from(value)),
                 "--exclude" => parsed.exclude_prefixes.push(value.to_string()),
@@ -2638,6 +2644,7 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                 "delete" => parsed.delete_mode = Some(DeleteMode::After),
                 "delete-before" | "delete-during" => parsed.delete_mode = Some(DeleteMode::Before),
                 "delete-after" => parsed.delete_mode = Some(DeleteMode::After),
+                "delete-excluded" => parsed.delete_excluded = true,
                 "max-age" => {
                     let value = next_value(&mut iter, &option)?;
                     parsed.max_age_ns = Some(parse_age_value(&value).with_context(|| {
@@ -3424,11 +3431,12 @@ fn run_delete_pass(
         source_records.into_iter().map(|row| row.rel_path).collect();
     let delete_targets: Vec<FileRecord> = destination_records
         .into_iter()
-        .filter(|row| !source_paths.contains(&row.rel_path))
         .filter(|row| {
-            policy
-                .map(|policy| !should_exclude_path(&row.rel_path, policy))
-                .unwrap_or(true)
+            let excluded = policy
+                .map(|policy| should_exclude_path(&row.rel_path, policy))
+                .unwrap_or(false);
+            (!source_paths.contains(&row.rel_path) && !excluded)
+                || (args.delete_excluded && excluded)
         })
         .collect();
 
@@ -3465,7 +3473,16 @@ fn run_delete_pass(
                     bytes: item.size,
                     dry_run: true,
                     overwrite: false,
-                    reason: Some("destination-only entry".to_string()),
+                    reason: Some(
+                        if policy
+                            .map(|policy| should_exclude_path(&item.rel_path, policy))
+                            .unwrap_or(false)
+                        {
+                            "excluded destination entry".to_string()
+                        } else {
+                            "destination-only entry".to_string()
+                        },
+                    ),
                 })
                 .context("serialize delete event")?;
                 writer.write_all(&payload)?;
@@ -3495,7 +3512,16 @@ fn run_delete_pass(
                         bytes: item.size,
                         dry_run: false,
                         overwrite: false,
-                        reason: Some("destination-only entry".to_string()),
+                        reason: Some(
+                            if policy
+                                .map(|policy| should_exclude_path(&item.rel_path, policy))
+                                .unwrap_or(false)
+                            {
+                                "excluded destination entry".to_string()
+                            } else {
+                                "destination-only entry".to_string()
+                            },
+                        ),
                     })
                     .context("serialize delete event")?;
                     writer.write_all(&payload)?;
@@ -3933,6 +3959,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_compat_copy_flags_supports_delete_excluded() -> Result<()> {
+        let args = CompatCopyArgs {
+            compat_args: vec!["--delete-excluded".into(), "left".into(), "right".into()],
+        };
+
+        let runtime = parse_compat_copy_flags(&args, "rsync")?;
+        assert!(runtime.delete_excluded);
+        assert_eq!(runtime.source, PathBuf::from("left"));
+        assert_eq!(runtime.destination, PathBuf::from("right"));
+        Ok(())
+    }
+
+    #[test]
     fn parse_compat_copy_flags_marks_unknown_short_flags() -> Result<()> {
         let args = CompatCopyArgs {
             compat_args: vec!["-nQ".into(), "left".into(), "right".into()],
@@ -4222,6 +4261,7 @@ mod tests {
                 stop_on_error: false,
                 log: None,
                 progress_every: 1,
+                delete_excluded: false,
             },
             None,
         )?;
@@ -4229,6 +4269,75 @@ mod tests {
         assert_eq!(summary.deleted_files, 1);
         assert_eq!(summary.deleted_bytes, 6);
         assert!(destination_root.join("orphan.bin").exists());
+
+        fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn delete_pass_can_remove_excluded_destination_files() -> Result<()> {
+        let root = temp_dir("delete_excluded");
+        let source_root = root.join("source");
+        let destination_root = root.join("destination");
+        fs::create_dir_all(&source_root)?;
+        fs::create_dir_all(&destination_root)?;
+
+        fs::write(source_root.join("keep.bin"), b"keep")?;
+        fs::create_dir_all(source_root.join("skip"))?;
+        fs::write(source_root.join("skip/inner.bin"), b"skip")?;
+        fs::write(destination_root.join("keep.bin"), b"keep")?;
+        fs::create_dir_all(destination_root.join("skip"))?;
+        fs::write(destination_root.join("skip/inner.bin"), b"skip")?;
+        fs::write(destination_root.join("orphan.bin"), b"orphan")?;
+
+        let source_db = root.join("source.sqlite");
+        let destination_db = root.join("destination.sqlite");
+
+        scan_command(ScanArgs {
+            db: source_db.clone(),
+            label: "left".to_string(),
+            root: source_root,
+            exclude_prefixes: Vec::new(),
+            policy: None,
+            hash: false,
+        })?;
+        scan_command(ScanArgs {
+            db: destination_db.clone(),
+            label: "right".to_string(),
+            root: destination_root.clone(),
+            exclude_prefixes: Vec::new(),
+            policy: None,
+            hash: false,
+        })?;
+
+        let policy = ExcludePolicy {
+            directory_prefixes: vec!["skip".to_string()],
+            folder_name_additions: Vec::new(),
+            subtree_overrides: HashMap::new(),
+            enabled: true,
+        };
+
+        let summary = run_delete_pass(
+            &source_db,
+            &destination_db,
+            "left",
+            "right",
+            DeleteRunArgs {
+                destination_root: destination_root.clone(),
+                dry_run: false,
+                stop_on_error: false,
+                log: None,
+                progress_every: 1,
+                delete_excluded: true,
+            },
+            Some(&policy),
+        )?;
+
+        assert_eq!(summary.deleted_files, 2);
+        assert_eq!(summary.deleted_bytes, 10);
+        assert!(!destination_root.join("skip/inner.bin").exists());
+        assert!(!destination_root.join("orphan.bin").exists());
+        assert!(destination_root.join("keep.bin").exists());
 
         fs::remove_dir_all(&root).ok();
         Ok(())
