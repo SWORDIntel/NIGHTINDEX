@@ -322,6 +322,7 @@ struct CompatRuntime {
     exclude_prefixes: Vec<String>,
     include_patterns: Vec<String>,
     filter_exclude_patterns: Vec<String>,
+    accepted_link_flags: Vec<String>,
     unsupported_args: Vec<String>,
 }
 
@@ -2107,6 +2108,12 @@ fn sync_copy_missing_command(args: SyncCopyMissingArgs) -> Result<()> {
 
 fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
     let runtime = parse_compat_copy_flags(&args, command)?;
+    if !runtime.accepted_link_flags.is_empty() {
+        eprintln!(
+            "[nightindex {command}] compat symlink flags accepted but no-op for now: {}",
+            runtime.accepted_link_flags.join(", ")
+        );
+    }
     if !runtime.unsupported_args.is_empty() {
         eprintln!(
             "[nightindex {command}] ignored/unsupported flags: {}",
@@ -2281,6 +2288,7 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
         exclude_prefixes: Vec::new(),
         include_patterns: Vec::new(),
         filter_exclude_patterns: Vec::new(),
+        accepted_link_flags: Vec::new(),
         unsupported_args: Vec::new(),
     };
     let mut positionals: Vec<String> = Vec::new();
@@ -2307,6 +2315,11 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                 continue;
             }
             let key = key.replace('_', "-");
+            let accepted_link_flag = matches!(
+                key.as_str(),
+                "--copy-links" | "--copy-unsafe-links" | "--links"
+            );
+            let inplace_flag = key == "--inplace";
 
             match key.as_str() {
                 "--dry-run" => parsed.dry_run = true,
@@ -2323,7 +2336,10 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                 | "--progress"
                 | "--max-age"
                 | "--inplace" => {
-                    if key == "--inplace" {
+                    if accepted_link_flag {
+                        parsed.accepted_link_flags.push(key);
+                    }
+                    if inplace_flag {
                         parsed.inplace = true;
                     }
                 }
@@ -2404,6 +2420,10 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                 "hash" => parsed.hash = true,
                 "copy-links" | "copy-unsafe-links" | "links" | "perms" | "times" | "group"
                 | "owner" | "progress" | "max-age" | "inplace" => {
+                    if matches!(stripped.as_str(), "copy-links" | "copy-unsafe-links" | "links")
+                    {
+                        parsed.accepted_link_flags.push(option.clone());
+                    }
                     if stripped == "inplace" {
                         parsed.inplace = true;
                     }
@@ -3476,6 +3496,31 @@ mod tests {
         assert!(runtime.unsupported_args.is_empty());
         assert_eq!(runtime.source, PathBuf::from("source"));
         assert_eq!(runtime.destination, PathBuf::from("dest"));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_records_accepted_link_flags() -> Result<()> {
+        let args = CompatCopyArgs {
+            compat_args: vec![
+                "--copy-links".into(),
+                "--copy-unsafe-links".into(),
+                "--links".into(),
+                "source".into(),
+                "dest".into(),
+            ],
+        };
+
+        let runtime = parse_compat_copy_flags(&args, "rsync")?;
+        assert_eq!(
+            runtime.accepted_link_flags,
+            vec![
+                "--copy-links".to_string(),
+                "--copy-unsafe-links".to_string(),
+                "--links".to_string(),
+            ]
+        );
+        assert!(runtime.unsupported_args.is_empty());
         Ok(())
     }
 
