@@ -189,21 +189,21 @@ ndex rsync [copy flags...] <source> <destination>
 ndex rclone [copy flags...] <source> <destination>
 ```
 
-Common mapped options:
+Compatibility matrix:
 
-- `-n`, `--dry-run` → dry-run mode  
-- default compat behavior overwrites changed existing files, like a normal local sync/copy tool  
-- `--ignore-existing` → skip any destination path that already exists  
-- `--update`, `-u` → only replace destination files when the source is newer  
-- `--checksum`, `-c` → force hash-based file matching  
-- `--exclude <pattern>` and `--exclude-from <file>` → import excludes into scan policy  
-- `--log-file <path>`, `--log <path>` and `--policy <path>`  
-- `--progress-every <n>` → override progress interval  
-- `--size-only`, `--ignore-times` → recovery mode: treat same-size files as equivalent when destination
-  conflict checks are made (helps when timestamps/mtime drift is common)
-- `--delete*`, `--filter`, `--inplace` are reported as unsupported and run as no-op  
-- `--stop-on-error` to fail fast on first copy failure  
-- remote path forms like `host:/path`, `user@host:/path`, and `s3://bucket/path` are rejected up front  
+| Category | Flags | Behavior |
+|---|---|---|
+| mapped | `-n`, `--dry-run` | dry-run mode |
+| mapped | `--ignore-existing` | skip destination paths that already exist |
+| mapped | `--update`, `-u` | replace destination files only when source is newer |
+| mapped | `--checksum`, `-c` | enable hash-based matching |
+| mapped | `--exclude`, `--exclude-from` | imported into scan policy excludes |
+| mapped | `--log-file`, `--log`, `--policy`, `--progress-every` | map to compat runtime controls |
+| mapped | `--size-only`, `--ignore-times` | treat same-size files as equivalent during conflict checks |
+| mapped | `--stop-on-error` | fail fast on first copy failure |
+| local-only | default mode | changed files can be overwritten unless constrained by flags |
+| unsupported/no-op | `--delete*`, `--filter`, `--inplace`, ssh/rsh/include filter family | reported and ignored |
+| rejected | remote specs like `host:/path`, `user@host:/path`, `rsync://`, `s3://...` | hard error up front |
 
 Usage examples:
 
