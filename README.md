@@ -171,18 +171,22 @@ nightindex sync \
   [--log /tmp/events.ndjson]
 ```
 
-`rclone` and `rsync`  
-Compatibility frontends that accept common transfer flags and execute the same copy plan logic.
+Direct compat copy mode  
+`ndex` and `nightindex` accept common local rsync/rclone-style copy flags directly at the top level.
 Unsupported options are skipped and reported to stderr.
+Remote endpoints are not supported yet; source and destination must both be local filesystem paths.
 
 ```bash
-nightindex rsync \
-  [rsync flags...] \
+ndex \
+  [copy flags...] \
   <source> <destination>
-  
-nightindex rclone \
-  [rclone flags...] \
-  <source> <destination>
+```
+
+Backward-compatible forms still work:
+
+```bash
+ndex rsync [copy flags...] <source> <destination>
+ndex rclone [copy flags...] <source> <destination>
 ```
 
 Common mapped options:
@@ -199,12 +203,13 @@ Common mapped options:
   conflict checks are made (helps when timestamps/mtime drift is common)
 - `--delete*`, `--filter`, `--inplace` are reported as unsupported and run as no-op  
 - `--stop-on-error` to fail fast on first copy failure  
+- remote path forms like `host:/path`, `user@host:/path`, and `s3://bucket/path` are rejected up front  
 
 Usage examples:
 
 ```bash
-ndex rsync --dry-run -av --ignore-existing /mnt/source /tank/dest
-ndex rclone --checksum --exclude /foo /mnt/source /tank/dest
+ndex --dry-run -av --ignore-existing /mnt/source /tank/dest
+ndex --checksum --exclude /foo /mnt/source /tank/dest
 ```
 
 Terminal shortcuts:
