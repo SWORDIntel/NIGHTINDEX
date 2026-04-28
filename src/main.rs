@@ -2195,8 +2195,10 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
     })?;
     let scan_elapsed = now_ns()? - scan_started;
     eprintln!(
-        "[nightindex {command}] scan phase completed in {}",
-        format_duration_ns(scan_elapsed)
+        "[nightindex {command}] phase=scan duration={} source={} destination={}",
+        format_duration_ns(scan_elapsed),
+        source_root.display(),
+        destination_root.display()
     );
 
     let plan_started = now_ns()?;
@@ -2209,7 +2211,7 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
     )?;
     let plan_elapsed = now_ns()? - plan_started;
     eprintln!(
-        "[nightindex {command}] plan mode={} files={} bytes={} in {}",
+        "[nightindex {command}] phase=plan mode={} files={} bytes={} duration={}",
         plan.mode,
         plan.summary.files_to_copy,
         format_bytes(plan.summary.bytes_to_copy),
@@ -2240,15 +2242,20 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
     }
 
     eprintln!(
-        "[nightindex {command}] done copied={} overwritten={} skipped_existing={} skipped_conflict={} failed={} bytes={} copy_time={} total_time={}",
+        "[nightindex {command}] phase=copy copied={} overwritten={} skipped_existing={} skipped_conflict={} failed={} bytes={} duration={}",
         summary.copied_files,
         summary.overwritten_files,
         summary.skipped_existing,
         summary.skipped_conflict,
         summary.failed_files,
         format_bytes(summary.copied_bytes),
-        format_duration_ns(copy_elapsed),
-        format_duration_ns(now_ns()? - total_started)
+        format_duration_ns(copy_elapsed)
+    );
+    eprintln!(
+        "[nightindex {command}] phase=total duration={} mode={} dry_run={}",
+        format_duration_ns(now_ns()? - total_started),
+        summary.mode,
+        summary.dry_run
     );
 
     let json = serde_json::to_string_pretty(&summary)?;
@@ -3393,6 +3400,43 @@ mod tests {
             .count();
         assert_eq!(delete_count, 1);
         assert_eq!(q_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_supports_equals_forms() -> Result<()> {
+        let args = CompatCopyArgs {
+            compat_args: vec![
+                "--exclude=tmp/cache".into(),
+                "--log-file=/tmp/compat.log".into(),
+                "--policy=/tmp/policy.yaml".into(),
+                "source".into(),
+                "dest".into(),
+            ],
+        };
+
+        let runtime = parse_compat_copy_flags(&args, "rclone")?;
+        assert_eq!(runtime.source, PathBuf::from("source"));
+        assert_eq!(runtime.destination, PathBuf::from("dest"));
+        assert_eq!(runtime.log, Some(PathBuf::from("/tmp/compat.log")));
+        assert_eq!(runtime.policy, Some(PathBuf::from("/tmp/policy.yaml")));
+        assert!(runtime.exclude_prefixes.iter().any(|v| v == "tmp/cache"));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_marks_rsh_transport_unsupported() -> Result<()> {
+        let args = CompatCopyArgs {
+            compat_args: vec!["--rsh=ssh -p 2222".into(), "source".into(), "dest".into()],
+        };
+
+        let runtime = parse_compat_copy_flags(&args, "rsync")?;
+        assert!(
+            runtime
+                .unsupported_args
+                .iter()
+                .any(|v| v == "--rsh=ssh -p 2222")
+        );
         Ok(())
     }
 
