@@ -199,8 +199,8 @@ Common mapped options:
 - `--progress-every <n>` → override progress interval  
 - `--size-only`, `--ignore-times` → recovery mode: treat same-size files as equivalent when destination
   conflict checks are made (helps when timestamps/mtime drift is common)
-- Accepted and ignored: `--copy-links`, `--copy-unsafe-links`, `--links`, `--perms`, `--times`,
-  `--group`, `--owner`, `--chmod`, `--progress`, `--max-age`
+- Accepted and preserved as symlinks: `--copy-links`, `--copy-unsafe-links`, `--links`
+- Accepted and ignored: `--perms`, `--times`, `--group`, `--owner`, `--chmod`, `--progress`, `--max-age`
 - Accepted compat flag: `--inplace`
 - Still unsupported in direct compat mode: `--rsh`, `--ssh`, `--dry-run-mode`
 

@@ -372,6 +372,7 @@ enum DeleteMode {
 #[derive(Debug, Clone)]
 struct FileRecord {
     rel_path: String,
+    file_type: String,
     size: u64,
     mtime_ns: i64,
     fast_hash: Option<String>,
@@ -470,6 +471,8 @@ struct CopyPlanSummary {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct CopyPlanItem {
     rel_path: String,
+    #[serde(default)]
+    file_type: String,
     size: u64,
     mtime_ns: i64,
     fast_hash: Option<String>,
@@ -709,10 +712,11 @@ fn scan_command(args: ScanArgs) -> Result<()> {
             }
         };
 
-        if entry.file_type().is_dir() {
+        let entry_file_type = entry.file_type();
+        if entry_file_type.is_dir() {
             continue;
         }
-        if !entry.file_type().is_file() {
+        if !entry_file_type.is_file() && !entry_file_type.is_symlink() {
             continue;
         }
 
@@ -733,7 +737,18 @@ fn scan_command(args: ScanArgs) -> Result<()> {
             continue;
         }
 
-        let metadata = match entry.metadata() {
+        let file_type = if entry_file_type.is_symlink() {
+            "symlink"
+        } else {
+            "file"
+        }
+        .to_string();
+
+        let metadata = match if entry_file_type.is_symlink() {
+            fs::symlink_metadata(entry.path())
+        } else {
+            fs::metadata(entry.path())
+        } {
             Ok(metadata) => metadata,
             Err(err) => {
                 eprintln!("[scan] stat failed: {}: {err}", entry.path().display());
@@ -742,29 +757,58 @@ fn scan_command(args: ScanArgs) -> Result<()> {
             }
         };
 
-        let size = metadata.len();
-        let mtime_ns = metadata
-            .modified()
-            .ok()
-            .and_then(system_time_to_ns)
-            .unwrap_or_default();
+        let (size, mtime_ns, source_fast_hash) = if entry_file_type.is_symlink() {
+            let target = match fs::read_link(entry.path()) {
+                Ok(target) => target,
+                Err(err) => {
+                    eprintln!("[scan] read-link failed: {}: {err}", entry.path().display());
+                    errors += 1;
+                    continue;
+                }
+            };
+            (0, 0, Some(target.to_string_lossy().to_string()))
+        } else {
+            let size = metadata.len();
+            let mtime_ns = metadata
+                .modified()
+                .ok()
+                .and_then(system_time_to_ns)
+                .unwrap_or_default();
+            (size, mtime_ns, None)
+        };
 
         let existing = conn
             .query_row(
-                "SELECT size, mtime_ns, fast_hash FROM files WHERE label = ?1 AND rel_path = ?2",
+                "SELECT file_type, size, mtime_ns, fast_hash FROM files WHERE label = ?1 AND rel_path = ?2",
                 params![&args.label, &rel_path],
                 |row| {
                     Ok((
-                        row.get::<_, u64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
             .optional()?;
 
-        let fast_hash = if let Some((old_size, old_mtime_ns, old_hash)) = existing {
-            if old_size == size && old_mtime_ns == mtime_ns && (!args.hash || old_hash.is_some()) {
+        let fast_hash = if let Some((old_file_type, old_size, old_mtime_ns, old_hash)) = existing {
+            if file_type == "symlink" {
+                if old_file_type == file_type
+                    && old_size == size
+                    && old_mtime_ns == mtime_ns
+                    && old_hash == source_fast_hash
+                {
+                    reused += 1;
+                    old_hash
+                } else {
+                    source_fast_hash
+                }
+            } else if old_file_type == file_type
+                && old_size == size
+                && old_mtime_ns == mtime_ns
+                && (!args.hash || old_hash.is_some())
+            {
                 reused += 1;
                 old_hash
             } else if args.hash {
@@ -773,6 +817,8 @@ fn scan_command(args: ScanArgs) -> Result<()> {
             } else {
                 None
             }
+        } else if file_type == "symlink" {
+            source_fast_hash
         } else if args.hash {
             hashed += 1;
             Some(blake3_file(entry.path())?)
@@ -783,7 +829,7 @@ fn scan_command(args: ScanArgs) -> Result<()> {
         conn.execute(
             r#"
             INSERT INTO files(label, rel_path, file_type, size, mtime_ns, fast_hash, scanned_at)
-            VALUES(?1, ?2, 'file', ?3, ?4, ?5, ?6)
+            VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
             ON CONFLICT(label, rel_path) DO UPDATE SET
                 file_type = excluded.file_type,
                 size = excluded.size,
@@ -794,6 +840,7 @@ fn scan_command(args: ScanArgs) -> Result<()> {
             params![
                 &args.label,
                 &rel_path,
+                &file_type,
                 size,
                 mtime_ns,
                 fast_hash,
@@ -1876,6 +1923,7 @@ fn build_copy_missing_plan(
         bytes_to_copy += row.size;
         items.push(CopyPlanItem {
             rel_path: row.rel_path.clone(),
+            file_type: row.file_type.clone(),
             size: row.size,
             mtime_ns: row.mtime_ns,
             fast_hash: row.fast_hash.clone(),
@@ -2816,7 +2864,7 @@ fn run_copy_plan(
         let mut destination_exists = false;
         let mut destination_metadata = None::<fs::Metadata>;
         let mut existing_bytes = None::<u64>;
-        match fs::metadata(&destination_path) {
+        match fs::symlink_metadata(&destination_path) {
             Ok(metadata) => {
                 destination_exists = true;
                 existing_bytes = Some(metadata.len());
@@ -2853,8 +2901,208 @@ fn run_copy_plan(
             }
         }
 
+        let is_symlink = item.file_type == "symlink";
         let is_overwrite = args.overwrite;
         let mut action = CopyEventAction::Copy;
+
+        if is_symlink {
+            let target = match fs::read_link(&source_path) {
+                Ok(target) => target,
+                Err(err) => {
+                    failed += 1;
+                    write_event(
+                        &mut log,
+                        &CopyEvent {
+                            schema_version: 2,
+                            rel_path: item.rel_path.clone(),
+                            action: CopyEventAction::Fail,
+                            existing_bytes,
+                            bytes: 0,
+                            dry_run: args.dry_run,
+                            overwrite: args.overwrite,
+                            reason: Some(format!("failed reading symlink target: {}", err)),
+                        },
+                    )?;
+                    if args.stop_on_error {
+                        return Err(err)
+                            .with_context(|| format!("failed reading {}", source_path.display()));
+                    } else {
+                        eprintln!(
+                            "[err] failed reading symlink target: {}: {}",
+                            source_path.display(),
+                            err
+                        );
+                        continue;
+                    }
+                }
+            };
+
+            if destination_exists {
+                if let Some(metadata) = destination_metadata.as_ref() {
+                    if metadata.file_type().is_symlink() {
+                        let destination_target = match fs::read_link(&destination_path) {
+                            Ok(target) => target,
+                            Err(err) => {
+                                failed += 1;
+                                write_event(
+                                    &mut log,
+                                    &CopyEvent {
+                                        schema_version: 2,
+                                        rel_path: item.rel_path.clone(),
+                                        action: CopyEventAction::Fail,
+                                        existing_bytes,
+                                        bytes: 0,
+                                        dry_run: args.dry_run,
+                                        overwrite: args.overwrite,
+                                        reason: Some(format!(
+                                            "failed reading destination symlink target: {}",
+                                            err
+                                        )),
+                                    },
+                                )?;
+                                if args.stop_on_error {
+                                    return Err(err).with_context(|| {
+                                        format!(
+                                            "failed reading destination {}",
+                                            destination_path.display()
+                                        )
+                                    });
+                                } else {
+                                    eprintln!(
+                                        "[err] failed reading destination symlink target: {}: {}",
+                                        destination_path.display(),
+                                        err
+                                    );
+                                    continue;
+                                }
+                            }
+                        };
+                        if destination_target == target {
+                            skipped_existing += 1;
+                            write_event(
+                                &mut log,
+                                &CopyEvent {
+                                    schema_version: 2,
+                                    rel_path: item.rel_path.clone(),
+                                    action: CopyEventAction::SkipExisting,
+                                    existing_bytes,
+                                    bytes: 0,
+                                    dry_run: args.dry_run,
+                                    overwrite: args.overwrite,
+                                    reason: None,
+                                },
+                            )?;
+                            continue;
+                        }
+                        if !is_overwrite {
+                            skipped_conflict += 1;
+                            write_event(
+                                &mut log,
+                                &CopyEvent {
+                                    schema_version: 2,
+                                    rel_path: item.rel_path.clone(),
+                                    action: CopyEventAction::SkipConflict,
+                                    existing_bytes,
+                                    bytes: 0,
+                                    dry_run: args.dry_run,
+                                    overwrite: args.overwrite,
+                                    reason: Some(format!(
+                                        "destination conflict: existing symlink target {}",
+                                        destination_target.display()
+                                    )),
+                                },
+                            )?;
+                            continue;
+                        }
+
+                        overwritten_files += 1;
+                        action = CopyEventAction::Overwrite;
+                    } else {
+                        skipped_conflict += 1;
+                        write_event(
+                            &mut log,
+                            &CopyEvent {
+                                schema_version: 2,
+                                rel_path: item.rel_path.clone(),
+                                action: CopyEventAction::SkipConflict,
+                                existing_bytes,
+                                bytes: 0,
+                                dry_run: args.dry_run,
+                                overwrite: args.overwrite,
+                                reason: Some(
+                                    "destination path exists and is not a symlink".to_string(),
+                                ),
+                            },
+                        )?;
+                        continue;
+                    }
+                }
+            }
+
+            if args.dry_run {
+                copied += 1;
+
+                if (index + 1) % progress_every == 0 {
+                    println!("[dry-run] planned={} copied={}", index + 1, copied);
+                }
+
+                write_event(
+                    &mut log,
+                    &CopyEvent {
+                        schema_version: 2,
+                        rel_path: item.rel_path.clone(),
+                        action,
+                        existing_bytes,
+                        bytes: 0,
+                        dry_run: true,
+                        overwrite: args.overwrite,
+                        reason: None,
+                    },
+                )?;
+                continue;
+            }
+
+            if let Some(parent) = destination_path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "failed to create destination directory {}",
+                        parent.display()
+                    )
+                })?;
+            }
+            if destination_exists {
+                fs::remove_file(&destination_path)
+                    .with_context(|| format!("failed to replace {}", destination_path.display()))?;
+            }
+
+            create_symlink(&target, &destination_path).with_context(|| {
+                format!("failed to create symlink {}", destination_path.display())
+            })?;
+            copied += 1;
+            copied_bytes += 0;
+            if (index + 1) % progress_every == 0 {
+                println!(
+                    "[copy] {} / {} ({} bytes)",
+                    index + 1,
+                    items_to_copy.len(),
+                    copied_bytes
+                );
+            }
+            write_event(
+                &mut log,
+                &CopyEvent {
+                    schema_version: 2,
+                    rel_path: item.rel_path.clone(),
+                    action,
+                    existing_bytes,
+                    bytes: 0,
+                    dry_run: false,
+                    overwrite: args.overwrite,
+                    reason: None,
+                },
+            )?;
+            continue;
+        }
 
         if destination_exists {
             if let Some(metadata) = destination_metadata.as_ref() {
@@ -3047,6 +3295,20 @@ fn run_copy_plan(
     })
 }
 
+#[cfg(unix)]
+fn create_symlink(target: &Path, link_path: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, link_path)
+        .with_context(|| format!("failed to create symlink {}", link_path.display()))
+}
+
+#[cfg(not(unix))]
+fn create_symlink(_target: &Path, link_path: &Path) -> Result<()> {
+    bail!(
+        "symlink creation is not supported on this platform: {}",
+        link_path.display()
+    )
+}
+
 fn run_delete_pass(
     source_db: &Path,
     destination_db: &Path,
@@ -3181,14 +3443,15 @@ fn open_readonly_db(path: &Path) -> Result<Connection> {
 
 fn load_label(conn: &Connection, label: &str) -> Result<Vec<FileRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT rel_path, size, mtime_ns, fast_hash FROM files WHERE label = ?1 ORDER BY rel_path",
+        "SELECT rel_path, file_type, size, mtime_ns, fast_hash FROM files WHERE label = ?1 ORDER BY rel_path",
     )?;
     let rows = stmt.query_map(params![label], |row| {
         Ok(FileRecord {
             rel_path: row.get(0)?,
-            size: row.get(1)?,
-            mtime_ns: row.get(2)?,
-            fast_hash: row.get(3)?,
+            file_type: row.get(1)?,
+            size: row.get(2)?,
+            mtime_ns: row.get(3)?,
+            fast_hash: row.get(4)?,
         })
     })?;
 
@@ -3670,18 +3933,21 @@ mod tests {
             items: vec![
                 CopyPlanItem {
                     rel_path: "QCOM".to_string(),
+                    file_type: "file".to_string(),
                     size: 1,
                     mtime_ns: 1,
                     fast_hash: None,
                 },
                 CopyPlanItem {
                     rel_path: "QCOM/readme.md".to_string(),
+                    file_type: "file".to_string(),
                     size: 2,
                     mtime_ns: 2,
                     fast_hash: None,
                 },
                 CopyPlanItem {
                     rel_path: "QCOM/tools/helper.py".to_string(),
+                    file_type: "file".to_string(),
                     size: 3,
                     mtime_ns: 3,
                     fast_hash: None,
@@ -3768,6 +4034,110 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn scan_command_records_symlinks() -> Result<()> {
+        let root = temp_dir("scan_symlink");
+        let source_root = root.join("source");
+        fs::create_dir_all(&source_root)?;
+
+        fs::write(source_root.join("payload.txt"), b"payload")?;
+        std::os::unix::fs::symlink("payload.txt", source_root.join("payload.link"))?;
+
+        let db = root.join("scan.sqlite");
+        scan_command(ScanArgs {
+            db: db.clone(),
+            label: "left".to_string(),
+            root: source_root,
+            exclude_prefixes: Vec::new(),
+            policy: None,
+            hash: false,
+        })?;
+
+        let conn = open_readonly_db(&db)?;
+        let rows = load_label(&conn, "left")?;
+        assert_eq!(rows.len(), 2);
+        let file_row = rows
+            .iter()
+            .find(|row| row.rel_path == "payload.txt")
+            .expect("file row");
+        assert_eq!(file_row.file_type, "file");
+        let link_row = rows
+            .iter()
+            .find(|row| row.rel_path == "payload.link")
+            .expect("symlink row");
+        assert_eq!(link_row.file_type, "symlink");
+        assert_eq!(link_row.size, 0);
+        assert_eq!(link_row.mtime_ns, 0);
+        assert_eq!(link_row.fast_hash.as_deref(), Some("payload.txt"));
+
+        fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_plan_preserves_symlinks() -> Result<()> {
+        let root = temp_dir("copy_symlink");
+        let source_root = root.join("source");
+        let destination_root = root.join("destination");
+        fs::create_dir_all(&source_root)?;
+        fs::create_dir_all(&destination_root)?;
+
+        fs::write(source_root.join("payload.txt"), b"payload")?;
+        std::os::unix::fs::symlink("payload.txt", source_root.join("payload.link"))?;
+
+        let source_db = root.join("source.sqlite");
+        let destination_db = root.join("destination.sqlite");
+
+        scan_command(ScanArgs {
+            db: source_db.clone(),
+            label: "left".to_string(),
+            root: source_root.clone(),
+            exclude_prefixes: Vec::new(),
+            policy: None,
+            hash: false,
+        })?;
+        scan_command(ScanArgs {
+            db: destination_db.clone(),
+            label: "right".to_string(),
+            root: destination_root.clone(),
+            exclude_prefixes: Vec::new(),
+            policy: None,
+            hash: false,
+        })?;
+
+        let plan = build_copy_missing_plan(&source_db, &destination_db, "left", "right", None)?;
+        assert!(
+            plan.items
+                .iter()
+                .any(|item| item.rel_path == "payload.link" && item.file_type == "symlink")
+        );
+
+        let summary = execute_copy_missing_with_plan(
+            &plan,
+            CopyRunArgs {
+                source_root: source_root.clone(),
+                destination_root: destination_root.clone(),
+                overwrite: false,
+                dry_run: false,
+                stop_on_error: false,
+                log: None,
+                progress_every: 1,
+                size_only: false,
+            },
+            None,
+        )?;
+
+        assert_eq!(summary.copied_files, 2);
+        let link_target = std::fs::read_link(destination_root.join("payload.link"))?;
+        assert_eq!(link_target, PathBuf::from("payload.txt"));
+        assert!(destination_root.join("payload.txt").exists());
+
+        fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
     #[test]
     fn filter_plan_by_patterns_applies_allowlist_and_blocklist() {
         let plan = CopyPlan {
@@ -3786,18 +4156,21 @@ mod tests {
             items: vec![
                 CopyPlanItem {
                     rel_path: "QCOM/keep.bin".to_string(),
+                    file_type: "file".to_string(),
                     size: 2,
                     mtime_ns: 1,
                     fast_hash: None,
                 },
                 CopyPlanItem {
                     rel_path: "QCOM/tmp/drop.bin".to_string(),
+                    file_type: "file".to_string(),
                     size: 4,
                     mtime_ns: 2,
                     fast_hash: None,
                 },
                 CopyPlanItem {
                     rel_path: "ARM64/skip.bin".to_string(),
+                    file_type: "file".to_string(),
                     size: 6,
                     mtime_ns: 3,
                     fast_hash: None,
@@ -3842,18 +4215,21 @@ mod tests {
         let left_rows = vec![
             FileRecord {
                 rel_path: "alpha/readme.txt".to_string(),
+                file_type: "file".to_string(),
                 size: 101,
                 mtime_ns: 1,
                 fast_hash: Some("hash-readme-left".to_string()),
             },
             FileRecord {
                 rel_path: "alpha/app.bin".to_string(),
+                file_type: "file".to_string(),
                 size: 202,
                 mtime_ns: 2,
                 fast_hash: Some("hash-bin-left".to_string()),
             },
             FileRecord {
                 rel_path: "alpha/notes.log".to_string(),
+                file_type: "file".to_string(),
                 size: 303,
                 mtime_ns: 3,
                 fast_hash: Some("hash-notes-left".to_string()),
@@ -3862,24 +4238,28 @@ mod tests {
         let right_rows = vec![
             FileRecord {
                 rel_path: "beta/readme.txt".to_string(),
+                file_type: "file".to_string(),
                 size: 111,
                 mtime_ns: 10,
                 fast_hash: Some("hash-readme-left".to_string()),
             },
             FileRecord {
                 rel_path: "beta/app.bin".to_string(),
+                file_type: "file".to_string(),
                 size: 222,
                 mtime_ns: 11,
                 fast_hash: Some("hash-bin-left".to_string()),
             },
             FileRecord {
                 rel_path: "omega/readme.txt".to_string(),
+                file_type: "file".to_string(),
                 size: 333,
                 mtime_ns: 12,
                 fast_hash: Some("hash-readme-left".to_string()),
             },
             FileRecord {
                 rel_path: "omega/other.tmp".to_string(),
+                file_type: "file".to_string(),
                 size: 444,
                 mtime_ns: 13,
                 fast_hash: Some("hash-other".to_string()),
