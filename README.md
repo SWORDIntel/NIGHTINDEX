@@ -16,6 +16,16 @@ cargo build --release
 ```
 
 Binary output: `target/release/nightindex`.
+The same binary is also installed as `target/release/ndex` (executable alias only).
+
+Alias map:
+- `nightindex` is the full command name.
+- `ndex` is the executable alias for `nightindex`.
+- `dossier` also has the `intel` alias.
+- `plan-copy-missing` also has the `plan` alias.
+- `sync-copy-missing` also has the `sync` alias.
+- `execute-copy-missing` also has the `execute` alias.
+- `extract-check` also has the `extcheck` alias.
 
 ## Recommended recovery use-case
 
@@ -160,6 +170,47 @@ nightindex sync \
   [--policy <policy>] \
   [--log /tmp/events.ndjson]
 ```
+
+`rclone` and `rsync`  
+Compatibility frontends that accept common transfer flags and execute the same copy plan logic.
+Unsupported options are skipped and reported to stderr.
+
+```bash
+nightindex rsync \
+  [rsync flags...] \
+  <source> <destination>
+  
+nightindex rclone \
+  [rclone flags...] \
+  <source> <destination>
+```
+
+Common mapped options:
+
+- `-n`, `--dry-run` → dry-run mode  
+- `--ignore-existing`, `--update`, `-u` → skip existing files (no overwrite)  
+- `--checksum`, `-c` → force hash-based file matching  
+- `--exclude <pattern>` and `--exclude-from <file>` → import excludes into scan policy  
+- `--log-file <path>`, `--log <path>` and `--policy <path>`  
+- `--progress-every <n>` → override progress interval  
+- `--size-only`, `--ignore-times` → recovery mode: treat same-size files as equivalent when destination
+  conflict checks are made (helps when timestamps/mtime drift is common)
+- `--delete*`, `--filter`, `--inplace` are reported as unsupported and run as no-op  
+- `--stop-on-error` to fail fast on first copy failure  
+
+Usage examples:
+
+```bash
+ndex rsync --dry-run -av --ignore-existing /mnt/source /tank/dest
+ndex rclone --checksum --exclude /foo /mnt/source /tank/dest
+```
+
+Terminal shortcuts:
+
+- `nightindex` full binary name  
+- `ndex` compact alias for quick calls
+
+`ndex` and `nightindex` are built from the same binary; use either in scripts.
 
 ## Policy format
 
