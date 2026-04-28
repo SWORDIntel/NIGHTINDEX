@@ -188,7 +188,9 @@ nightindex rclone \
 Common mapped options:
 
 - `-n`, `--dry-run` → dry-run mode  
-- `--ignore-existing`, `--update`, `-u` → skip existing files (no overwrite)  
+- default compat behavior overwrites changed existing files, like a normal local sync/copy tool  
+- `--ignore-existing` → skip any destination path that already exists  
+- `--update`, `-u` → only replace destination files when the source is newer  
 - `--checksum`, `-c` → force hash-based file matching  
 - `--exclude <pattern>` and `--exclude-from <file>` → import excludes into scan policy  
 - `--log-file <path>`, `--log <path>` and `--policy <path>`  
