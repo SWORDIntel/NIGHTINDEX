@@ -321,6 +321,7 @@ struct CompatRuntime {
     size_only: bool,
     exclude_prefixes: Vec<String>,
     include_patterns: Vec<String>,
+    filter_exclude_patterns: Vec<String>,
     unsupported_args: Vec<String>,
 }
 
@@ -2182,6 +2183,12 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
             runtime.include_patterns.join(", ")
         );
     }
+    if !runtime.filter_exclude_patterns.is_empty() {
+        eprintln!(
+            "[nightindex {command}] filter excludes: {}",
+            runtime.filter_exclude_patterns.join(", ")
+        );
+    }
 
     let scan_started = now_ns()?;
     scan_command(ScanArgs {
@@ -2216,7 +2223,11 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
         &right_label,
         Some(&policy),
     )?;
-    let filtered_plan = filter_plan_by_include_patterns(&plan, &runtime.include_patterns);
+    let filtered_plan = filter_plan_by_include_patterns(
+        &plan,
+        &runtime.include_patterns,
+        &runtime.filter_exclude_patterns,
+    );
     let plan_elapsed = now_ns()? - plan_started;
     eprintln!(
         "[nightindex {command}] phase=plan mode={} files={} bytes={} duration={}",
@@ -2287,6 +2298,7 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
         size_only: false,
         exclude_prefixes: Vec::new(),
         include_patterns: Vec::new(),
+        filter_exclude_patterns: Vec::new(),
         unsupported_args: Vec::new(),
     };
     let mut unsupported_seen: HashSet<String> = HashSet::new();
@@ -2341,6 +2353,25 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                     parse_include_file(value, &mut parsed.include_patterns)
                         .with_context(|| format!("invalid --include-from value '{value}'"))?;
                 }
+                "--filter" => {
+                    parse_filter_rule(
+                        value,
+                        &mut parsed.include_patterns,
+                        &mut parsed.filter_exclude_patterns,
+                        &mut parsed.unsupported_args,
+                        &mut unsupported_seen,
+                    );
+                }
+                "--filter-from" => {
+                    parse_filter_file(
+                        value,
+                        &mut parsed.include_patterns,
+                        &mut parsed.filter_exclude_patterns,
+                        &mut parsed.unsupported_args,
+                        &mut unsupported_seen,
+                    )
+                    .with_context(|| format!("invalid --filter-from value '{value}'"))?;
+                }
                 "--progress-every" => {
                     parsed.progress_every = value
                         .parse::<usize>()
@@ -2361,7 +2392,7 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                         format!("{key}"),
                     );
                 }
-                "--filter" | "--rsh" | "--ssh" | "--dry-run-mode" => {
+                "--rsh" | "--ssh" | "--dry-run-mode" => {
                     push_unsupported_arg(
                         &mut parsed.unsupported_args,
                         &mut unsupported_seen,
@@ -2423,6 +2454,27 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                     parse_include_file(&value, &mut parsed.include_patterns)
                         .with_context(|| format!("invalid --include-from value '{value}'"))?;
                 }
+                "filter" => {
+                    let value = next_value(&mut iter, &option)?;
+                    parse_filter_rule(
+                        &value,
+                        &mut parsed.include_patterns,
+                        &mut parsed.filter_exclude_patterns,
+                        &mut parsed.unsupported_args,
+                        &mut unsupported_seen,
+                    );
+                }
+                "filter-from" => {
+                    let value = next_value(&mut iter, &option)?;
+                    parse_filter_file(
+                        &value,
+                        &mut parsed.include_patterns,
+                        &mut parsed.filter_exclude_patterns,
+                        &mut parsed.unsupported_args,
+                        &mut unsupported_seen,
+                    )
+                    .with_context(|| format!("invalid --filter-from value '{value}'"))?;
+                }
                 "progress-every" => {
                     let value = next_value(&mut iter, &option)?;
                     parsed.progress_every = value
@@ -2437,7 +2489,7 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                         format!("--{stripped}"),
                     );
                 }
-                "rsh" | "ssh" | "filter" => {
+                "rsh" | "ssh" => {
                     let value = next_value(&mut iter, &option)?;
                     push_unsupported_arg(
                         &mut parsed.unsupported_args,
@@ -2548,6 +2600,31 @@ fn parse_include_file(path: &str, includes: &mut Vec<String>) -> Result<()> {
     parse_pattern_file(path, includes, "include")
 }
 
+fn parse_filter_file(
+    path: &str,
+    filter_includes: &mut Vec<String>,
+    filter_excludes: &mut Vec<String>,
+    unsupported_args: &mut Vec<String>,
+    unsupported_seen: &mut HashSet<String>,
+) -> Result<()> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read filter file {path}"))?;
+    for line in text.lines() {
+        let rule = line.trim();
+        if rule.is_empty() || rule.starts_with('#') {
+            continue;
+        }
+        parse_filter_rule(
+            rule,
+            filter_includes,
+            filter_excludes,
+            unsupported_args,
+            unsupported_seen,
+        );
+    }
+    Ok(())
+}
+
 fn parse_pattern_file(path: &str, output: &mut Vec<String>, kind: &str) -> Result<()> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {kind} file {path}"))?;
@@ -2561,8 +2638,43 @@ fn parse_pattern_file(path: &str, output: &mut Vec<String>, kind: &str) -> Resul
     Ok(())
 }
 
-fn filter_plan_by_include_patterns(plan: &CopyPlan, include_patterns: &[String]) -> CopyPlan {
-    if include_patterns.is_empty() {
+fn parse_filter_rule(
+    rule: &str,
+    filter_includes: &mut Vec<String>,
+    filter_excludes: &mut Vec<String>,
+    unsupported_args: &mut Vec<String>,
+    unsupported_seen: &mut HashSet<String>,
+) {
+    let trimmed = rule.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if let Some(rest) = trimmed.strip_prefix('+') {
+        let pattern = rest.trim();
+        if !pattern.is_empty() {
+            filter_includes.push(pattern.to_string());
+            return;
+        }
+    } else if let Some(rest) = trimmed.strip_prefix('-') {
+        let pattern = rest.trim();
+        if !pattern.is_empty() {
+            filter_excludes.push(pattern.to_string());
+            return;
+        }
+    }
+    push_unsupported_arg(
+        unsupported_args,
+        unsupported_seen,
+        format!("--filter={trimmed}"),
+    );
+}
+
+fn filter_plan_by_include_patterns(
+    plan: &CopyPlan,
+    include_patterns: &[String],
+    filter_exclude_patterns: &[String],
+) -> CopyPlan {
+    if include_patterns.is_empty() && filter_exclude_patterns.is_empty() {
         return CopyPlan {
             mode: plan.mode.clone(),
             left_label: plan.left_label.clone(),
@@ -2583,10 +2695,14 @@ fn filter_plan_by_include_patterns(plan: &CopyPlan, include_patterns: &[String])
     let mut items = Vec::new();
     let mut bytes_to_copy = 0u64;
     for item in &plan.items {
-        if include_patterns
+        let include_match = include_patterns.is_empty()
+            || include_patterns
+                .iter()
+                .any(|pattern| path_matches_pattern(&item.rel_path, pattern));
+        let exclude_match = filter_exclude_patterns
             .iter()
-            .any(|pattern| path_matches_pattern(&item.rel_path, pattern))
-        {
+            .any(|pattern| path_matches_pattern(&item.rel_path, pattern));
+        if include_match && !exclude_match {
             bytes_to_copy += item.size;
             items.push(item.clone());
         }
@@ -3566,6 +3682,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_compat_copy_flags_supports_filter_rules() -> Result<()> {
+        let root = temp_dir("filter");
+        let filter_file = root.join("filters.txt");
+        fs::write(&filter_file, "+ QCOM/*\n- ARM64/*\n#note\n")?;
+
+        let args = CompatCopyArgs {
+            compat_args: vec![
+                "--filter".into(),
+                "+ 04_KEYS/*".into(),
+                "--filter-from".into(),
+                filter_file.display().to_string(),
+                "source".into(),
+                "dest".into(),
+            ],
+        };
+        let runtime = parse_compat_copy_flags(&args, "rsync")?;
+        assert!(runtime.include_patterns.iter().any(|p| p == "04_KEYS/*"));
+        assert!(runtime.include_patterns.iter().any(|p| p == "QCOM/*"));
+        assert!(
+            runtime
+                .filter_exclude_patterns
+                .iter()
+                .any(|p| p == "ARM64/*")
+        );
+        fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[test]
     fn parse_compat_copy_flags_marks_rsh_transport_unsupported() -> Result<()> {
         let args = CompatCopyArgs {
             compat_args: vec!["--rsh=ssh -p 2222".into(), "source".into(), "dest".into()],
@@ -3628,10 +3773,47 @@ mod tests {
         let filtered = filter_plan_by_include_patterns(
             &plan,
             &["QCOM/*".to_string(), "04_KEYS/*".to_string()],
+            &[],
         );
         assert_eq!(filtered.summary.files_to_copy, 2);
         assert_eq!(filtered.summary.bytes_to_copy, 20);
         assert_eq!(filtered.items.len(), 2);
+    }
+
+    #[test]
+    fn filter_plan_by_include_patterns_honors_filter_excludes() {
+        let plan = CopyPlan {
+            mode: "copy-sync".to_string(),
+            left_label: "left".to_string(),
+            right_label: "right".to_string(),
+            left_db: None,
+            right_db: None,
+            generated_at_ns: 1,
+            summary: CopyPlanSummary {
+                files_to_copy: 3,
+                bytes_to_copy: 30,
+                left_files: 10,
+                right_files: 5,
+            },
+            items: vec![
+                CopyPlanItem {
+                    rel_path: "QCOM/a.bin".to_string(),
+                    size: 10,
+                    mtime_ns: 1,
+                    fast_hash: None,
+                },
+                CopyPlanItem {
+                    rel_path: "ARM64/b.bin".to_string(),
+                    size: 10,
+                    mtime_ns: 1,
+                    fast_hash: None,
+                },
+            ],
+        };
+        let filtered = filter_plan_by_include_patterns(&plan, &[], &["ARM64/*".to_string()]);
+        assert_eq!(filtered.summary.files_to_copy, 1);
+        assert_eq!(filtered.items.len(), 1);
+        assert_eq!(filtered.items[0].rel_path, "QCOM/a.bin");
     }
 
     #[test]

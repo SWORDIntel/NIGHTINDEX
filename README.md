@@ -199,11 +199,12 @@ Compatibility matrix:
 | mapped | `--checksum`, `-c` | enable hash-based matching |
 | mapped | `--exclude`, `--exclude-from` | imported into scan policy excludes |
 | mapped | `--include`, `--include-from` | include allowlist patterns applied to planned copy items |
+| mapped subset | `--filter`, `--filter-from` | `+` rules add allowlist patterns, `-` rules add blocklist patterns |
 | mapped | `--log-file`, `--log`, `--policy`, `--progress-every` | map to compat runtime controls |
 | mapped | `--size-only`, `--ignore-times` | treat same-size files as equivalent during conflict checks |
 | mapped | `--stop-on-error` | fail fast on first copy failure |
 | local-only | default mode | changed files can be overwritten unless constrained by flags |
-| unsupported/no-op | `--delete*`, `--filter`, `--inplace`, ssh/rsh transport family | reported and ignored |
+| unsupported/no-op | `--delete*`, `--inplace`, ssh/rsh transport family | reported and ignored |
 | rejected | remote specs like `host:/path`, `user@host:/path`, `rsync://`, `s3://...` | hard error up front |
 
 Troubleshooting:
