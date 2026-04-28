@@ -205,6 +205,9 @@ Compatibility matrix:
 | unsupported/no-op | `--delete*`, `--filter`, `--inplace`, ssh/rsh/include filter family | reported and ignored |
 | rejected | remote specs like `host:/path`, `user@host:/path`, `rsync://`, `s3://...` | hard error up front |
 
+Troubleshooting:
+- if your source is remote-style (`user@host:/path`), mount it first (SSHFS/NFS/SMB/local mirror) and then run `ndex` against local mount paths.
+
 Usage examples:
 
 ```bash
