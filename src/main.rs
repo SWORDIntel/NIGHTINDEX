@@ -2359,7 +2359,12 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                     &mut parsed.unsupported_args,
                     &mut unsupported_seen,
                 ),
-                "--include" => parsed.include_patterns.push(normalize_policy_path(value)),
+                "--include" => {
+                    let normalized = normalize_policy_path(value);
+                    if !normalized.is_empty() {
+                        parsed.include_patterns.push(normalized);
+                    }
+                }
                 "--include-from" => {
                     parse_include_file(value, &mut parsed.include_patterns)
                         .with_context(|| format!("invalid --include-from value '{value}'"))?;
@@ -3520,6 +3525,23 @@ mod tests {
         assert_eq!(runtime.source, PathBuf::from("source"));
         assert_eq!(runtime.destination, PathBuf::from("dest"));
         fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_ignores_empty_include_values() -> Result<()> {
+        let args = CompatCopyArgs {
+            compat_args: vec![
+                "--include=/".into(),
+                "source".into(),
+                "dest".into(),
+            ],
+        };
+
+        let runtime = parse_compat_copy_flags(&args, "rsync")?;
+        assert!(runtime.include_patterns.is_empty());
+        assert_eq!(runtime.source, PathBuf::from("source"));
+        assert_eq!(runtime.destination, PathBuf::from("dest"));
         Ok(())
     }
 
