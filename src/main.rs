@@ -322,6 +322,7 @@ struct CompatRuntime {
     exclude_prefixes: Vec<String>,
     include_patterns: Vec<PatternSpec>,
     filter_exclude_patterns: Vec<PatternSpec>,
+    max_age_ns: Option<i64>,
     accepted_link_flags: Vec<String>,
     unsupported_args: Vec<String>,
 }
@@ -766,7 +767,12 @@ fn scan_command(args: ScanArgs) -> Result<()> {
                     continue;
                 }
             };
-            (0, 0, Some(target.to_string_lossy().to_string()))
+            let mtime_ns = metadata
+                .modified()
+                .ok()
+                .and_then(system_time_to_ns)
+                .unwrap_or_default();
+            (0, mtime_ns, Some(target.to_string_lossy().to_string()))
         } else {
             let size = metadata.len();
             let mtime_ns = metadata
@@ -1980,6 +1986,33 @@ fn filter_plan_by_patterns(
     filtered
 }
 
+fn filter_plan_by_max_age(plan: &CopyPlan, max_age_ns: i64, now_ns: i64) -> CopyPlan {
+    if max_age_ns <= 0 {
+        return CopyPlan {
+            summary: CopyPlanSummary {
+                files_to_copy: 0,
+                bytes_to_copy: 0,
+                ..plan.summary.clone()
+            },
+            items: Vec::new(),
+            ..plan.clone()
+        };
+    }
+
+    let items: Vec<CopyPlanItem> = plan
+        .items
+        .iter()
+        .filter(|item| now_ns.saturating_sub(item.mtime_ns).max(0) <= max_age_ns)
+        .cloned()
+        .collect();
+    let bytes_to_copy = items.iter().map(|item| item.size).sum();
+    let mut filtered = plan.clone();
+    filtered.summary.files_to_copy = items.len();
+    filtered.summary.bytes_to_copy = bytes_to_copy;
+    filtered.items = items;
+    filtered
+}
+
 fn path_pattern_matches_spec(pattern: &PatternSpec, rel_path: &str) -> bool {
     let dir_only = pattern.dir_only;
     let pattern = normalize_policy_path(&pattern.pattern);
@@ -2268,6 +2301,9 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
                 .join(", ")
         );
     }
+    if let Some(max_age_ns) = runtime.max_age_ns {
+        eprintln!("[nightindex {command}] max-age filter: {} ns", max_age_ns);
+    }
 
     let work_root = {
         let root = std::env::temp_dir().join(format!(
@@ -2336,6 +2372,11 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
         &runtime.include_patterns,
         &runtime.filter_exclude_patterns,
     );
+    let plan = if let Some(max_age_ns) = runtime.max_age_ns {
+        filter_plan_by_max_age(&plan, max_age_ns, now_ns()?)
+    } else {
+        plan
+    };
 
     let mut summary = execute_copy_missing_with_plan(
         &plan,
@@ -2400,6 +2441,7 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
         exclude_prefixes: Vec::new(),
         include_patterns: Vec::new(),
         filter_exclude_patterns: Vec::new(),
+        max_age_ns: None,
         accepted_link_flags: Vec::new(),
         unsupported_args: Vec::new(),
     };
@@ -2446,7 +2488,6 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                 | "--owner"
                 | "--chmod"
                 | "--progress"
-                | "--max-age"
                 | "--inplace" => {
                     if accepted_link_flag {
                         parsed.accepted_link_flags.push(key);
@@ -2454,6 +2495,11 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                     if inplace_flag {
                         parsed.inplace = true;
                     }
+                }
+                "--max-age" => {
+                    parsed.max_age_ns = Some(parse_age_value(value).with_context(|| {
+                        format!("invalid --max-age='{value}' in {command} compatibility parsing")
+                    })?);
                 }
                 "--log-file" | "--log" => parsed.log = Some(PathBuf::from(value)),
                 "--policy" => parsed.policy = Some(PathBuf::from(value)),
@@ -2530,7 +2576,7 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                 "overwrite" => parsed.overwrite = true,
                 "hash" => parsed.hash = true,
                 "copy-links" | "copy-unsafe-links" | "links" | "perms" | "times" | "group"
-                | "owner" | "progress" | "max-age" | "inplace" => {
+                | "owner" | "progress" | "inplace" => {
                     if matches!(
                         stripped.as_str(),
                         "copy-links" | "copy-unsafe-links" | "links"
@@ -2570,6 +2616,12 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                 "delete" => parsed.delete_mode = Some(DeleteMode::After),
                 "delete-before" | "delete-during" => parsed.delete_mode = Some(DeleteMode::Before),
                 "delete-after" => parsed.delete_mode = Some(DeleteMode::After),
+                "max-age" => {
+                    let value = next_value(&mut iter, &option)?;
+                    parsed.max_age_ns = Some(parse_age_value(&value).with_context(|| {
+                        format!("invalid --max-age='{value}' in {command} compatibility parsing")
+                    })?);
+                }
                 "rsh" | "ssh" | "dry-run-mode" => {
                     let value = next_value(&mut iter, &option)?;
                     parsed
@@ -3636,6 +3688,34 @@ fn normalize_excludes(values: &[String]) -> Vec<String> {
         .collect()
 }
 
+fn parse_age_value(value: &str) -> Result<i64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("empty max-age value");
+    }
+
+    let (number_part, multiplier) = match trimmed.chars().last() {
+        Some('s') | Some('S') => (&trimmed[..trimmed.len() - 1], 1u128),
+        Some('m') | Some('M') => (&trimmed[..trimmed.len() - 1], 60u128),
+        Some('h') | Some('H') => (&trimmed[..trimmed.len() - 1], 60u128 * 60),
+        Some('d') | Some('D') => (&trimmed[..trimmed.len() - 1], 60u128 * 60 * 24),
+        Some(ch) if ch.is_ascii_digit() => (trimmed, 1u128),
+        _ => bail!("invalid max-age value '{value}'"),
+    };
+
+    let seconds = number_part
+        .parse::<u128>()
+        .with_context(|| format!("invalid max-age value '{value}'"))?;
+    let nanos = seconds
+        .checked_mul(multiplier)
+        .and_then(|value| value.checked_mul(1_000_000_000))
+        .context("max-age value is too large")?;
+    if nanos > i64::MAX as u128 {
+        bail!("max-age value is too large");
+    }
+    Ok(nanos as i64)
+}
+
 fn should_walk(path: &Path, root: &Path, policy: &ExcludePolicy) -> bool {
     if path == root {
         return true;
@@ -3782,6 +3862,24 @@ mod tests {
 
         let runtime = parse_compat_copy_flags(&args, "rclone")?;
         assert!(runtime.size_only);
+        assert_eq!(runtime.source, PathBuf::from("left"));
+        assert_eq!(runtime.destination, PathBuf::from("right"));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_supports_max_age() -> Result<()> {
+        let args = CompatCopyArgs {
+            compat_args: vec![
+                "--max-age".into(),
+                "10m".into(),
+                "left".into(),
+                "right".into(),
+            ],
+        };
+
+        let runtime = parse_compat_copy_flags(&args, "rclone")?;
+        assert_eq!(runtime.max_age_ns, Some(10 * 60 * 1_000_000_000));
         assert_eq!(runtime.source, PathBuf::from("left"));
         assert_eq!(runtime.destination, PathBuf::from("right"));
         Ok(())
@@ -3980,6 +4078,61 @@ mod tests {
     }
 
     #[test]
+    fn filter_plan_by_max_age_keeps_only_recent_items() {
+        let plan = CopyPlan {
+            mode: "copy-missing".to_string(),
+            left_label: "left".to_string(),
+            right_label: "right".to_string(),
+            left_db: None,
+            right_db: None,
+            generated_at_ns: 0,
+            summary: CopyPlanSummary {
+                files_to_copy: 3,
+                bytes_to_copy: 12,
+                left_files: 3,
+                right_files: 0,
+            },
+            items: vec![
+                CopyPlanItem {
+                    rel_path: "old.bin".to_string(),
+                    file_type: "file".to_string(),
+                    size: 2,
+                    mtime_ns: 1_000,
+                    fast_hash: None,
+                },
+                CopyPlanItem {
+                    rel_path: "fresh.bin".to_string(),
+                    file_type: "file".to_string(),
+                    size: 4,
+                    mtime_ns: 950_000_000,
+                    fast_hash: None,
+                },
+                CopyPlanItem {
+                    rel_path: "link".to_string(),
+                    file_type: "symlink".to_string(),
+                    size: 6,
+                    mtime_ns: 980_000_000,
+                    fast_hash: None,
+                },
+            ],
+        };
+
+        let filtered = filter_plan_by_max_age(&plan, 100_000_000, 1_000_000_000);
+
+        assert_eq!(filtered.summary.files_to_copy, 2);
+        assert_eq!(filtered.summary.bytes_to_copy, 10);
+        assert_eq!(filtered.items.len(), 2);
+        assert!(
+            filtered
+                .items
+                .iter()
+                .any(|item| item.rel_path == "fresh.bin")
+        );
+        assert!(filtered.items.iter().any(|item| item.rel_path == "link"));
+        assert!(!filtered.items.iter().any(|item| item.rel_path == "old.bin"));
+    }
+
+    #[test]
     fn delete_pass_targets_destination_only_files() -> Result<()> {
         let root = temp_dir("delete_pass");
         let source_root = root.join("source");
@@ -4068,7 +4221,7 @@ mod tests {
             .expect("symlink row");
         assert_eq!(link_row.file_type, "symlink");
         assert_eq!(link_row.size, 0);
-        assert_eq!(link_row.mtime_ns, 0);
+        assert!(link_row.mtime_ns > 0);
         assert_eq!(link_row.fast_hash.as_deref(), Some("payload.txt"));
 
         fs::remove_dir_all(&root).ok();
