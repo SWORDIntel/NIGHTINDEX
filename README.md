@@ -171,51 +171,44 @@ nightindex sync \
   [--log /tmp/events.ndjson]
 ```
 
-Direct compat copy mode  
-`ndex` and `nightindex` accept common local rsync/rclone-style copy flags directly at the top level.
-Unsupported options are skipped and reported to stderr.
-Remote endpoints are not supported yet; source and destination must both be local filesystem paths.
+`rclone` and `rsync`  
+Compatibility frontends that accept common transfer flags and execute the same copy plan logic.
+Mapped and accepted options are applied; unsupported ones are reported to stderr.
 
 ```bash
-ndex \
-  [copy flags...] \
+nightindex rsync \
+  [rsync flags...] \
+  <source> <destination>
+  
+nightindex rclone \
+  [rclone flags...] \
   <source> <destination>
 ```
 
-Backward-compatible forms still work:
+Common mapped options:
 
-```bash
-ndex rsync [copy flags...] <source> <destination>
-ndex rclone [copy flags...] <source> <destination>
-```
-
-Compatibility matrix:
-
-| Category | Flags | Behavior |
-|---|---|---|
-| mapped | `-n`, `--dry-run` | dry-run mode |
-| mapped | `--ignore-existing` | skip destination paths that already exist |
-| mapped | `--update`, `-u` | replace destination files only when source is newer |
-| mapped | `--checksum`, `-c` | enable hash-based matching |
-| mapped | `--exclude`, `--exclude-from` | imported into scan policy excludes |
-| mapped | `--include`, `--include-from` | include allowlist patterns applied to planned copy items |
-| mapped | `--files-from` | newline-delimited relative paths added to the include allowlist |
-| mapped subset | `--filter`, `--filter-from` | `+` rules add allowlist patterns, `-` rules add blocklist patterns |
-| mapped | `--log-file`, `--log`, `--policy`, `--progress-every` | map to compat runtime controls |
-| mapped | `--size-only`, `--ignore-times` | treat same-size files as equivalent during conflict checks |
-| mapped | `--stop-on-error` | fail fast on first copy failure |
-| local-only | default mode | changed files can be overwritten unless constrained by flags |
-| unsupported/no-op | `--delete*`, `--inplace`, ssh/rsh transport family | reported and ignored |
-| rejected | remote specs like `host:/path`, `user@host:/path`, `rsync://`, `s3://...` | hard error up front |
-
-Troubleshooting:
-- if your source is remote-style (`user@host:/path`), mount it first (SSHFS/NFS/SMB/local mirror) and then run `ndex` against local mount paths.
+- `-n`, `--dry-run` → dry-run mode  
+- `--ignore-existing`, `--update`, `-u` → skip existing files (no overwrite)  
+- `--checksum`, `-c` → force hash-based file matching  
+- `--stop-on-error` → fail fast on the first copy error  
+- `--exclude <pattern>` and `--exclude-from <file>` → import excludes into scan policy  
+- `--delete`, `--delete-before`, `--delete-during`, `--delete-after` → delete destination-only files  
+- `--include <pattern>`, `--include-from <file>` → include allowlist patterns  
+- `--filter <rule>`, `--filter-from <file>` → `+` rules add allowlist patterns and `-` rules add blocklist patterns  
+- `--log-file <path>`, `--log <path>` and `--policy <path>`  
+- `--progress-every <n>` → override progress interval  
+- `--size-only`, `--ignore-times` → recovery mode: treat same-size files as equivalent when destination
+  conflict checks are made (helps when timestamps/mtime drift is common)
+- Accepted and ignored: `--copy-links`, `--copy-unsafe-links`, `--links`, `--perms`, `--times`,
+  `--group`, `--owner`, `--chmod`, `--progress`, `--max-age`
+- Accepted compat flag: `--inplace`
+- Still unsupported in direct compat mode: `--rsh`, `--ssh`, `--dry-run-mode`
 
 Usage examples:
 
 ```bash
-ndex --dry-run -av --ignore-existing /mnt/source /tank/dest
-ndex --checksum --exclude /foo /mnt/source /tank/dest
+ndex rsync --dry-run --delete-after --ignore-existing --stop-on-error --progress-every 250 /mnt/source /tank/dest
+ndex rclone --checksum --include 'QCOM/**' --filter '- QCOM/tmp/**' /mnt/source /tank/dest
 ```
 
 Terminal shortcuts:
