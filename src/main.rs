@@ -5,7 +5,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -78,8 +78,14 @@ const DOSSIER_FOLDER_PREFIX_TOKEN_WEIGHT: f64 = 0.05;
 const DOSSIER_FOLDER_DEPTH_TOKEN_WEIGHT: f64 = 0.02;
 
 #[derive(Parser)]
-#[command(name = "nightindex")]
-#[command(about = "Indexed recovery copy for hostile file trees", long_about = None)]
+#[command(
+    name = "nightindex",
+    alias = "ndex",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "Indexed recovery copy for hostile file trees",
+    long_about = "Use `nightindex` for explicit commands or `ndex` as the shorter alias.",
+    after_help = "Command names:\n- `nightindex` (full command name)\n- `ndex` (binary alias)\n\nRecovery aliases:\n- `nightindex dossier` (alias: `intel`)\n- `nightindex plan-copy-missing` (alias: `plan`)\n- `nightindex sync-copy-missing` (alias: `sync`)\n- `nightindex execute-copy-missing` (alias: `execute`)\n- `nightindex extract-check` (alias: `extcheck`)",
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -90,17 +96,33 @@ enum Commands {
     Scan(ScanArgs),
     CompareSummary(CompareSummaryArgs),
     Brief(BriefArgs),
-    #[command(alias = "intel")]
+    #[command(about = "Read-only folder identity scoring", alias = "intel")]
     Dossier(DossierArgs),
-    #[command(alias = "extcheck")]
+    #[command(about = "Compare archive-like payload families", alias = "extcheck")]
     ExtractCheck(ExtractCheckArgs),
-    #[command(alias = "plan")]
+    #[command(about = "Create a plan for missing file copy", alias = "plan")]
     PlanCopyMissing(PlanCopyMissingArgs),
     ExecuteCopyMissing(ExecuteCopyMissingArgs),
-    #[command(alias = "execute")]
+    #[command(about = "Execute a previously generated copy plan", alias = "execute")]
     ExecutePlan(ExecutePlanArgs),
-    #[command(name = "sync-copy-missing", alias = "sync")]
+    #[command(
+        name = "sync-copy-missing",
+        about = "Plan and execute missing-file copy in one step",
+        alias = "sync"
+    )]
     SyncCopyMissing(SyncCopyMissingArgs),
+    #[command(
+        name = "rclone",
+        about = "Compatibility frontend for rclone-like command style",
+        trailing_var_arg = true
+    )]
+    Rclone(CompatCopyArgs),
+    #[command(
+        name = "rsync",
+        about = "Compatibility frontend for rsync-like command style",
+        trailing_var_arg = true
+    )]
+    Rsync(CompatCopyArgs),
 }
 
 #[derive(Args)]
@@ -277,6 +299,32 @@ struct SyncCopyMissingArgs {
     write_plan: Option<PathBuf>,
 }
 
+#[derive(Args, Clone)]
+struct CompatCopyArgs {
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    compat_args: Vec<String>,
+}
+
+#[derive(Debug)]
+struct CompatRuntime {
+    source: PathBuf,
+    destination: PathBuf,
+    overwrite: bool,
+    ignore_existing: bool,
+    update_only: bool,
+    dry_run: bool,
+    stop_on_error: bool,
+    policy: Option<PathBuf>,
+    hash: bool,
+    log: Option<PathBuf>,
+    progress_every: usize,
+    size_only: bool,
+    exclude_prefixes: Vec<String>,
+    include_patterns: Vec<String>,
+    filter_exclude_patterns: Vec<String>,
+    unsupported_args: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 struct FileRecord {
     rel_path: String,
@@ -375,7 +423,7 @@ struct CopyPlanSummary {
     right_files: usize,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct CopyPlanItem {
     rel_path: String,
     size: u64,
@@ -387,10 +435,13 @@ struct CopyRunArgs {
     source_root: PathBuf,
     destination_root: PathBuf,
     overwrite: bool,
+    ignore_existing: bool,
+    update_only: bool,
     dry_run: bool,
     stop_on_error: bool,
     log: Option<PathBuf>,
     progress_every: usize,
+    size_only: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -523,7 +574,20 @@ enum DossierTokenFamily {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    dispatch_argv(std::env::args().collect())
+}
+
+fn dispatch_argv(argv: Vec<String>) -> Result<()> {
+    if should_use_direct_compat(&argv) {
+        return compat_copy_command(
+            CompatCopyArgs {
+                compat_args: argv.into_iter().skip(1).collect(),
+            },
+            "copy",
+        );
+    }
+
+    let cli = Cli::parse_from(argv);
     match cli.command {
         Commands::Scan(args) => scan_command(args),
         Commands::CompareSummary(args) => compare_summary_command(args),
@@ -534,7 +598,41 @@ fn main() -> Result<()> {
         Commands::ExecuteCopyMissing(args) => execute_copy_missing_command(args),
         Commands::ExecutePlan(args) => execute_plan_command(args),
         Commands::SyncCopyMissing(args) => sync_copy_missing_command(args),
+        Commands::Rclone(args) => compat_copy_command(args, "rclone"),
+        Commands::Rsync(args) => compat_copy_command(args, "rsync"),
     }
+}
+
+fn should_use_direct_compat(argv: &[String]) -> bool {
+    let Some(first) = argv.get(1).map(String::as_str) else {
+        return false;
+    };
+    if matches!(first, "-h" | "--help" | "-V" | "--version" | "help") {
+        return false;
+    }
+    !is_known_command_name(first)
+}
+
+fn is_known_command_name(value: &str) -> bool {
+    matches!(
+        value,
+        "scan"
+            | "compare-summary"
+            | "brief"
+            | "dossier"
+            | "intel"
+            | "extract-check"
+            | "extcheck"
+            | "plan-copy-missing"
+            | "plan"
+            | "execute-copy-missing"
+            | "execute-plan"
+            | "execute"
+            | "sync-copy-missing"
+            | "sync"
+            | "rclone"
+            | "rsync"
+    )
 }
 
 fn scan_command(args: ScanArgs) -> Result<()> {
@@ -1743,6 +1841,66 @@ fn build_copy_missing_plan(
         right_map.insert(row.rel_path.clone(), row);
     }
 
+    build_copy_plan_from_maps(
+        &left_map,
+        &right_map,
+        left_db,
+        right_db,
+        left,
+        right,
+        policy,
+        "copy-missing",
+        false,
+    )
+}
+
+fn build_copy_sync_plan(
+    left_db: &Path,
+    right_db: &Path,
+    left: &str,
+    right: &str,
+    policy: Option<&ExcludePolicy>,
+) -> Result<CopyPlan> {
+    let left_conn = open_db(left_db)?;
+    let right_conn = open_db(right_db)?;
+
+    let left_rows = load_label(&left_conn, left)?;
+    let right_rows = load_label(&right_conn, right)?;
+
+    let mut left_map: HashMap<String, FileRecord> = HashMap::with_capacity(left_rows.len());
+    let mut right_map: HashMap<String, FileRecord> = HashMap::with_capacity(right_rows.len());
+
+    for row in left_rows {
+        left_map.insert(row.rel_path.clone(), row);
+    }
+    for row in right_rows {
+        right_map.insert(row.rel_path.clone(), row);
+    }
+
+    build_copy_plan_from_maps(
+        &left_map,
+        &right_map,
+        left_db,
+        right_db,
+        left,
+        right,
+        policy,
+        "copy-sync",
+        true,
+    )
+}
+
+fn build_copy_plan_from_maps(
+    left_map: &HashMap<String, FileRecord>,
+    right_map: &HashMap<String, FileRecord>,
+    left_db: &Path,
+    right_db: &Path,
+    left: &str,
+    right: &str,
+    policy: Option<&ExcludePolicy>,
+    mode: &str,
+    include_changed: bool,
+) -> Result<CopyPlan> {
     let mut items = Vec::new();
     let mut bytes_to_copy = 0u64;
     let mut rel_paths: Vec<&String> = left_map.keys().collect();
@@ -1754,12 +1912,17 @@ fn build_copy_missing_plan(
                 continue;
             }
         }
-        if right_map.contains_key(rel_path) {
-            continue;
-        }
         let row = left_map
             .get(rel_path)
             .expect("left_map key list and map should stay aligned");
+        let include = match right_map.get(rel_path) {
+            None => true,
+            Some(existing) if include_changed => !file_records_equivalent(row, existing),
+            Some(_) => false,
+        };
+        if !include {
+            continue;
+        }
         bytes_to_copy += row.size;
         items.push(CopyPlanItem {
             rel_path: row.rel_path.clone(),
@@ -1770,7 +1933,7 @@ fn build_copy_missing_plan(
     }
 
     Ok(CopyPlan {
-        mode: "copy-missing".to_string(),
+        mode: mode.to_string(),
         left_label: left.to_string(),
         right_label: right.to_string(),
         left_db: Some(left_db.display().to_string()),
@@ -1784,6 +1947,19 @@ fn build_copy_missing_plan(
         },
         items,
     })
+}
+
+fn file_records_equivalent(left: &FileRecord, right: &FileRecord) -> bool {
+    if left.size != right.size {
+        return false;
+    }
+    if left.mtime_ns == right.mtime_ns {
+        return true;
+    }
+    match (left.fast_hash.as_deref(), right.fast_hash.as_deref()) {
+        (Some(left_hash), Some(right_hash)) => left_hash == right_hash,
+        _ => false,
+    }
 }
 
 fn plan_copy_missing_command(args: PlanCopyMissingArgs) -> Result<()> {
@@ -1823,10 +1999,13 @@ fn execute_copy_missing_command(args: ExecuteCopyMissingArgs) -> Result<()> {
             source_root,
             destination_root,
             overwrite: args.overwrite,
+            ignore_existing: false,
+            update_only: false,
             dry_run: args.dry_run,
             stop_on_error: args.stop_on_error,
             log: args.log,
             progress_every: args.progress_every,
+            size_only: false,
         },
         Some(&policy),
     )?;
@@ -1844,7 +2023,7 @@ fn execute_copy_missing_with_plan(
     args: CopyRunArgs,
     policy: Option<&ExcludePolicy>,
 ) -> Result<CopyExecutionSummary> {
-    if plan.mode != "copy-missing" {
+    if plan.mode != "copy-missing" && plan.mode != "copy-sync" {
         eprintln!(
             "[warn] executing plan with mode '{}' using copy-missing behavior",
             plan.mode
@@ -1862,7 +2041,7 @@ fn execute_plan_command(args: ExecutePlanArgs) -> Result<()> {
     let policy = load_exclude_policy(args.policy.as_deref())?;
 
     match plan.mode.as_str() {
-        "copy-missing" => {
+        "copy-missing" | "copy-sync" => {
             let source_root = resolve_copy_source_root(&args.from, "source")?;
             let destination_root = resolve_copy_destination_root(&args.to)?;
             let started_at_ns = now_ns()?;
@@ -1872,10 +2051,13 @@ fn execute_plan_command(args: ExecutePlanArgs) -> Result<()> {
                     source_root,
                     destination_root,
                     overwrite: args.overwrite,
+                    ignore_existing: false,
+                    update_only: false,
                     dry_run: args.dry_run,
                     stop_on_error: args.stop_on_error,
                     log: args.log,
                     progress_every: args.progress_every,
+                    size_only: false,
                 },
                 Some(&policy),
             )?;
@@ -1914,10 +2096,13 @@ fn sync_copy_missing_command(args: SyncCopyMissingArgs) -> Result<()> {
             source_root,
             destination_root,
             overwrite: args.overwrite,
+            ignore_existing: false,
+            update_only: false,
             dry_run: args.dry_run,
             stop_on_error: args.stop_on_error,
             log: args.log,
             progress_every: args.progress_every,
+            size_only: false,
         },
         Some(&policy),
     )?;
@@ -1928,6 +2113,740 @@ fn sync_copy_missing_command(args: SyncCopyMissingArgs) -> Result<()> {
     let json = serde_json::to_string_pretty(&summary)?;
     println!("{json}");
     Ok(())
+}
+
+fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
+    let total_started = now_ns()?;
+    let runtime = parse_compat_copy_flags(&args, command)?;
+    if !runtime.unsupported_args.is_empty() {
+        eprintln!(
+            "[nightindex {command}] ignored/unsupported flags: {}",
+            runtime.unsupported_args.join(", ")
+        );
+    }
+    let mut policy = load_exclude_policy(runtime.policy.as_deref())?;
+
+    if !runtime.exclude_prefixes.is_empty() {
+        let excludes = normalize_excludes(&runtime.exclude_prefixes);
+        for prefix in &excludes {
+            if !policy
+                .directory_prefixes
+                .iter()
+                .any(|existing| existing == prefix)
+            {
+                policy.directory_prefixes.push(prefix.clone());
+            }
+        }
+        if !excludes.is_empty() {
+            policy.enabled = true;
+            eprintln!(
+                "[nightindex {command}] active compatibility excludes: {}",
+                excludes.join(", ")
+            );
+        }
+    }
+
+    let work_root = {
+        let root = std::env::temp_dir().join(format!(
+            "nightindex-compat-{}-{}",
+            std::process::id(),
+            now_ns()?
+        ));
+        fs::create_dir_all(&root)
+            .with_context(|| format!("failed to create {}", root.display()))?;
+        root
+    };
+    let left_db = work_root.join("source.sqlite");
+    let right_db = work_root.join("destination.sqlite");
+    let left_label = "left_source".to_string();
+    let right_label = "right_destination".to_string();
+
+    reject_remote_like_path(&runtime.source, command, "source")?;
+    reject_remote_like_path(&runtime.destination, command, "destination")?;
+
+    let source_root = resolve_copy_source_root(&runtime.source, "source")?;
+    let destination_root = resolve_copy_destination_root(&runtime.destination)?;
+
+    eprintln!(
+        "[nightindex {command}] scan source={} destination={} dry_run={} checksum={} ignore_existing={} update_only={} size_only={}",
+        source_root.display(),
+        destination_root.display(),
+        runtime.dry_run,
+        runtime.hash,
+        runtime.ignore_existing,
+        runtime.update_only,
+        runtime.size_only
+    );
+    if !runtime.include_patterns.is_empty() {
+        eprintln!(
+            "[nightindex {command}] include patterns: {}",
+            runtime.include_patterns.join(", ")
+        );
+    }
+    if !runtime.filter_exclude_patterns.is_empty() {
+        eprintln!(
+            "[nightindex {command}] filter excludes: {}",
+            runtime.filter_exclude_patterns.join(", ")
+        );
+    }
+
+    let scan_started = now_ns()?;
+    scan_command(ScanArgs {
+        db: left_db.clone(),
+        label: left_label.clone(),
+        root: source_root.clone(),
+        exclude_prefixes: runtime.exclude_prefixes.clone(),
+        policy: runtime.policy.clone(),
+        hash: runtime.hash,
+    })?;
+    scan_command(ScanArgs {
+        db: right_db.clone(),
+        label: right_label.clone(),
+        root: destination_root.clone(),
+        exclude_prefixes: runtime.exclude_prefixes,
+        policy: runtime.policy.clone(),
+        hash: runtime.hash,
+    })?;
+    let scan_elapsed = now_ns()? - scan_started;
+    eprintln!(
+        "[nightindex {command}] phase=scan duration={} source={} destination={}",
+        format_duration_ns(scan_elapsed),
+        source_root.display(),
+        destination_root.display()
+    );
+
+    let plan_started = now_ns()?;
+    let plan = build_copy_sync_plan(
+        &left_db,
+        &right_db,
+        &left_label,
+        &right_label,
+        Some(&policy),
+    )?;
+    let filtered_plan = filter_plan_by_include_patterns(
+        &plan,
+        &runtime.include_patterns,
+        &runtime.filter_exclude_patterns,
+    );
+    let plan_elapsed = now_ns()? - plan_started;
+    eprintln!(
+        "[nightindex {command}] phase=plan mode={} files={} bytes={} duration={}",
+        filtered_plan.mode,
+        filtered_plan.summary.files_to_copy,
+        format_bytes(filtered_plan.summary.bytes_to_copy),
+        format_duration_ns(plan_elapsed)
+    );
+
+    let copy_started = now_ns()?;
+    let summary = execute_copy_missing_with_plan(
+        &filtered_plan,
+        CopyRunArgs {
+            source_root,
+            destination_root,
+            overwrite: runtime.overwrite,
+            ignore_existing: runtime.ignore_existing,
+            update_only: runtime.update_only,
+            dry_run: runtime.dry_run,
+            stop_on_error: runtime.stop_on_error,
+            log: runtime.log,
+            progress_every: runtime.progress_every,
+            size_only: runtime.size_only,
+        },
+        Some(&policy),
+    )?;
+    let copy_elapsed = now_ns()? - copy_started;
+    let cleanup = fs::remove_dir_all(&work_root);
+    if let Err(err) = cleanup {
+        eprintln!("[nightindex {command}] cleanup warning: {err}");
+    }
+
+    eprintln!(
+        "[nightindex {command}] phase=copy copied={} overwritten={} skipped_existing={} skipped_conflict={} failed={} bytes={} duration={}",
+        summary.copied_files,
+        summary.overwritten_files,
+        summary.skipped_existing,
+        summary.skipped_conflict,
+        summary.failed_files,
+        format_bytes(summary.copied_bytes),
+        format_duration_ns(copy_elapsed)
+    );
+    eprintln!(
+        "[nightindex {command}] phase=total duration={} mode={} dry_run={}",
+        format_duration_ns(now_ns()? - total_started),
+        summary.mode,
+        summary.dry_run
+    );
+
+    let json = serde_json::to_string_pretty(&summary)?;
+    println!("{json}");
+    Ok(())
+}
+
+fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<CompatRuntime> {
+    let mut parsed = CompatRuntime {
+        source: PathBuf::new(),
+        destination: PathBuf::new(),
+        overwrite: true,
+        ignore_existing: false,
+        update_only: false,
+        dry_run: false,
+        stop_on_error: false,
+        policy: None,
+        hash: false,
+        log: None,
+        progress_every: 1000,
+        size_only: false,
+        exclude_prefixes: Vec::new(),
+        include_patterns: Vec::new(),
+        filter_exclude_patterns: Vec::new(),
+        unsupported_args: Vec::new(),
+    };
+    let mut unsupported_seen: HashSet<String> = HashSet::new();
+    let mut positionals: Vec<String> = Vec::new();
+
+    let mut iter = args.compat_args.clone().into_iter();
+    let next_value = |iter: &mut std::vec::IntoIter<String>, option: &str| -> Result<String> {
+        iter.next().with_context(|| {
+            format!("missing value for {option} in {command} compatibility parsing")
+        })
+    };
+
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            while let Some(value) = iter.next() {
+                positionals.push(value);
+            }
+            break;
+        }
+
+        if let Some((key, value)) = arg.split_once('=') {
+            if !key.starts_with("--") {
+                positionals.push(arg);
+                continue;
+            }
+            let key = key.replace('_', "-");
+
+            match key.as_str() {
+                "--dry-run" => parsed.dry_run = true,
+                "--ignore-existing" => parsed.ignore_existing = true,
+                "--update" => parsed.update_only = true,
+                "--checksum" | "--hash" => parsed.hash = true,
+                "--copy-links"
+                | "--copy-unsafe-links"
+                | "--links"
+                | "--perms"
+                | "--times"
+                | "--group"
+                | "--owner"
+                | "--chmod"
+                | "--progress"
+                | "--max-age" => {}
+                "--log-file" | "--log" => parsed.log = Some(PathBuf::from(value)),
+                "--policy" => parsed.policy = Some(PathBuf::from(value)),
+                "--exclude" => parsed.exclude_prefixes.push(value.to_string()),
+                "--exclude-from" => {
+                    parse_exclude_file(value, &mut parsed.exclude_prefixes)
+                        .with_context(|| format!("invalid --exclude-from value '{value}'"))?;
+                }
+                "--include" => parsed.include_patterns.push(value.to_string()),
+                "--include-from" => {
+                    parse_include_file(value, &mut parsed.include_patterns)
+                        .with_context(|| format!("invalid --include-from value '{value}'"))?;
+                }
+                "--files-from" => {
+                    parse_files_from_file(value, &mut parsed.include_patterns)
+                        .with_context(|| format!("invalid --files-from value '{value}'"))?;
+                }
+                "--filter" => {
+                    parse_filter_rule(
+                        value,
+                        &mut parsed.include_patterns,
+                        &mut parsed.filter_exclude_patterns,
+                        &mut parsed.unsupported_args,
+                        &mut unsupported_seen,
+                    );
+                }
+                "--filter-from" => {
+                    parse_filter_file(
+                        value,
+                        &mut parsed.include_patterns,
+                        &mut parsed.filter_exclude_patterns,
+                        &mut parsed.unsupported_args,
+                        &mut unsupported_seen,
+                    )
+                    .with_context(|| format!("invalid --filter-from value '{value}'"))?;
+                }
+                "--progress-every" => {
+                    parsed.progress_every = value
+                        .parse::<usize>()
+                        .map_err(|_| {
+                            anyhow!(
+                                "invalid --progress-every '{value}' in {command} compatibility parsing"
+                            )
+                        })?
+                        .max(1);
+                }
+                "--size-only" | "--ignore-times" => {
+                    parsed.size_only = true;
+                }
+                "--delete" | "--delete-before" | "--delete-during" | "--delete-after" => {
+                    push_unsupported_arg(
+                        &mut parsed.unsupported_args,
+                        &mut unsupported_seen,
+                        format!("{key}"),
+                    );
+                }
+                "--rsh" | "--ssh" | "--dry-run-mode" => {
+                    push_unsupported_arg(
+                        &mut parsed.unsupported_args,
+                        &mut unsupported_seen,
+                        format!("{key}={value}"),
+                    );
+                }
+                _ => push_unsupported_arg(
+                    &mut parsed.unsupported_args,
+                    &mut unsupported_seen,
+                    format!("{key}={value}"),
+                ),
+            }
+            continue;
+        }
+
+        if let Some(raw_stripped) = arg.strip_prefix("--") {
+            let stripped = raw_stripped.replace('_', "-");
+            if stripped.is_empty() {
+                positionals.push(arg);
+                continue;
+            }
+
+            let option = format!("--{stripped}");
+
+            match stripped.as_str() {
+                "dry-run" => parsed.dry_run = true,
+                "ignore-existing" => parsed.ignore_existing = true,
+                "update" => parsed.update_only = true,
+                "checksum" => parsed.hash = true,
+                "overwrite" => parsed.overwrite = true,
+                "hash" => parsed.hash = true,
+                "copy-links" | "copy-unsafe-links" | "links" | "perms" | "times" | "group"
+                | "owner" | "progress" | "max-age" => {}
+                "stop-on-error" => parsed.stop_on_error = true,
+                "size-only" | "ignore-times" => parsed.size_only = true,
+                "log-file" | "log" => {
+                    let value = next_value(&mut iter, &option)?;
+                    parsed.log = Some(PathBuf::from(value));
+                }
+                "policy" => {
+                    let value = next_value(&mut iter, &option)?;
+                    parsed.policy = Some(PathBuf::from(value));
+                }
+                "exclude" => {
+                    let value = next_value(&mut iter, &option)?;
+                    parsed.exclude_prefixes.push(value);
+                }
+                "exclude-from" => {
+                    let value = next_value(&mut iter, &option)?;
+                    parse_exclude_file(&value, &mut parsed.exclude_prefixes)
+                        .with_context(|| format!("invalid --exclude-from value '{value}'"))?;
+                }
+                "include" => {
+                    let value = next_value(&mut iter, &option)?;
+                    parsed.include_patterns.push(value);
+                }
+                "include-from" => {
+                    let value = next_value(&mut iter, &option)?;
+                    parse_include_file(&value, &mut parsed.include_patterns)
+                        .with_context(|| format!("invalid --include-from value '{value}'"))?;
+                }
+                "files-from" => {
+                    let value = next_value(&mut iter, &option)?;
+                    parse_files_from_file(&value, &mut parsed.include_patterns)
+                        .with_context(|| format!("invalid --files-from value '{value}'"))?;
+                }
+                "filter" => {
+                    let value = next_value(&mut iter, &option)?;
+                    parse_filter_rule(
+                        &value,
+                        &mut parsed.include_patterns,
+                        &mut parsed.filter_exclude_patterns,
+                        &mut parsed.unsupported_args,
+                        &mut unsupported_seen,
+                    );
+                }
+                "filter-from" => {
+                    let value = next_value(&mut iter, &option)?;
+                    parse_filter_file(
+                        &value,
+                        &mut parsed.include_patterns,
+                        &mut parsed.filter_exclude_patterns,
+                        &mut parsed.unsupported_args,
+                        &mut unsupported_seen,
+                    )
+                    .with_context(|| format!("invalid --filter-from value '{value}'"))?;
+                }
+                "progress-every" => {
+                    let value = next_value(&mut iter, &option)?;
+                    parsed.progress_every = value
+                        .parse::<usize>()
+                        .with_context(|| format!("invalid --progress-every '{value}'"))?
+                        .max(1);
+                }
+                "delete" | "delete-before" | "delete-during" | "delete-after" => {
+                    push_unsupported_arg(
+                        &mut parsed.unsupported_args,
+                        &mut unsupported_seen,
+                        format!("--{stripped}"),
+                    );
+                }
+                "rsh" | "ssh" => {
+                    let value = next_value(&mut iter, &option)?;
+                    push_unsupported_arg(
+                        &mut parsed.unsupported_args,
+                        &mut unsupported_seen,
+                        format!("--{stripped}={value}"),
+                    );
+                }
+                "dry-run-mode" => {
+                    push_unsupported_arg(
+                        &mut parsed.unsupported_args,
+                        &mut unsupported_seen,
+                        format!("--{stripped}"),
+                    );
+                }
+                _ => push_unsupported_arg(
+                    &mut parsed.unsupported_args,
+                    &mut unsupported_seen,
+                    format!("--{stripped}"),
+                ),
+            }
+            continue;
+        }
+
+        if arg.starts_with('-') && arg != "-" {
+            let short = &arg[1..];
+            let mut index = 0usize;
+            while index < short.len() {
+                let flag = short.as_bytes()[index] as char;
+                index += 1;
+
+                let takes_value = matches!(flag, 'e' | 'f');
+                if takes_value {
+                    let value = if index < short.len() {
+                        let value = short[index..].to_string();
+                        index = short.len();
+                        value
+                    } else {
+                        next_value(&mut iter, &format!("-{flag}"))?
+                    };
+                    match flag {
+                        'e' => push_unsupported_arg(
+                            &mut parsed.unsupported_args,
+                            &mut unsupported_seen,
+                            format!("--rsh={value}"),
+                        ),
+                        'f' => push_unsupported_arg(
+                            &mut parsed.unsupported_args,
+                            &mut unsupported_seen,
+                            format!("--filter={value}"),
+                        ),
+                        _ => push_unsupported_arg(
+                            &mut parsed.unsupported_args,
+                            &mut unsupported_seen,
+                            format!("-{flag}={value}"),
+                        ),
+                    }
+                    continue;
+                }
+
+                match flag {
+                    'n' => parsed.dry_run = true,
+                    'u' => parsed.update_only = true,
+                    'c' => parsed.hash = true,
+                    'a' | 'r' | 'v' | 'l' | 't' | 'p' | 'h' | 'H' | 'L' | 'z' | 'R' | 'x' | 'q'
+                    | 'I' | 'S' | 'k' | 'm' | 'D' | 'o' | 'g' | 'P' => {}
+                    _ => push_unsupported_arg(
+                        &mut parsed.unsupported_args,
+                        &mut unsupported_seen,
+                        format!("-{flag}"),
+                    ),
+                }
+            }
+            continue;
+        }
+
+        positionals.push(arg);
+    }
+
+    if positionals.len() < 2 {
+        bail!("{command} requires <source> <destination>");
+    }
+    parsed.source = PathBuf::from(positionals[0].clone());
+    parsed.destination = PathBuf::from(positionals[1].clone());
+    if positionals.len() > 2 {
+        for extra in &positionals[2..] {
+            push_unsupported_arg(
+                &mut parsed.unsupported_args,
+                &mut unsupported_seen,
+                format!("extra positional: {extra}"),
+            );
+        }
+    }
+    parsed.progress_every = parsed.progress_every.max(1);
+    Ok(parsed)
+}
+
+fn push_unsupported_arg(output: &mut Vec<String>, seen: &mut HashSet<String>, value: String) {
+    if seen.insert(value.clone()) {
+        output.push(value);
+    }
+}
+
+fn parse_exclude_file(path: &str, excludes: &mut Vec<String>) -> Result<()> {
+    parse_pattern_file(path, excludes, "exclude")
+}
+
+fn parse_include_file(path: &str, includes: &mut Vec<String>) -> Result<()> {
+    parse_pattern_file(path, includes, "include")
+}
+
+fn parse_files_from_file(path: &str, includes: &mut Vec<String>) -> Result<()> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read files-from file {path}"))?;
+    for line in text.lines() {
+        let value = line.trim();
+        if value.is_empty() || value.starts_with('#') {
+            continue;
+        }
+        let normalized = normalize_policy_path(value);
+        if !normalized.is_empty() {
+            includes.push(normalized);
+        }
+    }
+    Ok(())
+}
+
+fn parse_filter_file(
+    path: &str,
+    filter_includes: &mut Vec<String>,
+    filter_excludes: &mut Vec<String>,
+    unsupported_args: &mut Vec<String>,
+    unsupported_seen: &mut HashSet<String>,
+) -> Result<()> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read filter file {path}"))?;
+    for line in text.lines() {
+        let rule = line.trim();
+        if rule.is_empty() || rule.starts_with('#') {
+            continue;
+        }
+        parse_filter_rule(
+            rule,
+            filter_includes,
+            filter_excludes,
+            unsupported_args,
+            unsupported_seen,
+        );
+    }
+    Ok(())
+}
+
+fn parse_pattern_file(path: &str, output: &mut Vec<String>, kind: &str) -> Result<()> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {kind} file {path}"))?;
+    for line in text.lines() {
+        let value = line.trim();
+        if value.is_empty() || value.starts_with('#') {
+            continue;
+        }
+        output.push(value.to_string());
+    }
+    Ok(())
+}
+
+fn parse_filter_rule(
+    rule: &str,
+    filter_includes: &mut Vec<String>,
+    filter_excludes: &mut Vec<String>,
+    unsupported_args: &mut Vec<String>,
+    unsupported_seen: &mut HashSet<String>,
+) {
+    let trimmed = rule.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if let Some(rest) = trimmed.strip_prefix('+') {
+        let pattern = rest.trim();
+        if !pattern.is_empty() {
+            filter_includes.push(pattern.to_string());
+            return;
+        }
+    } else if let Some(rest) = trimmed.strip_prefix('-') {
+        let pattern = rest.trim();
+        if !pattern.is_empty() {
+            filter_excludes.push(pattern.to_string());
+            return;
+        }
+    }
+    push_unsupported_arg(
+        unsupported_args,
+        unsupported_seen,
+        format!("--filter={trimmed}"),
+    );
+}
+
+fn filter_plan_by_include_patterns(
+    plan: &CopyPlan,
+    include_patterns: &[String],
+    filter_exclude_patterns: &[String],
+) -> CopyPlan {
+    if include_patterns.is_empty() && filter_exclude_patterns.is_empty() {
+        return CopyPlan {
+            mode: plan.mode.clone(),
+            left_label: plan.left_label.clone(),
+            right_label: plan.right_label.clone(),
+            left_db: plan.left_db.clone(),
+            right_db: plan.right_db.clone(),
+            generated_at_ns: plan.generated_at_ns,
+            summary: CopyPlanSummary {
+                files_to_copy: plan.summary.files_to_copy,
+                bytes_to_copy: plan.summary.bytes_to_copy,
+                left_files: plan.summary.left_files,
+                right_files: plan.summary.right_files,
+            },
+            items: plan.items.clone(),
+        };
+    }
+
+    let mut items = Vec::new();
+    let mut bytes_to_copy = 0u64;
+    for item in &plan.items {
+        let include_match = include_patterns.is_empty()
+            || include_patterns
+                .iter()
+                .any(|pattern| path_matches_pattern(&item.rel_path, pattern));
+        let exclude_match = filter_exclude_patterns
+            .iter()
+            .any(|pattern| path_matches_pattern(&item.rel_path, pattern));
+        if include_match && !exclude_match {
+            bytes_to_copy += item.size;
+            items.push(item.clone());
+        }
+    }
+
+    CopyPlan {
+        mode: plan.mode.clone(),
+        left_label: plan.left_label.clone(),
+        right_label: plan.right_label.clone(),
+        left_db: plan.left_db.clone(),
+        right_db: plan.right_db.clone(),
+        generated_at_ns: plan.generated_at_ns,
+        summary: CopyPlanSummary {
+            files_to_copy: items.len(),
+            bytes_to_copy,
+            left_files: plan.summary.left_files,
+            right_files: plan.summary.right_files,
+        },
+        items,
+    }
+}
+
+fn path_matches_pattern(path: &str, pattern: &str) -> bool {
+    wildcard_match(path.as_bytes(), pattern.as_bytes())
+}
+
+fn wildcard_match(text: &[u8], pattern: &[u8]) -> bool {
+    let (mut ti, mut pi) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti) = (None::<usize>, 0usize);
+
+    while ti < text.len() {
+        if pi < pattern.len() && (pattern[pi] == b'?' || pattern[pi] == text[ti]) {
+            ti += 1;
+            pi += 1;
+            continue;
+        }
+        if pi < pattern.len() && pattern[pi] == b'*' {
+            star_pi = Some(pi);
+            pi += 1;
+            star_ti = ti;
+            continue;
+        }
+        if let Some(star) = star_pi {
+            pi = star + 1;
+            star_ti += 1;
+            ti = star_ti;
+            continue;
+        }
+        return false;
+    }
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pattern.len()
+}
+
+fn reject_remote_like_path(path: &Path, command: &str, role: &str) -> Result<()> {
+    let value = path.to_string_lossy();
+    if value == "-" {
+        return Ok(());
+    }
+    if looks_like_remote_spec(&value) {
+        bail!("{command} compatibility does not support remote {role} paths yet: {value}");
+    }
+    Ok(())
+}
+
+fn looks_like_remote_spec(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains("://") {
+        return true;
+    }
+    if trimmed.starts_with("rsync://") {
+        return true;
+    }
+    if let Some((left, right)) = trimmed.split_once(':') {
+        if left.is_empty() || right.is_empty() {
+            return false;
+        }
+        if left.starts_with('/') || trimmed.starts_with("./") || trimmed.starts_with("../") {
+            return false;
+        }
+        if left.len() == 1 && left.chars().all(|ch| ch.is_ascii_alphabetic()) {
+            return false;
+        }
+        return !right.starts_with('\\');
+    }
+    false
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit_index = 0usize;
+    while value >= 1024.0 && unit_index + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit_index += 1;
+    }
+    if unit_index == 0 {
+        format!("{bytes} {}", UNITS[unit_index])
+    } else {
+        format!("{value:.2} {}", UNITS[unit_index])
+    }
+}
+
+fn format_duration_ns(duration_ns: i64) -> String {
+    let secs = duration_ns as f64 / 1_000_000_000.0;
+    if secs < 1.0 {
+        format!("{:.0} ms", secs * 1000.0)
+    } else if secs < 60.0 {
+        format!("{secs:.2} s")
+    } else {
+        let minutes = (secs / 60.0).floor() as u64;
+        let rem = secs - (minutes as f64 * 60.0);
+        format!("{minutes}m {rem:.1}s")
+    }
 }
 
 fn resolve_copy_source_root(path: &Path, label: &str) -> Result<PathBuf> {
@@ -2088,6 +3007,9 @@ fn run_copy_plan(
                         } else if let Some(expected_hash) = item.fast_hash.as_deref() {
                             same_file = blake3_file(&destination_path)? == expected_hash;
                         }
+                        if args.size_only {
+                            same_file = true;
+                        }
                     }
 
                     if same_file {
@@ -2106,6 +3028,52 @@ fn run_copy_plan(
                             },
                         )?;
                         continue;
+                    }
+
+                    if args.ignore_existing {
+                        skipped_existing += 1;
+                        write_event(
+                            &mut log,
+                            &CopyEvent {
+                                schema_version: 2,
+                                rel_path: item.rel_path.clone(),
+                                action: CopyEventAction::SkipExisting,
+                                existing_bytes,
+                                bytes: 0,
+                                dry_run: args.dry_run,
+                                overwrite: args.overwrite,
+                                reason: Some(
+                                    "destination exists and --ignore-existing is active"
+                                        .to_string(),
+                                ),
+                            },
+                        )?;
+                        continue;
+                    }
+
+                    if args.update_only {
+                        let destination_mtime =
+                            metadata.modified().ok().and_then(system_time_to_ns);
+                        if destination_mtime.is_some_and(|mtime| mtime >= item.mtime_ns) {
+                            skipped_existing += 1;
+                            write_event(
+                                &mut log,
+                                &CopyEvent {
+                                    schema_version: 2,
+                                    rel_path: item.rel_path.clone(),
+                                    action: CopyEventAction::SkipExisting,
+                                    existing_bytes,
+                                    bytes: 0,
+                                    dry_run: args.dry_run,
+                                    overwrite: args.overwrite,
+                                    reason: Some(
+                                        "destination is newer or same age under --update"
+                                            .to_string(),
+                                    ),
+                                },
+                            )?;
+                            continue;
+                        }
                     }
 
                     if !is_overwrite {
@@ -2432,7 +3400,7 @@ fn normalize_policy_path(value: &str) -> String {
         .trim()
         .trim_matches('/')
         .split('/')
-        .filter(|part| !part.is_empty())
+        .filter(|part| !part.is_empty() && *part != ".")
         .collect::<Vec<_>>()
         .join("/")
 }
@@ -2516,4 +3484,678 @@ fn blake3_file(path: &Path) -> Result<String> {
         hasher.update(&buf[..read]);
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "nightindex-test-{}-{}-{}",
+            std::process::id(),
+            prefix,
+            nanos
+        ));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_maps_supported_aliases() -> Result<()> {
+        let root = temp_dir("compat");
+        let exclude_file = root.join("excludes.txt");
+        fs::write(&exclude_file, "cache\n#note\nnode_modules\n\n")?;
+
+        let args = CompatCopyArgs {
+            compat_args: vec![
+                "--dry-run".into(),
+                "-uc".into(),
+                "--checksum".into(),
+                "--progress-every".into(),
+                "42".into(),
+                "--log".into(),
+                "/tmp/nightindex-compat.log".into(),
+                "--exclude".into(),
+                "tmp/cache".into(),
+                "--exclude-from".into(),
+                exclude_file.display().to_string(),
+                "--ignore-times".into(),
+                "source".into(),
+                "dest".into(),
+                "unused".into(),
+            ],
+        };
+
+        let runtime = parse_compat_copy_flags(&args, "rsync")?;
+        assert!(runtime.dry_run);
+        assert!(runtime.hash);
+        assert!(runtime.size_only);
+        assert!(runtime.overwrite);
+        assert!(!runtime.ignore_existing);
+        assert!(runtime.update_only);
+        assert_eq!(runtime.progress_every, 42);
+        assert_eq!(
+            runtime.log,
+            Some(PathBuf::from("/tmp/nightindex-compat.log"))
+        );
+        assert_eq!(runtime.source, PathBuf::from("source"));
+        assert_eq!(runtime.destination, PathBuf::from("dest"));
+        assert!(
+            !runtime
+                .unsupported_args
+                .iter()
+                .any(|item| item == "--ignore-times")
+        );
+        assert!(
+            runtime
+                .unsupported_args
+                .iter()
+                .any(|item| item == "extra positional: unused")
+        );
+        assert!(
+            runtime
+                .exclude_prefixes
+                .iter()
+                .any(|item| item == "tmp/cache")
+        );
+        assert!(runtime.exclude_prefixes.iter().any(|item| item == "cache"));
+        assert!(
+            runtime
+                .exclude_prefixes
+                .iter()
+                .any(|item| item == "node_modules")
+        );
+        assert!(runtime.policy.is_none());
+
+        fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_size_only_support() -> Result<()> {
+        let args = CompatCopyArgs {
+            compat_args: vec!["--size-only".into(), "left".into(), "right".into()],
+        };
+
+        let runtime = parse_compat_copy_flags(&args, "rclone")?;
+        assert!(runtime.size_only);
+        assert_eq!(runtime.source, PathBuf::from("left"));
+        assert_eq!(runtime.destination, PathBuf::from("right"));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_marks_unknown_short_flags() -> Result<()> {
+        let args = CompatCopyArgs {
+            compat_args: vec!["-nQ".into(), "left".into(), "right".into()],
+        };
+
+        let runtime = parse_compat_copy_flags(&args, "rclone")?;
+        assert!(runtime.dry_run);
+        assert!(runtime.unsupported_args.contains(&"-Q".to_string()));
+        assert_eq!(runtime.source, PathBuf::from("left"));
+        assert_eq!(runtime.destination, PathBuf::from("right"));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_mark_inplace_unsupported() -> Result<()> {
+        let args = CompatCopyArgs {
+            compat_args: vec![
+                "--stop-on-error".into(),
+                "--inplace".into(),
+                "source".into(),
+                "dest".into(),
+            ],
+        };
+
+        let runtime = parse_compat_copy_flags(&args, "rsync")?;
+        assert!(runtime.stop_on_error);
+        assert!(
+            runtime
+                .unsupported_args
+                .iter()
+                .any(|item| item == "--inplace")
+        );
+        assert_eq!(runtime.source, PathBuf::from("source"));
+        assert_eq!(runtime.destination, PathBuf::from("dest"));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_dedupes_unsupported_flags() -> Result<()> {
+        let args = CompatCopyArgs {
+            compat_args: vec![
+                "--delete".into(),
+                "--delete".into(),
+                "-QQ".into(),
+                "source".into(),
+                "dest".into(),
+            ],
+        };
+
+        let runtime = parse_compat_copy_flags(&args, "rsync")?;
+        let delete_count = runtime
+            .unsupported_args
+            .iter()
+            .filter(|item| item.as_str() == "--delete")
+            .count();
+        let q_count = runtime
+            .unsupported_args
+            .iter()
+            .filter(|item| item.as_str() == "-Q")
+            .count();
+        assert_eq!(delete_count, 1);
+        assert_eq!(q_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_supports_equals_forms() -> Result<()> {
+        let args = CompatCopyArgs {
+            compat_args: vec![
+                "--exclude=tmp/cache".into(),
+                "--log-file=/tmp/compat.log".into(),
+                "--policy=/tmp/policy.yaml".into(),
+                "source".into(),
+                "dest".into(),
+            ],
+        };
+
+        let runtime = parse_compat_copy_flags(&args, "rclone")?;
+        assert_eq!(runtime.source, PathBuf::from("source"));
+        assert_eq!(runtime.destination, PathBuf::from("dest"));
+        assert_eq!(runtime.log, Some(PathBuf::from("/tmp/compat.log")));
+        assert_eq!(runtime.policy, Some(PathBuf::from("/tmp/policy.yaml")));
+        assert!(runtime.exclude_prefixes.iter().any(|v| v == "tmp/cache"));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_supports_include_flags() -> Result<()> {
+        let root = temp_dir("include");
+        let include_file = root.join("includes.txt");
+        fs::write(&include_file, "01_EXPLOITS/*\n#note\n04_KEYS/**\n")?;
+
+        let args = CompatCopyArgs {
+            compat_args: vec![
+                "--include".into(),
+                "QCOM/*".into(),
+                "--include-from".into(),
+                include_file.display().to_string(),
+                "source".into(),
+                "dest".into(),
+            ],
+        };
+        let runtime = parse_compat_copy_flags(&args, "rsync")?;
+        assert!(runtime.include_patterns.iter().any(|p| p == "QCOM/*"));
+        assert!(
+            runtime
+                .include_patterns
+                .iter()
+                .any(|p| p == "01_EXPLOITS/*")
+        );
+        assert!(runtime.include_patterns.iter().any(|p| p == "04_KEYS/**"));
+        fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_supports_files_from() -> Result<()> {
+        let root = temp_dir("files_from");
+        let files_from = root.join("files-from.txt");
+        fs::write(&files_from, "QCOM/a.bin\n./ARM64/b.bin\n#note\n")?;
+
+        let args = CompatCopyArgs {
+            compat_args: vec![
+                "--files-from".into(),
+                files_from.display().to_string(),
+                "source".into(),
+                "dest".into(),
+            ],
+        };
+        let runtime = parse_compat_copy_flags(&args, "rsync")?;
+        assert!(runtime.include_patterns.iter().any(|p| p == "QCOM/a.bin"));
+        assert!(runtime.include_patterns.iter().any(|p| p == "ARM64/b.bin"));
+        fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_supports_filter_rules() -> Result<()> {
+        let root = temp_dir("filter");
+        let filter_file = root.join("filters.txt");
+        fs::write(&filter_file, "+ QCOM/*\n- ARM64/*\n#note\n")?;
+
+        let args = CompatCopyArgs {
+            compat_args: vec![
+                "--filter".into(),
+                "+ 04_KEYS/*".into(),
+                "--filter-from".into(),
+                filter_file.display().to_string(),
+                "source".into(),
+                "dest".into(),
+            ],
+        };
+        let runtime = parse_compat_copy_flags(&args, "rsync")?;
+        assert!(runtime.include_patterns.iter().any(|p| p == "04_KEYS/*"));
+        assert!(runtime.include_patterns.iter().any(|p| p == "QCOM/*"));
+        assert!(
+            runtime
+                .filter_exclude_patterns
+                .iter()
+                .any(|p| p == "ARM64/*")
+        );
+        fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_marks_rsh_transport_unsupported() -> Result<()> {
+        let args = CompatCopyArgs {
+            compat_args: vec!["--rsh=ssh -p 2222".into(), "source".into(), "dest".into()],
+        };
+
+        let runtime = parse_compat_copy_flags(&args, "rsync")?;
+        assert!(
+            runtime
+                .unsupported_args
+                .iter()
+                .any(|v| v == "--rsh=ssh -p 2222")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wildcard_match_patterns() {
+        assert!(path_matches_pattern("QCOM/abc/file.bin", "QCOM/*/file.bin"));
+        assert!(path_matches_pattern("01_EXPLOITS/a.txt", "01_EXPLOITS/*"));
+        assert!(path_matches_pattern("04_KEYS/a/b/c.txt", "04_KEYS/**"));
+        assert!(!path_matches_pattern("ARM64/x.bin", "QCOM/*"));
+    }
+
+    #[test]
+    fn filter_plan_by_include_patterns_reduces_items() {
+        let plan = CopyPlan {
+            mode: "copy-sync".to_string(),
+            left_label: "left".to_string(),
+            right_label: "right".to_string(),
+            left_db: None,
+            right_db: None,
+            generated_at_ns: 1,
+            summary: CopyPlanSummary {
+                files_to_copy: 3,
+                bytes_to_copy: 30,
+                left_files: 10,
+                right_files: 5,
+            },
+            items: vec![
+                CopyPlanItem {
+                    rel_path: "QCOM/a.bin".to_string(),
+                    size: 10,
+                    mtime_ns: 1,
+                    fast_hash: None,
+                },
+                CopyPlanItem {
+                    rel_path: "ARM64/b.bin".to_string(),
+                    size: 10,
+                    mtime_ns: 1,
+                    fast_hash: None,
+                },
+                CopyPlanItem {
+                    rel_path: "04_KEYS/c.txt".to_string(),
+                    size: 10,
+                    mtime_ns: 1,
+                    fast_hash: None,
+                },
+            ],
+        };
+        let filtered = filter_plan_by_include_patterns(
+            &plan,
+            &["QCOM/*".to_string(), "04_KEYS/*".to_string()],
+            &[],
+        );
+        assert_eq!(filtered.summary.files_to_copy, 2);
+        assert_eq!(filtered.summary.bytes_to_copy, 20);
+        assert_eq!(filtered.items.len(), 2);
+    }
+
+    #[test]
+    fn filter_plan_by_include_patterns_honors_filter_excludes() {
+        let plan = CopyPlan {
+            mode: "copy-sync".to_string(),
+            left_label: "left".to_string(),
+            right_label: "right".to_string(),
+            left_db: None,
+            right_db: None,
+            generated_at_ns: 1,
+            summary: CopyPlanSummary {
+                files_to_copy: 3,
+                bytes_to_copy: 30,
+                left_files: 10,
+                right_files: 5,
+            },
+            items: vec![
+                CopyPlanItem {
+                    rel_path: "QCOM/a.bin".to_string(),
+                    size: 10,
+                    mtime_ns: 1,
+                    fast_hash: None,
+                },
+                CopyPlanItem {
+                    rel_path: "ARM64/b.bin".to_string(),
+                    size: 10,
+                    mtime_ns: 1,
+                    fast_hash: None,
+                },
+            ],
+        };
+        let filtered = filter_plan_by_include_patterns(&plan, &[], &["ARM64/*".to_string()]);
+        assert_eq!(filtered.summary.files_to_copy, 1);
+        assert_eq!(filtered.items.len(), 1);
+        assert_eq!(filtered.items[0].rel_path, "QCOM/a.bin");
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_ignore_existing_distinct_from_update() -> Result<()> {
+        let args = CompatCopyArgs {
+            compat_args: vec!["--ignore-existing".into(), "source".into(), "dest".into()],
+        };
+
+        let runtime = parse_compat_copy_flags(&args, "rsync")?;
+        assert!(runtime.overwrite);
+        assert!(runtime.ignore_existing);
+        assert!(!runtime.update_only);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_default_overwrites_changed_files() -> Result<()> {
+        let args = CompatCopyArgs {
+            compat_args: vec!["source".into(), "dest".into()],
+        };
+
+        let runtime = parse_compat_copy_flags(&args, "rclone")?;
+        assert!(runtime.overwrite);
+        assert!(!runtime.ignore_existing);
+        assert!(!runtime.update_only);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_compat_copy_flags_treat_dash_as_path() -> Result<()> {
+        let args = CompatCopyArgs {
+            compat_args: vec!["-n".into(), "-".into(), "dest".into()],
+        };
+
+        let runtime = parse_compat_copy_flags(&args, "rsync")?;
+        assert!(runtime.dry_run);
+        assert_eq!(runtime.source, PathBuf::from("-"));
+        assert_eq!(runtime.destination, PathBuf::from("dest"));
+        Ok(())
+    }
+
+    #[test]
+    fn looks_like_remote_spec_detects_remote_syntax() {
+        assert!(looks_like_remote_spec("host:/srv/data"));
+        assert!(looks_like_remote_spec("user@host:/srv/data"));
+        assert!(looks_like_remote_spec("s3://bucket/path"));
+        assert!(!looks_like_remote_spec("/srv/data"));
+        assert!(!looks_like_remote_spec("./local:path"));
+        assert!(!looks_like_remote_spec("../local:path"));
+        assert!(!looks_like_remote_spec("C:\\data"));
+        assert!(!looks_like_remote_spec("-"));
+    }
+
+    #[test]
+    fn reject_remote_like_path_blocks_remote_specs() {
+        let err = reject_remote_like_path(Path::new("host:/srv/data"), "rsync", "source")
+            .expect_err("remote path should fail");
+        assert!(
+            err.to_string()
+                .contains("rsync compatibility does not support remote source paths yet")
+        );
+    }
+
+    #[test]
+    fn build_dossier_matches_returns_top_k_matches() {
+        let left_rows = vec![
+            FileRecord {
+                rel_path: "alpha/readme.txt".to_string(),
+                size: 101,
+                mtime_ns: 1,
+                fast_hash: Some("hash-readme-left".to_string()),
+            },
+            FileRecord {
+                rel_path: "alpha/app.bin".to_string(),
+                size: 202,
+                mtime_ns: 2,
+                fast_hash: Some("hash-bin-left".to_string()),
+            },
+            FileRecord {
+                rel_path: "alpha/notes.log".to_string(),
+                size: 303,
+                mtime_ns: 3,
+                fast_hash: Some("hash-notes-left".to_string()),
+            },
+        ];
+        let right_rows = vec![
+            FileRecord {
+                rel_path: "beta/readme.txt".to_string(),
+                size: 111,
+                mtime_ns: 10,
+                fast_hash: Some("hash-readme-left".to_string()),
+            },
+            FileRecord {
+                rel_path: "beta/app.bin".to_string(),
+                size: 222,
+                mtime_ns: 11,
+                fast_hash: Some("hash-bin-left".to_string()),
+            },
+            FileRecord {
+                rel_path: "omega/readme.txt".to_string(),
+                size: 333,
+                mtime_ns: 12,
+                fast_hash: Some("hash-readme-left".to_string()),
+            },
+            FileRecord {
+                rel_path: "omega/other.tmp".to_string(),
+                size: 444,
+                mtime_ns: 13,
+                fast_hash: Some("hash-other".to_string()),
+            },
+        ];
+
+        let left_signatures = build_folder_signatures(&left_rows);
+        let right_signatures = build_folder_signatures(&right_rows);
+        let matches = build_dossier_matches(&left_signatures, &right_signatures, 1);
+
+        assert_eq!(left_signatures.len(), 1);
+        assert_eq!(right_signatures.len(), 2);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].left_folder, "alpha");
+        assert_eq!(matches[0].right_folder, "beta");
+        assert!((matches[0].overlap_weight > 0.0));
+        assert_eq!(matches[0].shared_rel_file_count, 2);
+
+        let all = build_dossier_matches(&left_signatures, &right_signatures, 5);
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn build_copy_plan_from_maps_includes_changed_files_for_sync_mode() -> Result<()> {
+        let mut left_map = HashMap::new();
+        let mut right_map = HashMap::new();
+
+        left_map.insert(
+            "file.txt".to_string(),
+            FileRecord {
+                rel_path: "file.txt".to_string(),
+                size: 10,
+                mtime_ns: 200,
+                fast_hash: Some("left-hash".to_string()),
+            },
+        );
+        right_map.insert(
+            "file.txt".to_string(),
+            FileRecord {
+                rel_path: "file.txt".to_string(),
+                size: 10,
+                mtime_ns: 100,
+                fast_hash: Some("right-hash".to_string()),
+            },
+        );
+
+        let plan = build_copy_plan_from_maps(
+            &left_map,
+            &right_map,
+            Path::new("/tmp/left.sqlite"),
+            Path::new("/tmp/right.sqlite"),
+            "left",
+            "right",
+            None,
+            "copy-sync",
+            true,
+        )?;
+        assert_eq!(plan.mode, "copy-sync");
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].rel_path, "file.txt");
+
+        let missing_only = build_copy_plan_from_maps(
+            &left_map,
+            &right_map,
+            Path::new("/tmp/left.sqlite"),
+            Path::new("/tmp/right.sqlite"),
+            "left",
+            "right",
+            None,
+            "copy-missing",
+            false,
+        )?;
+        assert!(missing_only.items.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn dossier_alias_command_still_parses() {
+        let cli = Cli::parse_from([
+            "nightindex",
+            "intel",
+            "--left-db",
+            "/tmp/left.sqlite",
+            "--right-db",
+            "/tmp/right.sqlite",
+            "--left",
+            "left",
+            "--right",
+            "right",
+        ]);
+        match cli.command {
+            Commands::Dossier(args) => {
+                assert_eq!(args.left_db, PathBuf::from("/tmp/left.sqlite"));
+                assert_eq!(args.right_db, PathBuf::from("/tmp/right.sqlite"));
+            }
+            _ => panic!("intel alias did not resolve to dossier"),
+        }
+    }
+
+    #[test]
+    fn binary_alias_and_compat_aliases_parse() {
+        let cli = Cli::parse_from([
+            "ndex",
+            "sync",
+            "--left-db",
+            "/tmp/left.sqlite",
+            "--right-db",
+            "/tmp/right.sqlite",
+            "--left",
+            "left",
+            "--right",
+            "right",
+            "--from",
+            "/tmp/source",
+            "--to",
+            "/tmp/dest",
+        ]);
+        match cli.command {
+            Commands::SyncCopyMissing(args) => {
+                assert_eq!(args.left_db, PathBuf::from("/tmp/left.sqlite"));
+                assert_eq!(args.right_db, PathBuf::from("/tmp/right.sqlite"));
+                assert_eq!(args.from, PathBuf::from("/tmp/source"));
+                assert_eq!(args.to, PathBuf::from("/tmp/dest"));
+            }
+            _ => panic!("ndex sync alias did not resolve to sync-copy-missing"),
+        }
+
+        let cli = Cli::parse_from(["nightindex", "rsync", "--dry-run", "src", "dst"]);
+        match cli.command {
+            Commands::Rsync(args) => {
+                let runtime = parse_compat_copy_flags(&args, "rsync").expect("compat parse");
+                assert!(runtime.dry_run);
+                assert_eq!(runtime.source, PathBuf::from("src"));
+                assert_eq!(runtime.destination, PathBuf::from("dst"));
+            }
+            _ => panic!("rsync compatibility command did not parse"),
+        }
+    }
+
+    #[test]
+    fn direct_compat_detection_prefers_top_level_copy_mode() {
+        assert!(should_use_direct_compat(&[
+            "ndex".to_string(),
+            "--dry-run".to_string(),
+            "/tmp/src".to_string(),
+            "/tmp/dst".to_string(),
+        ]));
+        assert!(should_use_direct_compat(&[
+            "ndex".to_string(),
+            "/tmp/src".to_string(),
+            "/tmp/dst".to_string(),
+        ]));
+        assert!(!should_use_direct_compat(&[
+            "ndex".to_string(),
+            "scan".to_string(),
+            "--db".to_string(),
+            "x.sqlite".to_string(),
+        ]));
+        assert!(!should_use_direct_compat(&[
+            "ndex".to_string(),
+            "rsync".to_string(),
+            "/tmp/src".to_string(),
+            "/tmp/dst".to_string(),
+        ]));
+        assert!(!should_use_direct_compat(&[
+            "ndex".to_string(),
+            "--help".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn known_command_names_include_aliases() {
+        assert!(is_known_command_name("scan"));
+        assert!(is_known_command_name("intel"));
+        assert!(is_known_command_name("sync"));
+        assert!(is_known_command_name("execute"));
+        assert!(!is_known_command_name("--dry-run"));
+        assert!(!is_known_command_name("/tmp/src"));
+    }
+
+    #[test]
+    fn open_readonly_db_does_not_create_db() {
+        let root = temp_dir("readonly");
+        let db_path = root.join("missing.sqlite");
+        assert!(!db_path.exists());
+        assert!(open_readonly_db(&db_path).is_err());
+        assert!(!db_path.exists());
+        assert!(open_db(&db_path).is_ok());
+        assert!(db_path.exists());
+        assert!(open_readonly_db(&db_path).is_ok());
+        fs::remove_dir_all(root).ok();
+    }
 }
