@@ -572,7 +572,20 @@ enum DossierTokenFamily {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    dispatch_argv(std::env::args().collect())
+}
+
+fn dispatch_argv(argv: Vec<String>) -> Result<()> {
+    if should_use_direct_compat(&argv) {
+        return compat_copy_command(
+            CompatCopyArgs {
+                compat_args: argv.into_iter().skip(1).collect(),
+            },
+            "copy",
+        );
+    }
+
+    let cli = Cli::parse_from(argv);
     match cli.command {
         Commands::Scan(args) => scan_command(args),
         Commands::CompareSummary(args) => compare_summary_command(args),
@@ -586,6 +599,38 @@ fn main() -> Result<()> {
         Commands::Rclone(args) => compat_copy_command(args, "rclone"),
         Commands::Rsync(args) => compat_copy_command(args, "rsync"),
     }
+}
+
+fn should_use_direct_compat(argv: &[String]) -> bool {
+    let Some(first) = argv.get(1).map(String::as_str) else {
+        return false;
+    };
+    if matches!(first, "-h" | "--help" | "-V" | "--version" | "help") {
+        return false;
+    }
+    !is_known_command_name(first)
+}
+
+fn is_known_command_name(value: &str) -> bool {
+    matches!(
+        value,
+        "scan"
+            | "compare-summary"
+            | "brief"
+            | "dossier"
+            | "intel"
+            | "extract-check"
+            | "extcheck"
+            | "plan-copy-missing"
+            | "plan"
+            | "execute-copy-missing"
+            | "execute-plan"
+            | "execute"
+            | "sync-copy-missing"
+            | "sync"
+            | "rclone"
+            | "rsync"
+    )
 }
 
 fn scan_command(args: ScanArgs) -> Result<()> {
@@ -2113,8 +2158,22 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
     let left_label = "left_source".to_string();
     let right_label = "right_destination".to_string();
 
+    reject_remote_like_path(&runtime.source, command, "source")?;
+    reject_remote_like_path(&runtime.destination, command, "destination")?;
+
     let source_root = resolve_copy_source_root(&runtime.source, "source")?;
     let destination_root = resolve_copy_destination_root(&runtime.destination)?;
+
+    eprintln!(
+        "[nightindex {command}] scan source={} destination={} dry_run={} checksum={} ignore_existing={} update_only={} size_only={}",
+        source_root.display(),
+        destination_root.display(),
+        runtime.dry_run,
+        runtime.hash,
+        runtime.ignore_existing,
+        runtime.update_only,
+        runtime.size_only
+    );
 
     scan_command(ScanArgs {
         db: left_db.clone(),
@@ -2139,6 +2198,12 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
         &right_label,
         Some(&policy),
     )?;
+    eprintln!(
+        "[nightindex {command}] plan mode={} files={} bytes={}",
+        plan.mode,
+        plan.summary.files_to_copy,
+        format_bytes(plan.summary.bytes_to_copy)
+    );
 
     let summary = execute_copy_missing_with_plan(
         &plan,
@@ -2160,6 +2225,16 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
     if let Err(err) = cleanup {
         eprintln!("[nightindex {command}] cleanup warning: {err}");
     }
+
+    eprintln!(
+        "[nightindex {command}] done copied={} overwritten={} skipped_existing={} skipped_conflict={} failed={} bytes={}",
+        summary.copied_files,
+        summary.overwritten_files,
+        summary.skipped_existing,
+        summary.skipped_conflict,
+        summary.failed_files,
+        format_bytes(summary.copied_bytes)
+    );
 
     let json = serde_json::to_string_pretty(&summary)?;
     println!("{json}");
@@ -2381,6 +2456,58 @@ fn parse_exclude_file(path: &str, excludes: &mut Vec<String>) -> Result<()> {
         excludes.push(value.to_string());
     }
     Ok(())
+}
+
+fn reject_remote_like_path(path: &Path, command: &str, role: &str) -> Result<()> {
+    let value = path.to_string_lossy();
+    if value == "-" {
+        return Ok(());
+    }
+    if looks_like_remote_spec(&value) {
+        bail!("{command} compatibility does not support remote {role} paths yet: {value}");
+    }
+    Ok(())
+}
+
+fn looks_like_remote_spec(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains("://") {
+        return true;
+    }
+    if trimmed.starts_with("rsync://") {
+        return true;
+    }
+    if let Some((left, right)) = trimmed.split_once(':') {
+        if left.is_empty() || right.is_empty() {
+            return false;
+        }
+        if left.starts_with('/') || trimmed.starts_with("./") || trimmed.starts_with("../") {
+            return false;
+        }
+        if left.len() == 1 && left.chars().all(|ch| ch.is_ascii_alphabetic()) {
+            return false;
+        }
+        return !right.starts_with('\\');
+    }
+    false
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit_index = 0usize;
+    while value >= 1024.0 && unit_index + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit_index += 1;
+    }
+    if unit_index == 0 {
+        format!("{bytes} {}", UNITS[unit_index])
+    } else {
+        format!("{value:.2} {}", UNITS[unit_index])
+    }
 }
 
 fn resolve_copy_source_root(path: &Path, label: &str) -> Result<PathBuf> {
@@ -3202,6 +3329,28 @@ mod tests {
     }
 
     #[test]
+    fn looks_like_remote_spec_detects_remote_syntax() {
+        assert!(looks_like_remote_spec("host:/srv/data"));
+        assert!(looks_like_remote_spec("user@host:/srv/data"));
+        assert!(looks_like_remote_spec("s3://bucket/path"));
+        assert!(!looks_like_remote_spec("/srv/data"));
+        assert!(!looks_like_remote_spec("./local:path"));
+        assert!(!looks_like_remote_spec("../local:path"));
+        assert!(!looks_like_remote_spec("C:\\data"));
+        assert!(!looks_like_remote_spec("-"));
+    }
+
+    #[test]
+    fn reject_remote_like_path_blocks_remote_specs() {
+        let err = reject_remote_like_path(Path::new("host:/srv/data"), "rsync", "source")
+            .expect_err("remote path should fail");
+        assert!(
+            err.to_string()
+                .contains("rsync compatibility does not support remote source paths yet")
+        );
+    }
+
+    #[test]
     fn build_dossier_matches_returns_top_k_matches() {
         let left_rows = vec![
             FileRecord {
@@ -3381,6 +3530,47 @@ mod tests {
             }
             _ => panic!("rsync compatibility command did not parse"),
         }
+    }
+
+    #[test]
+    fn direct_compat_detection_prefers_top_level_copy_mode() {
+        assert!(should_use_direct_compat(&[
+            "ndex".to_string(),
+            "--dry-run".to_string(),
+            "/tmp/src".to_string(),
+            "/tmp/dst".to_string(),
+        ]));
+        assert!(should_use_direct_compat(&[
+            "ndex".to_string(),
+            "/tmp/src".to_string(),
+            "/tmp/dst".to_string(),
+        ]));
+        assert!(!should_use_direct_compat(&[
+            "ndex".to_string(),
+            "scan".to_string(),
+            "--db".to_string(),
+            "x.sqlite".to_string(),
+        ]));
+        assert!(!should_use_direct_compat(&[
+            "ndex".to_string(),
+            "rsync".to_string(),
+            "/tmp/src".to_string(),
+            "/tmp/dst".to_string(),
+        ]));
+        assert!(!should_use_direct_compat(&[
+            "ndex".to_string(),
+            "--help".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn known_command_names_include_aliases() {
+        assert!(is_known_command_name("scan"));
+        assert!(is_known_command_name("intel"));
+        assert!(is_known_command_name("sync"));
+        assert!(is_known_command_name("execute"));
+        assert!(!is_known_command_name("--dry-run"));
+        assert!(!is_known_command_name("/tmp/src"));
     }
 
     #[test]
