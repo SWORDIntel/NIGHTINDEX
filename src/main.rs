@@ -1356,7 +1356,12 @@ fn scan_command(args: ScanArgs) -> Result<()> {
             profile
         } else {
             fingerprint_recomputed += 1;
-            let profile = build_file_fingerprint_profile(&rel_path, &file_type, size);
+            let mut profile = build_file_fingerprint_profile(&rel_path, &file_type, size);
+            if let Some(text_signature) =
+                infer_semantic_text_signature_from_file(entry.path(), &profile)?
+            {
+                profile.text_signature = Some(text_signature);
+            }
             store_cached_file_fingerprint_profile(
                 &conn,
                 &rel_path,
@@ -4099,6 +4104,227 @@ fn infer_text_signature(rel_path: &str, language: &str, normalized_name: &str) -
         normalized_name.to_string()
     };
     format!("{language}:{semantic_name}")
+}
+
+fn infer_semantic_text_signature_from_file(
+    path: &Path,
+    profile: &FileFingerprintProfile,
+) -> Result<Option<String>> {
+    if profile.is_binary || profile.language == "unknown" || profile.language == "symlink" {
+        return Ok(None);
+    }
+    let metadata = match fs::metadata(path) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    const MAX_READ_BYTES: u64 = 256 * 1024;
+    if metadata.len() > MAX_READ_BYTES {
+        return Ok(None);
+    }
+
+    let mut content = String::new();
+    File::open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?
+        .read_to_string(&mut content)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let semantic = infer_semantic_text_signature_from_content(
+        &profile.language,
+        &profile.normalized_name,
+        &content,
+    );
+    Ok(Some(semantic))
+}
+
+fn infer_semantic_text_signature_from_content(
+    language: &str,
+    normalized_name: &str,
+    content: &str,
+) -> String {
+    let mut import_tokens = HashSet::new();
+    let mut call_tokens = HashSet::new();
+    let mut key_tokens = HashSet::new();
+    let mut section_tokens = HashSet::new();
+
+    for line in content.lines().take(512) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
+            continue;
+        }
+
+        if let Some(value) = parse_import_like(trimmed, language) {
+            import_tokens.insert(value);
+        }
+        if let Some(value) = parse_call_like(trimmed, language) {
+            call_tokens.insert(value);
+        }
+        if let Some(value) = parse_key_like(trimmed) {
+            key_tokens.insert(value);
+        }
+        if let Some(value) = parse_section_like(trimmed) {
+            section_tokens.insert(value);
+        }
+    }
+
+    let mut import_vec = import_tokens.into_iter().collect::<Vec<_>>();
+    let mut call_vec = call_tokens.into_iter().collect::<Vec<_>>();
+    let mut key_vec = key_tokens.into_iter().collect::<Vec<_>>();
+    let mut section_vec = section_tokens.into_iter().collect::<Vec<_>>();
+    import_vec.sort();
+    call_vec.sort();
+    key_vec.sort();
+    section_vec.sort();
+    import_vec.truncate(4);
+    call_vec.truncate(4);
+    key_vec.truncate(4);
+    section_vec.truncate(3);
+
+    let semantic_name = if normalized_name.is_empty() {
+        "unnamed".to_string()
+    } else {
+        normalized_name.to_string()
+    };
+    let mut parts = vec![format!("{language}:{semantic_name}")];
+    if !import_vec.is_empty() {
+        parts.push(format!("i:{}", import_vec.join("+")));
+    }
+    if !call_vec.is_empty() {
+        parts.push(format!("f:{}", call_vec.join("+")));
+    }
+    if !key_vec.is_empty() {
+        parts.push(format!("k:{}", key_vec.join("+")));
+    }
+    if !section_vec.is_empty() {
+        parts.push(format!("s:{}", section_vec.join("+")));
+    }
+    parts.join("|")
+}
+
+fn parse_import_like(line: &str, language: &str) -> Option<String> {
+    let normalize = |value: &str| {
+        normalize_fingerprint_name(value)
+            .split('_')
+            .next()
+            .map(str::to_string)
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+    if language == "python" {
+        if let Some(rest) = line.strip_prefix("import ") {
+            return Some(normalize(rest.split(',').next()?.trim()));
+        }
+        if let Some(rest) = line.strip_prefix("from ") {
+            return Some(normalize(rest.split_whitespace().next()?));
+        }
+    }
+    if language == "rust" {
+        if let Some(rest) = line.strip_prefix("use ") {
+            return Some(normalize(rest.split("::").next()?));
+        }
+    }
+    if language == "go" {
+        if line.starts_with("import ") {
+            let cleaned = line
+                .trim_start_matches("import")
+                .trim()
+                .trim_matches('"')
+                .trim_matches('`');
+            if !cleaned.is_empty() {
+                return Some(normalize(cleaned.rsplit('/').next()?));
+            }
+        }
+    }
+    if language == "c_family" && line.starts_with("#include") {
+        let cleaned = line
+            .trim_start_matches("#include")
+            .trim()
+            .trim_matches('<')
+            .trim_matches('>')
+            .trim_matches('"');
+        if !cleaned.is_empty() {
+            return Some(normalize(cleaned.split('/').next_back()?));
+        }
+    }
+    if language == "javascript" {
+        if let Some(rest) = line.strip_prefix("import ") {
+            if let Some(idx) = rest.find(" from ") {
+                let module = rest[(idx + 6)..].trim().trim_matches(';').trim_matches('"');
+                if !module.is_empty() {
+                    return Some(normalize(module.rsplit('/').next()?));
+                }
+            }
+        }
+        if let Some(rest) = line.split("require(").nth(1) {
+            let module = rest
+                .split(')')
+                .next()
+                .unwrap_or_default()
+                .trim_matches('"')
+                .trim_matches('\'');
+            if !module.is_empty() {
+                return Some(normalize(module.rsplit('/').next()?));
+            }
+        }
+    }
+    None
+}
+
+fn parse_call_like(line: &str, language: &str) -> Option<String> {
+    if language == "python" && line.starts_with("def ") {
+        let name = line.trim_start_matches("def ").split('(').next()?.trim();
+        if !name.is_empty() {
+            return Some(normalize_fingerprint_name(name));
+        }
+    }
+    if language == "rust" && line.starts_with("fn ") {
+        let name = line.trim_start_matches("fn ").split('(').next()?.trim();
+        if !name.is_empty() {
+            return Some(normalize_fingerprint_name(name));
+        }
+    }
+    if language == "go" && line.starts_with("func ") {
+        let name = line.trim_start_matches("func ").split('(').next()?.trim();
+        if !name.is_empty() {
+            return Some(normalize_fingerprint_name(name));
+        }
+    }
+    if language == "c_family" && line.contains('(') && line.contains(')') && line.ends_with('{') {
+        let prefix = line.split('(').next()?.trim();
+        let name = prefix.split_whitespace().next_back()?;
+        if !name.is_empty() {
+            return Some(normalize_fingerprint_name(name));
+        }
+    }
+    None
+}
+
+fn parse_key_like(line: &str) -> Option<String> {
+    let assign = if line.contains('=') {
+        line.split('=').next()
+    } else if line.contains(':') {
+        line.split(':').next()
+    } else {
+        None
+    }?;
+    let key = assign.trim().trim_matches('"').trim_matches('\'');
+    if key.is_empty() || key.len() > 48 {
+        return None;
+    }
+    let normalized = normalize_fingerprint_name(key);
+    if normalized.is_empty() || normalized == "unnamed" {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn parse_section_like(line: &str) -> Option<String> {
+    if !(line.starts_with('[') && line.ends_with(']')) {
+        return None;
+    }
+    let section = line.trim_matches('[').trim_matches(']').trim();
+    if section.is_empty() {
+        return None;
+    }
+    Some(normalize_fingerprint_name(section))
 }
 
 fn infer_archive_payload_signature(rel_path: &str, archive_family: &str) -> Option<String> {
@@ -9763,5 +9989,20 @@ mod tests {
         assert_eq!(source.language, "python");
         assert_eq!(source.text_signature, Some("python:poc".to_string()));
         assert!(source.binary_signature.is_none());
+    }
+
+    #[test]
+    fn semantic_text_signature_extracts_import_and_function_tokens() {
+        let content = r#"
+import os
+from pathlib import Path
+
+def collect_results(path):
+    return Path(path)
+"#;
+        let signature = infer_semantic_text_signature_from_content("python", "collector", content);
+        assert!(signature.starts_with("python:collector"));
+        assert!(signature.contains("i:os+pathlib") || signature.contains("i:pathlib+os"));
+        assert!(signature.contains("f:collect_results"));
     }
 }

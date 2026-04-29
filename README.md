@@ -42,10 +42,12 @@ Implemented and shipping on the active branch:
   matching.
 - Archive-recursive foundation: `extract-check` reports virtual archive paths/families/depth, and
   dossier scoring consumes virtual archive shape tokens.
+- Semantic text signatures: scan enriches text-like files with lightweight import/function/key
+  signals that become stable `TEXTSIG` evidence for dossier ranking.
 
 In progress:
 - Archive-recursive indexing without extraction and semantic code/text signatures.
-- Extend cached signatures from deterministic metadata signals into deeper content-derived
+- Extend cached signatures from lightweight semantic signals into deeper content-derived
   binary/text/archive descriptors.
 
 ## Recommended recovery use-case

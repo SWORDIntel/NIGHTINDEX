@@ -2,7 +2,7 @@
 
 ## Current Status
 
-Estimated total progress: about 90%.
+Estimated total progress: about 91%.
 
 Done:
 - Core `nightindex` / `ndex` binaries and command aliases.
@@ -16,7 +16,7 @@ Done:
 - Dossier documentation updated with normalized fingerprint matching signals, confidence-tier interpretation, and fallback/compatibility expectations.
 - Archive-aware dossier matching added via `ARCH:`/`ARCHFAM:` and payload signature (`ARCHSIG:`), enabling multi-part archive-family matching without extraction.
 - NOT_STISLA-like dossier hardening: binaryity, archive-family, and size-class evidence now participate in dossier tie-breaks.
-- Current test baseline: `cargo test -q` passes 57 tests for both binaries.
+- Current test baseline: `cargo test -q` passes 58 tests for both binaries.
 - Deep dossier scoring now uses normalized fingerprint profiles for renamed-folder/file matching (suffix-noise robust: `final`, `v2`, `old`, `copy`, date-ish).
 - Resume, logs/status, and merge-apply hardening are implemented and pushed.
 - Persistent cache v1 is implemented: scan-time file fingerprint profiles are cached in SQLite by
@@ -27,6 +27,8 @@ Done:
   and consumed as dossier evidence tokens.
 - Archive-recursive foundation is implemented: `extract-check` now emits virtual archive path,
   family, payload signature, and depth metadata; dossier uses archive virtual path/depth tokens.
+- Semantic text signatures are implemented in scan: lightweight import/function/key/section tokens
+  are extracted for text-like files and persisted in `text_signature` as `TEXTSIG` dossier evidence.
 
 ## Next Highest-Value Work
 
