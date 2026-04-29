@@ -319,7 +319,25 @@ struct ResumePlanArgs {
     #[arg(long = "session-id")]
     session_id: Option<String>,
     #[arg(long = "out-json")]
-    out_json: PathBuf,
+    out_json: Option<PathBuf>,
+    #[arg(long)]
+    execute: bool,
+    #[arg(long)]
+    from: Option<PathBuf>,
+    #[arg(long)]
+    to: Option<PathBuf>,
+    #[arg(long)]
+    overwrite: bool,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long)]
+    stop_on_error: bool,
+    #[arg(long)]
+    policy: Option<PathBuf>,
+    #[arg(long)]
+    log: Option<PathBuf>,
+    #[arg(long, default_value_t = 1000)]
+    progress_every: usize,
 }
 
 #[derive(Args)]
@@ -3551,14 +3569,54 @@ fn plan_copy_missing_command(args: PlanCopyMissingArgs) -> Result<()> {
 
 fn resume_plan_command(args: ResumePlanArgs) -> Result<()> {
     let plan = build_resume_copy_plan(&args.db, args.session_id.as_deref())?;
-    if let Some(parent) = args.out_json.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+    if let Some(path) = args.out_json.as_ref() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let json = serde_json::to_string_pretty(&plan)?;
+        std::fs::write(path, format!("{json}\n"))
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        println!("{json}");
+    } else if !args.execute {
+        bail!("resume-plan requires --out-json unless --execute is set");
     }
-    let json = serde_json::to_string_pretty(&plan)?;
-    std::fs::write(&args.out_json, format!("{json}\n"))
-        .with_context(|| format!("failed to write {}", args.out_json.display()))?;
-    println!("{json}");
+
+    if args.execute {
+        let source_root = resolve_copy_source_root(
+            args.from.as_deref().ok_or_else(|| anyhow!("--from is required with --execute"))?,
+            "source",
+        )?;
+        let destination_root = resolve_copy_destination_root(
+            args.to.as_deref().ok_or_else(|| anyhow!("--to is required with --execute"))?,
+        )?;
+        let policy = load_exclude_policy(args.policy.as_deref())?;
+        let started_at_ns = now_ns()?;
+        let summary = execute_copy_missing_with_plan(
+            &plan,
+            CopyRunArgs {
+                source_root,
+                destination_root,
+                backup_dir: None,
+                overwrite: args.overwrite,
+                dry_run: args.dry_run,
+                stop_on_error: args.stop_on_error,
+                log: args.log,
+                progress_every: args.progress_every,
+                size_only: false,
+                hash: false,
+                copy_links_as_files: false,
+            },
+            Some(&policy),
+        )?;
+        let elapsed_ns = now_ns()? - started_at_ns;
+        if !args.dry_run {
+            record_copy_run_stats(&plan, &summary, elapsed_ns);
+        }
+        let json = serde_json::to_string_pretty(&summary)?;
+        println!("{json}");
+    }
+
     Ok(())
 }
 
@@ -7328,6 +7386,78 @@ mod tests {
         assert_eq!(resume_plan.items[0].rel_path, "a.bin");
         assert_eq!(resume_plan.left_label, "left");
         assert_eq!(resume_plan.right_label, "right");
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn resume_plan_command_can_execute_without_out_json() -> Result<()> {
+        let root = temp_dir("resume_execute");
+        let db = root.join("resume.sqlite");
+        let src = root.join("src");
+        let dst = root.join("dst");
+        fs::create_dir_all(&src)?;
+        fs::create_dir_all(&dst)?;
+        fs::write(src.join("a.bin"), b"abc")?;
+
+        let plan = CopyPlan {
+            mode: "copy-missing".to_string(),
+            left_label: "left".to_string(),
+            right_label: "right".to_string(),
+            left_db: Some(db.display().to_string()),
+            right_db: None,
+            generated_at_ns: 0,
+            summary: CopyPlanSummary {
+                files_to_copy: 1,
+                bytes_to_copy: 3,
+                left_files: 1,
+                right_files: 0,
+            },
+            items: vec![CopyPlanItem {
+                rel_path: "a.bin".to_string(),
+                file_type: "file".to_string(),
+                size: 3,
+                mtime_ns: 0,
+                fast_hash: None,
+            }],
+        };
+        let args = CopyRunArgs {
+            source_root: src.clone(),
+            destination_root: dst.clone(),
+            backup_dir: None,
+            overwrite: false,
+            dry_run: false,
+            stop_on_error: false,
+            log: None,
+            progress_every: 1000,
+            size_only: false,
+            hash: false,
+            copy_links_as_files: false,
+        };
+
+        let recorder = ResumeRecorder::start(&plan, &args, 1)?.expect("recorder");
+        let conn = open_db(&db)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO files(label, rel_path, file_type, size, mtime_ns, fast_hash, scanned_at) VALUES('left','a.bin','file',3,0,NULL,0)",
+            params![],
+        )?;
+        recorder.mark_status("a.bin", "failed", 0, Some("x"), true)?;
+
+        resume_plan_command(ResumePlanArgs {
+            db: db.clone(),
+            session_id: Some(recorder.session_id),
+            out_json: None,
+            execute: true,
+            from: Some(src),
+            to: Some(dst),
+            overwrite: false,
+            dry_run: true,
+            stop_on_error: false,
+            policy: None,
+            log: None,
+            progress_every: 1000,
+        })?;
 
         fs::remove_dir_all(root).ok();
         Ok(())

@@ -176,7 +176,8 @@ Build a retry plan from resume-state rows stored during prior copy runs.
 nightindex resume \
   --db <scan-or-copy.sqlite> \
   [--session-id <session_id>] \
-  --out-json /tmp/resume-plan.json
+  [--out-json /tmp/resume-plan.json] \
+  [--execute --from <left_root> --to <right_root>]
 ```
 
 `plan-copy-missing` (alias: `plan`)  
