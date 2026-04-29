@@ -216,6 +216,8 @@ struct DossierArgs {
     right: String,
     #[arg(long = "top-k", default_value_t = 10)]
     top_k: usize,
+    #[arg(long = "one-per-left")]
+    one_per_left: bool,
     #[arg(long = "confidence", default_value_t = DossierConfidenceTier::Manual)]
     min_confidence: DossierConfidenceTier,
     #[arg(long)]
@@ -1580,10 +1582,13 @@ fn dossier_command(args: DossierArgs) -> Result<()> {
 
     let candidates = build_dossier_matches(&left_signatures, &right_signatures, args.top_k);
     let min_confidence = args.min_confidence;
-    let candidates: Vec<DossierMatch> = candidates
+    let mut candidates: Vec<DossierMatch> = candidates
         .into_iter()
         .filter(|item| item.confidence_tier.should_emit(min_confidence))
         .collect();
+    if args.one_per_left {
+        candidates = keep_top_candidate_per_left(&candidates);
+    }
     let mut confidence_counts = DossierConfidenceCounts::default();
     for item in &candidates {
         confidence_counts.bump(item.confidence_tier);
@@ -2218,6 +2223,17 @@ fn build_dossier_actions_csv(matches: &[DossierMatch]) -> String {
         );
     }
     csv
+}
+
+fn keep_top_candidate_per_left(matches: &[DossierMatch]) -> Vec<DossierMatch> {
+    let mut seen_left = HashSet::new();
+    let mut out = Vec::new();
+    for item in matches {
+        if seen_left.insert(item.left_folder.clone()) {
+            out.push(item.clone());
+        }
+    }
+    out
 }
 
 fn build_file_fingerprint_profile(
@@ -6524,6 +6540,60 @@ mod tests {
         assert!(csv.contains(
             "alpha,2,gamma,manual,manual inspection required,0.157000,0,0,0"
         ));
+    }
+
+    #[test]
+    fn keep_top_candidate_per_left_keeps_first_match() {
+        let rows = vec![
+            DossierMatch {
+                left_folder: "alpha".to_string(),
+                right_folder: "beta".to_string(),
+                overlap_weight: 1.25,
+                left_weight: 2.0,
+                right_weight: 2.5,
+                overlap_ratio: 0.357,
+                shared_rel_file_count: 1,
+                shared_exact_file_name_count: 2,
+                shared_normalized_file_name_count: 1,
+                shared_file_stem_count: 1,
+                shared_file_ext_count: 1,
+                shared_ext_stem_count: 1,
+                shared_hash_count: 1,
+                shared_folder_token_count: 0,
+                shared_normalized_parent_folder_count: 1,
+                shared_binaryity_count: 2,
+                shared_archive_family_count: 0,
+                shared_language_count: 0,
+                shared_size_class_count: 0,
+                confidence_tier: DossierConfidenceTier::Possible,
+            },
+            DossierMatch {
+                left_folder: "alpha".to_string(),
+                right_folder: "gamma".to_string(),
+                overlap_weight: 0.75,
+                left_weight: 2.0,
+                right_weight: 2.5,
+                overlap_ratio: 0.157,
+                shared_rel_file_count: 0,
+                shared_exact_file_name_count: 0,
+                shared_normalized_file_name_count: 0,
+                shared_file_stem_count: 1,
+                shared_file_ext_count: 1,
+                shared_ext_stem_count: 0,
+                shared_hash_count: 0,
+                shared_folder_token_count: 1,
+                shared_normalized_parent_folder_count: 0,
+                shared_binaryity_count: 1,
+                shared_archive_family_count: 0,
+                shared_language_count: 0,
+                shared_size_class_count: 1,
+                confidence_tier: DossierConfidenceTier::Manual,
+            },
+        ];
+        let kept = keep_top_candidate_per_left(&rows);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].left_folder, "alpha");
+        assert_eq!(kept[0].right_folder, "beta");
     }
 
     fn make_confidence_match(
