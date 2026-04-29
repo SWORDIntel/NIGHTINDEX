@@ -1191,8 +1191,18 @@ fn scan_command(args: ScanArgs) -> Result<()> {
     {
         policy.enabled = true;
     }
-    let scanned_at = now_ns()?;
     let conn = open_db(&args.db)?;
+    let mut scanned_at = now_ns()?;
+    let prior_scanned_at = conn.query_row(
+        "SELECT MAX(scanned_at) FROM files WHERE label = ?1",
+        params![&args.label],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    if let Some(previous) = prior_scanned_at {
+        if scanned_at <= previous {
+            scanned_at = previous + 1;
+        }
+    }
 
     println!(
         "[scan] label={} root={} hash={}",
@@ -10398,12 +10408,14 @@ mod tests {
             Some(REPORT_VERSION_V1 as u64)
         );
         assert_eq!(
-            value.pointer("/cache_metrics/left_profile_cache/hits")
+            value
+                .pointer("/cache_metrics/left_profile_cache/hits")
                 .and_then(|v| v.as_u64()),
             Some(7)
         );
         assert_eq!(
-            value.pointer("/cache_metrics/right_profile_cache/misses")
+            value
+                .pointer("/cache_metrics/right_profile_cache/misses")
                 .and_then(|v| v.as_u64()),
             Some(3)
         );
@@ -10445,12 +10457,14 @@ mod tests {
             Some(REPORT_VERSION_V1 as u64)
         );
         assert_eq!(
-            value.pointer("/cache_metrics/left_profile_cache/hits")
+            value
+                .pointer("/cache_metrics/left_profile_cache/hits")
                 .and_then(|v| v.as_u64()),
             Some(5)
         );
         assert_eq!(
-            value.pointer("/cache_metrics/right_profile_cache/misses")
+            value
+                .pointer("/cache_metrics/right_profile_cache/misses")
                 .and_then(|v| v.as_u64()),
             Some(2)
         );
