@@ -880,6 +880,8 @@ struct DossierReport {
     only_action: Option<DossierAction>,
     left_folder_count: usize,
     right_folder_count: usize,
+    archive_signal_candidates: usize,
+    archive_signal_ratio: f64,
     confidence_counts: DossierConfidenceCounts,
     candidates: Vec<DossierMatch>,
 }
@@ -1825,6 +1827,15 @@ fn dossier_command(args: DossierArgs) -> Result<()> {
     for item in &candidates {
         confidence_counts.bump(item.confidence_tier);
     }
+    let archive_signal_candidates = candidates
+        .iter()
+        .filter(|item| item.shared_archive_family_count > 0)
+        .count();
+    let archive_signal_ratio = if candidates.is_empty() {
+        0.0
+    } else {
+        (archive_signal_candidates as f64) / (candidates.len() as f64)
+    };
 
     let report = DossierReport {
         left_db: args.left_db.display().to_string(),
@@ -1836,6 +1847,8 @@ fn dossier_command(args: DossierArgs) -> Result<()> {
         only_action: args.only_action,
         left_folder_count: left_signatures.len(),
         right_folder_count: right_signatures.len(),
+        archive_signal_candidates,
+        archive_signal_ratio,
         confidence_counts: confidence_counts.clone(),
         candidates: candidates.clone(),
     };
@@ -1879,6 +1892,10 @@ fn dossier_command(args: DossierArgs) -> Result<()> {
             confidence_counts.similar,
             confidence_counts.possible,
             confidence_counts.manual
+        );
+        eprintln!(
+            "[dossier] archive-signal: candidates={} ratio={:.3}",
+            archive_signal_candidates, archive_signal_ratio
         );
     } else {
         eprintln!(
