@@ -6,11 +6,20 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_yaml;
 use walkdir::WalkDir;
+
+mod copy_exec;
+
+use copy_exec::{CopyFinalizeOutcome, CopyStager};
+
+use copy_exec::{
+    CopyProgressSnapshot, format_progress_line, format_start_line, format_summary_line,
+    write_copy_progress_event, write_copy_summary_event,
+};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS files (
@@ -41,6 +50,24 @@ CREATE TABLE IF NOT EXISTS copy_runs (
 
 CREATE INDEX IF NOT EXISTS idx_copy_runs_pair_mode_at
 ON copy_runs(left_label, right_label, mode, copied_at);
+
+CREATE TABLE IF NOT EXISTS file_fingerprints (
+    label TEXT NOT NULL,
+    rel_path TEXT NOT NULL,
+    normalized_name TEXT NOT NULL,
+    normalized_folder TEXT NOT NULL,
+    ext TEXT,
+    is_binary INTEGER NOT NULL,
+    is_archive INTEGER NOT NULL,
+    archive_family TEXT,
+    language TEXT NOT NULL DEFAULT 'unknown',
+    size_class TEXT NOT NULL DEFAULT 'large',
+    scanned_at INTEGER NOT NULL,
+    PRIMARY KEY (label, rel_path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_file_fingerprints_label_rel_path
+ON file_fingerprints(label, rel_path);
 "#;
 
 const DEFAULT_NOISE_DIRS: &[&str] = &[
@@ -64,15 +91,29 @@ const DEFAULT_NOISE_DIRS: &[&str] = &[
 ];
 
 const ARCHIVE_EXTENSIONS: &[&str] = &[
-    ".tar.gz", ".tar.xz", ".zip", ".7z", ".tar", ".rar", ".img", ".iso", ".bin", ".raw", ".dmg",
-    ".apk", ".jar", ".ovpn", ".cpio",
+    ".tar.gz", ".tar.xz", ".tar.bz2", ".zip+txt", ".img.raw", ".zip", ".7z", ".tar", ".rar",
+    ".img", ".iso", ".raw", ".bin", ".dmg", ".apk", ".jar", ".ovpn", ".cpio",
 ];
+
+const BINARY_EXTENSIONS: &[&str] = &[
+    "7z", "apk", "bin", "cc", "class", "cpio", "dmg", "dll", "elf", "exe", "img", "iso", "jar",
+    "ko", "o", "obj", "ovpn", "pkg", "pyc", "raw", "so", "sys",
+];
+
+const BINARY_FOLDER_HINTS: &[&str] = &["/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/", "/lib/"];
 
 const DOSSIER_NAME_TOKEN_WEIGHT: f64 = 1.0;
 const DOSSIER_STEM_TOKEN_WEIGHT: f64 = 0.35;
 const DOSSIER_EXTENSION_TOKEN_WEIGHT: f64 = 0.2;
 const DOSSIER_EXTENSION_STEM_TOKEN_WEIGHT: f64 = 0.55;
 const DOSSIER_HASH_TOKEN_WEIGHT: f64 = 2.5;
+const DOSSIER_NORMALIZED_NAME_TOKEN_WEIGHT: f64 = 0.85;
+const DOSSIER_NORMALIZED_FOLDER_TOKEN_WEIGHT: f64 = 0.15;
+const DOSSIER_BINARYITY_TOKEN_WEIGHT: f64 = 0.4;
+const DOSSIER_ARCHIVE_TOKEN_WEIGHT: f64 = 0.35;
+const DOSSIER_ARCHIVE_SIGNATURE_TOKEN_WEIGHT: f64 = 0.22;
+const DOSSIER_LANGUAGE_TOKEN_WEIGHT: f64 = 0.28;
+const DOSSIER_SIZE_CLASS_TOKEN_WEIGHT: f64 = 0.18;
 const DOSSIER_FOLDER_TOKEN_WEIGHT: f64 = 0.1;
 const DOSSIER_FOLDER_PREFIX_TOKEN_WEIGHT: f64 = 0.05;
 const DOSSIER_FOLDER_DEPTH_TOKEN_WEIGHT: f64 = 0.02;
@@ -96,7 +137,11 @@ enum Commands {
     Scan(ScanArgs),
     CompareSummary(CompareSummaryArgs),
     Brief(BriefArgs),
-    #[command(about = "Read-only folder identity scoring", alias = "intel")]
+    #[command(
+        about = "Read-only folder identity scoring",
+        alias = "intel",
+        long_about = "dossier identifies the most likely folder matches between two manifests when names drift.\n\nIt combines legacy tokens (filename, stem, extension, hash, and folder path) with fingerprint profile signals:\n- NF: normalized file-name signatures\n- NFP: normalized parent-folder aliases (with prefix variants)\n- BIN / TEXT: binaryity class\n- ARCH / ARCHFAM: archive family\n- ARCHSIG: archive payload signature (for multi-part formats such as tar.gz vs tar.xz)\n\nConfidence tiers:\n- Identical: high overlap with exact-name anchors and at least two shared hashes\n- Similar: moderate overlap with shared hashes or normalized-folder-alias signals\n- Possible: extension/hash/folder evidence without stronger anchors\n- Manual: otherwise\n\nExpected behavior:\n- If fingerprint tables are missing from a database, dossier degrades to legacy-only matching.\n- Scores are deterministic, read-only, and do not alter either database."
+    )]
     Dossier(DossierArgs),
     #[command(about = "Compare archive-like payload families", alias = "extcheck")]
     ExtractCheck(ExtractCheckArgs),
@@ -135,6 +180,8 @@ struct ScanArgs {
     root: PathBuf,
     #[arg(long = "exclude")]
     exclude_prefixes: Vec<String>,
+    #[arg(long = "exclude-if-present")]
+    exclude_if_present: Vec<String>,
     #[arg(long)]
     policy: Option<PathBuf>,
     #[arg(long)]
@@ -169,6 +216,8 @@ struct DossierArgs {
     right: String,
     #[arg(long = "top-k", default_value_t = 10)]
     top_k: usize,
+    #[arg(long = "confidence", default_value_t = DossierConfidenceTier::Manual)]
+    min_confidence: DossierConfidenceTier,
     #[arg(long)]
     out_json: Option<PathBuf>,
     #[arg(long)]
@@ -309,6 +358,8 @@ struct CompatCopyArgs {
 struct CompatRuntime {
     source: PathBuf,
     destination: PathBuf,
+    source_trailing_slash: bool,
+    destination_trailing_slash: bool,
     overwrite: bool,
     dry_run: bool,
     stop_on_error: bool,
@@ -320,8 +371,15 @@ struct CompatRuntime {
     delete_mode: Option<DeleteMode>,
     delete_excluded: bool,
     inplace: bool,
+    stats: bool,
+    human_readable: bool,
+    verbosity: u8,
+    backup_requested: bool,
+    backup_dir: Option<PathBuf>,
     exclude_prefixes: Vec<String>,
+    exclude_if_present: Vec<String>,
     include_patterns: Vec<PatternSpec>,
+    files_from_patterns: Vec<PatternSpec>,
     filter_exclude_patterns: Vec<PatternSpec>,
     max_age_ns: Option<i64>,
     accepted_link_flags: Vec<String>,
@@ -378,6 +436,18 @@ struct FileRecord {
     size: u64,
     mtime_ns: i64,
     fast_hash: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct FileFingerprintProfile {
+    normalized_name: String,
+    normalized_folder: String,
+    ext: String,
+    is_binary: bool,
+    is_archive: bool,
+    archive_family: Option<String>,
+    language: String,
+    size_class: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -483,6 +553,7 @@ struct CopyPlanItem {
 struct CopyRunArgs {
     source_root: PathBuf,
     destination_root: PathBuf,
+    backup_dir: Option<PathBuf>,
     overwrite: bool,
     dry_run: bool,
     stop_on_error: bool,
@@ -495,11 +566,17 @@ struct CopyRunArgs {
 
 struct DeleteRunArgs {
     destination_root: PathBuf,
+    backup_dir: Option<PathBuf>,
     dry_run: bool,
     stop_on_error: bool,
     log: Option<PathBuf>,
     progress_every: usize,
     delete_excluded: bool,
+}
+
+enum RegularCopyOutcome {
+    Copied(u64),
+    LostRace,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -604,6 +681,19 @@ struct DossierMatch {
     right_weight: f64,
     overlap_ratio: f64,
     shared_rel_file_count: usize,
+    shared_exact_file_name_count: usize,
+    shared_normalized_file_name_count: usize,
+    shared_file_stem_count: usize,
+    shared_file_ext_count: usize,
+    shared_ext_stem_count: usize,
+    shared_hash_count: usize,
+    shared_folder_token_count: usize,
+    shared_normalized_parent_folder_count: usize,
+    shared_binaryity_count: usize,
+    shared_archive_family_count: usize,
+    shared_language_count: usize,
+    shared_size_class_count: usize,
+    confidence_tier: DossierConfidenceTier,
 }
 
 #[derive(Debug, Serialize)]
@@ -613,30 +703,134 @@ struct DossierReport {
     left_label: String,
     right_label: String,
     top_k: usize,
+    min_confidence: DossierConfidenceTier,
     left_folder_count: usize,
     right_folder_count: usize,
     candidates: Vec<DossierMatch>,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ValueEnum,
+)]
+#[serde(rename_all = "lowercase")]
+#[value(rename_all = "lowercase")]
+enum DossierConfidenceTier {
+    #[default]
+    Manual,
+    Possible,
+    Similar,
+    Identical,
+}
+
+impl DossierConfidenceTier {
+    fn should_emit(self, minimum: DossierConfidenceTier) -> bool {
+        self >= minimum
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Possible => "possible",
+            Self::Similar => "similar",
+            Self::Identical => "identical",
+        }
+    }
+
+    fn next_action(self) -> &'static str {
+        match self {
+            Self::Identical => "promote with high confidence",
+            Self::Similar => "review and likely apply",
+            Self::Possible => "review before applying",
+            Self::Manual => "manual inspection required",
+        }
+    }
+}
+
+impl std::fmt::Display for DossierConfidenceTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+const DOSSIER_CONFIDENCE_IDENTICAL_RATIO: f64 = 0.80;
+const DOSSIER_CONFIDENCE_SIMILAR_RATIO: f64 = 0.35;
+const DOSSIER_CONFIDENCE_POSSIBLE_RATIO: f64 = 0.15;
+
+fn dossier_confidence_tier(match_record: &DossierMatch) -> DossierConfidenceTier {
+    if match_record.overlap_ratio >= DOSSIER_CONFIDENCE_IDENTICAL_RATIO
+        && match_record.shared_hash_count >= 2
+        && match_record.shared_normalized_file_name_count >= 1
+    {
+        return DossierConfidenceTier::Identical;
+    }
+
+    if match_record.overlap_ratio >= DOSSIER_CONFIDENCE_SIMILAR_RATIO
+        && (match_record.shared_hash_count >= 1
+            || match_record.shared_normalized_parent_folder_count >= 1)
+    {
+        return DossierConfidenceTier::Similar;
+    }
+
+    if match_record.overlap_ratio >= DOSSIER_CONFIDENCE_POSSIBLE_RATIO
+        && (match_record.shared_file_ext_count > 0
+            || match_record.shared_ext_stem_count > 0
+            || match_record.shared_rel_file_count > 0
+            || match_record.shared_hash_count > 0
+            || match_record.shared_folder_token_count > 0
+            || match_record.shared_normalized_parent_folder_count > 0)
+    {
+        return DossierConfidenceTier::Possible;
+    }
+
+    DossierConfidenceTier::Manual
 }
 
 #[derive(Default)]
 struct DossierMatchState {
     shared_weight: f64,
     shared_file_name_weight: f64,
+    shared_normalized_file_name_weight: f64,
+    shared_normalized_parent_folder_weight: f64,
+    shared_normalized_parent_folder_count: usize,
     shared_file_stem_weight: f64,
+    shared_file_stem_count: usize,
     shared_file_ext_weight: f64,
+    shared_file_ext_count: usize,
     shared_ext_stem_weight: f64,
+    shared_ext_stem_count: usize,
     shared_hash_weight: f64,
+    shared_hash_count: usize,
     shared_folder_weight: f64,
+    shared_folder_count: usize,
+    shared_binaryity_weight: f64,
+    shared_binaryity_count: usize,
+    shared_archive_family_weight: f64,
+    shared_archive_family_count: usize,
+    shared_archive_signature_weight: f64,
+    shared_archive_signature_count: usize,
+    shared_file_name_count: usize,
+    shared_normalized_file_name_count: usize,
+    shared_language_count: usize,
+    shared_language_weight: f64,
+    shared_size_class_count: usize,
+    shared_size_class_weight: f64,
     shared_rel_file_count: usize,
 }
 
 #[derive(Copy, Clone)]
 enum DossierTokenFamily {
     ExactFileName,
+    NormalizedFileName,
     FileStem,
     FileExtension,
     ExtensionStem,
     Hash,
+    Binaryity,
+    ArchiveFamily,
+    ArchiveSignature,
+    Language,
+    SizeClass,
+    NormalizedFolder,
     Folder,
     Other,
 }
@@ -668,6 +862,7 @@ fn scan_command(args: ScanArgs) -> Result<()> {
     }
 
     let exclude_prefixes = normalize_excludes(&args.exclude_prefixes);
+    let exclude_if_present = normalize_excludes(&args.exclude_if_present);
     let mut policy = load_exclude_policy(args.policy.as_deref())?;
     for prefix in normalize_excludes(&args.exclude_prefixes) {
         if !policy
@@ -696,17 +891,24 @@ fn scan_command(args: ScanArgs) -> Result<()> {
     if !exclude_prefixes.is_empty() {
         println!("[scan] excludes={}", exclude_prefixes.join(", "));
     }
+    if !exclude_if_present.is_empty() {
+        println!(
+            "[scan] exclude-if-present markers={}",
+            exclude_if_present.join(", ")
+        );
+    }
 
     let mut files_seen = 0usize;
     let mut hashed = 0usize;
     let mut reused = 0usize;
     let mut excluded = 0usize;
     let mut errors = 0usize;
+    let mut symlinks_seen = 0usize;
 
     for entry in WalkDir::new(&root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|entry| should_walk(entry.path(), &root, &policy))
+        .filter_entry(|entry| should_walk(entry.path(), &root, &policy, &exclude_if_present))
     {
         let entry = match entry {
             Ok(entry) => entry,
@@ -723,6 +925,9 @@ fn scan_command(args: ScanArgs) -> Result<()> {
         }
         if !entry_file_type.is_file() && !entry_file_type.is_symlink() {
             continue;
+        }
+        if entry_file_type.is_symlink() {
+            symlinks_seen += 1;
         }
 
         let rel_path = match entry.path().strip_prefix(&root) {
@@ -836,6 +1041,8 @@ fn scan_command(args: ScanArgs) -> Result<()> {
             None
         };
 
+        let fingerprint_profile = build_file_fingerprint_profile(&rel_path, &file_type, size);
+
         conn.execute(
             r#"
             INSERT INTO files(label, rel_path, file_type, size, mtime_ns, fast_hash, scanned_at)
@@ -858,6 +1065,48 @@ fn scan_command(args: ScanArgs) -> Result<()> {
             ],
         )?;
 
+        conn.execute(
+            r#"
+            INSERT INTO file_fingerprints(
+                label,
+                rel_path,
+                normalized_name,
+                normalized_folder,
+                ext,
+                is_binary,
+                is_archive,
+                archive_family,
+                language,
+                size_class,
+                scanned_at
+            )
+            VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT(label, rel_path) DO UPDATE SET
+                normalized_name = excluded.normalized_name,
+                normalized_folder = excluded.normalized_folder,
+                ext = excluded.ext,
+                is_binary = excluded.is_binary,
+                is_archive = excluded.is_archive,
+                archive_family = excluded.archive_family,
+                language = excluded.language,
+                size_class = excluded.size_class,
+                scanned_at = excluded.scanned_at
+            "#,
+            params![
+                &args.label,
+                &rel_path,
+                &fingerprint_profile.normalized_name,
+                &fingerprint_profile.normalized_folder,
+                &fingerprint_profile.ext,
+                i32::from(fingerprint_profile.is_binary),
+                i32::from(fingerprint_profile.is_archive),
+                &fingerprint_profile.archive_family,
+                &fingerprint_profile.language,
+                &fingerprint_profile.size_class,
+                scanned_at
+            ],
+        )?;
+
         files_seen += 1;
         if files_seen % 500 == 0 {
             println!(
@@ -868,8 +1117,8 @@ fn scan_command(args: ScanArgs) -> Result<()> {
     }
 
     println!(
-        "[scan] done files={} hashed={} reused={} excluded={} errors={}",
-        files_seen, hashed, reused, excluded, errors
+        "[scan] summary: files={} symlinks={} hashed={} reused={} excluded={} errors={}",
+        files_seen, symlinks_seen, hashed, reused, excluded, errors
     );
     Ok(())
 }
@@ -952,6 +1201,18 @@ fn brief_command(args: BriefArgs) -> Result<()> {
         std::fs::write(&path, csv)
             .with_context(|| format!("failed to write {}", path.display()))?;
     }
+    eprintln!(
+        "[brief] summary: copy {} files / {} bytes; {} same, {} changed, {} left-only, {} right-only{}",
+        brief.files_to_copy,
+        brief.bytes_to_copy,
+        brief.same_path_same_meta,
+        brief.same_path_changed,
+        brief.left_only,
+        brief.right_only,
+        brief
+            .estimated_seconds
+            .map_or_else(|| "".to_string(), |seconds| format!(", ETA ~{seconds}s"))
+    );
     Ok(())
 }
 
@@ -1078,6 +1339,15 @@ fn extract_check_command(args: ExtractCheckArgs) -> Result<()> {
         std::fs::write(&path, csv)
             .with_context(|| format!("failed to write {}", path.display()))?;
     }
+    eprintln!(
+        "[extract-check] summary: {} exact matches, {} stem matches, {} left-only entries ({} folders), {} right-only entries ({} folders)",
+        report.exact_matches,
+        report.stem_matches,
+        report.left_only_count,
+        report.left_only_folders.len(),
+        report.right_only_count,
+        report.right_only_folders.len()
+    );
     Ok(())
 }
 
@@ -1272,6 +1542,8 @@ fn dossier_command(args: DossierArgs) -> Result<()> {
     let policy = load_exclude_policy(args.policy.as_deref())?;
     let left_rows = load_label(&left_conn, &args.left)?;
     let right_rows = load_label(&right_conn, &args.right)?;
+    let left_profiles = load_file_fingerprint_profiles(&left_conn, &args.left)?;
+    let right_profiles = load_file_fingerprint_profiles(&right_conn, &args.right)?;
 
     let left_rows: Vec<FileRecord> = left_rows
         .into_iter()
@@ -1281,11 +1553,15 @@ fn dossier_command(args: DossierArgs) -> Result<()> {
         .into_iter()
         .filter(|row| !should_exclude_path(&row.rel_path, &policy))
         .collect();
-
-    let left_signatures = build_folder_signatures(&left_rows);
-    let right_signatures = build_folder_signatures(&right_rows);
+    let left_signatures = build_folder_signatures_with_profiles(&left_rows, &left_profiles);
+    let right_signatures = build_folder_signatures_with_profiles(&right_rows, &right_profiles);
 
     let candidates = build_dossier_matches(&left_signatures, &right_signatures, args.top_k);
+    let min_confidence = args.min_confidence;
+    let candidates: Vec<DossierMatch> = candidates
+        .into_iter()
+        .filter(|item| item.confidence_tier.should_emit(min_confidence))
+        .collect();
 
     let report = DossierReport {
         left_db: args.left_db.display().to_string(),
@@ -1293,6 +1569,7 @@ fn dossier_command(args: DossierArgs) -> Result<()> {
         left_label: args.left,
         right_label: args.right,
         top_k: args.top_k,
+        min_confidence,
         left_folder_count: left_signatures.len(),
         right_folder_count: right_signatures.len(),
         candidates: candidates.clone(),
@@ -1309,6 +1586,28 @@ fn dossier_command(args: DossierArgs) -> Result<()> {
         let csv = build_dossier_csv(&candidates);
         std::fs::write(&path, csv)
             .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    if let Some(best) = candidates.first() {
+        eprintln!(
+            "[dossier] summary: {} candidates across {} left folders and {} right folders; best {} -> {} ({:.3}, {} shared files, {})",
+            candidates.len(),
+            report.left_folder_count,
+            report.right_folder_count,
+            best.left_folder,
+            best.right_folder,
+            best.overlap_ratio,
+            best.shared_rel_file_count,
+            best.confidence_tier.as_str()
+        );
+        eprintln!(
+            "[dossier] next action: {}",
+            best.confidence_tier.next_action()
+        );
+    } else {
+        eprintln!(
+            "[dossier] summary: 0 candidates across {} left folders and {} right folders",
+            report.left_folder_count, report.right_folder_count
+        );
     }
     Ok(())
 }
@@ -1551,21 +1850,55 @@ fn build_dossier_matches(
                     DossierTokenFamily::ExactFileName => {
                         state.shared_rel_file_count += 1;
                         state.shared_file_name_weight += shared;
+                        state.shared_file_name_count += 1;
+                    }
+                    DossierTokenFamily::NormalizedFileName => {
+                        state.shared_normalized_file_name_weight += shared;
+                        state.shared_normalized_file_name_count += 1;
                     }
                     DossierTokenFamily::FileStem => {
                         state.shared_file_stem_weight += shared;
+                        state.shared_file_stem_count += 1;
                     }
                     DossierTokenFamily::FileExtension => {
                         state.shared_file_ext_weight += shared;
+                        state.shared_file_ext_count += 1;
                     }
                     DossierTokenFamily::ExtensionStem => {
                         state.shared_ext_stem_weight += shared;
+                        state.shared_ext_stem_count += 1;
                     }
                     DossierTokenFamily::Hash => {
                         state.shared_hash_weight += shared;
+                        state.shared_hash_count += 1;
+                    }
+                    DossierTokenFamily::Binaryity => {
+                        state.shared_binaryity_weight += shared;
+                        state.shared_binaryity_count += 1;
+                    }
+                    DossierTokenFamily::ArchiveFamily => {
+                        state.shared_archive_family_weight += shared;
+                        state.shared_archive_family_count += 1;
+                    }
+                    DossierTokenFamily::ArchiveSignature => {
+                        state.shared_archive_signature_weight += shared;
+                        state.shared_archive_signature_count += 1;
+                    }
+                    DossierTokenFamily::Language => {
+                        state.shared_language_weight += shared;
+                        state.shared_language_count += 1;
+                    }
+                    DossierTokenFamily::SizeClass => {
+                        state.shared_size_class_weight += shared;
+                        state.shared_size_class_count += 1;
+                    }
+                    DossierTokenFamily::NormalizedFolder => {
+                        state.shared_normalized_parent_folder_weight += shared;
+                        state.shared_normalized_parent_folder_count += 1;
                     }
                     DossierTokenFamily::Folder => {
                         state.shared_folder_weight += shared;
+                        state.shared_folder_count += 1;
                     }
                     DossierTokenFamily::Other => {}
                 }
@@ -1586,18 +1919,33 @@ fn build_dossier_matches(
             }
 
             let overlap_ratio = state.shared_weight / denominator;
-            ranked.push((
-                DossierMatch {
-                    left_folder: left_folder.clone(),
-                    right_folder,
-                    overlap_weight: state.shared_weight,
-                    left_weight: left_signature.total_weight,
-                    right_weight: right_signature.total_weight,
-                    overlap_ratio,
-                    shared_rel_file_count: state.shared_rel_file_count,
-                },
-                state,
-            ));
+            let dossier_match = DossierMatch {
+                left_folder: left_folder.clone(),
+                right_folder,
+                overlap_weight: state.shared_weight,
+                left_weight: left_signature.total_weight,
+                right_weight: right_signature.total_weight,
+                overlap_ratio,
+                shared_rel_file_count: state.shared_rel_file_count,
+                shared_exact_file_name_count: state.shared_file_name_count,
+                shared_normalized_file_name_count: state.shared_normalized_file_name_count,
+                shared_file_stem_count: state.shared_file_stem_count,
+                shared_file_ext_count: state.shared_file_ext_count,
+                shared_ext_stem_count: state.shared_ext_stem_count,
+                shared_hash_count: state.shared_hash_count,
+                shared_folder_token_count: state.shared_folder_count,
+                shared_normalized_parent_folder_count: state.shared_normalized_parent_folder_count,
+                shared_binaryity_count: state.shared_binaryity_count,
+                shared_archive_family_count: state.shared_archive_family_count,
+                shared_language_count: state.shared_language_count,
+                shared_size_class_count: state.shared_size_class_count,
+                confidence_tier: DossierConfidenceTier::Manual,
+            };
+            let dossier_match = DossierMatch {
+                confidence_tier: dossier_confidence_tier(&dossier_match),
+                ..dossier_match
+            };
+            ranked.push((dossier_match, state));
         }
 
         ranked.sort_by(|a, b| {
@@ -1626,6 +1974,95 @@ fn build_dossier_matches(
                 })
                 .then_with(|| {
                     b_state
+                        .shared_file_name_count
+                        .cmp(&a_state.shared_file_name_count)
+                })
+                .then_with(|| {
+                    b_state
+                        .shared_hash_weight
+                        .partial_cmp(&a_state.shared_hash_weight)
+                        .unwrap_or(Ordering::Equal)
+                })
+                .then_with(|| b_state.shared_hash_count.cmp(&a_state.shared_hash_count))
+                .then_with(|| {
+                    b_state
+                        .shared_archive_signature_weight
+                        .partial_cmp(&a_state.shared_archive_signature_weight)
+                        .unwrap_or(Ordering::Equal)
+                })
+                .then_with(|| {
+                    b_state
+                        .shared_archive_signature_count
+                        .cmp(&a_state.shared_archive_signature_count)
+                })
+                .then_with(|| {
+                    b_state
+                        .shared_normalized_file_name_weight
+                        .partial_cmp(&a_state.shared_normalized_file_name_weight)
+                        .unwrap_or(Ordering::Equal)
+                })
+                .then_with(|| {
+                    b_state
+                        .shared_normalized_file_name_count
+                        .cmp(&a_state.shared_normalized_file_name_count)
+                })
+                .then_with(|| {
+                    b_state
+                        .shared_binaryity_weight
+                        .partial_cmp(&a_state.shared_binaryity_weight)
+                        .unwrap_or(Ordering::Equal)
+                })
+                .then_with(|| {
+                    b_state
+                        .shared_binaryity_count
+                        .cmp(&a_state.shared_binaryity_count)
+                })
+                .then_with(|| {
+                    b_state
+                        .shared_archive_family_weight
+                        .partial_cmp(&a_state.shared_archive_family_weight)
+                        .unwrap_or(Ordering::Equal)
+                })
+                .then_with(|| {
+                    b_state
+                        .shared_archive_family_count
+                        .cmp(&a_state.shared_archive_family_count)
+                })
+                .then_with(|| {
+                    b_state
+                        .shared_language_weight
+                        .partial_cmp(&a_state.shared_language_weight)
+                        .unwrap_or(Ordering::Equal)
+                })
+                .then_with(|| {
+                    b_state
+                        .shared_language_count
+                        .cmp(&a_state.shared_language_count)
+                })
+                .then_with(|| {
+                    b_state
+                        .shared_size_class_weight
+                        .partial_cmp(&a_state.shared_size_class_weight)
+                        .unwrap_or(Ordering::Equal)
+                })
+                .then_with(|| {
+                    b_state
+                        .shared_size_class_count
+                        .cmp(&a_state.shared_size_class_count)
+                })
+                .then_with(|| {
+                    b_state
+                        .shared_normalized_parent_folder_weight
+                        .partial_cmp(&a_state.shared_normalized_parent_folder_weight)
+                        .unwrap_or(Ordering::Equal)
+                })
+                .then_with(|| {
+                    b_state
+                        .shared_normalized_parent_folder_count
+                        .cmp(&a_state.shared_normalized_parent_folder_count)
+                })
+                .then_with(|| {
+                    b_state
                         .shared_file_ext_weight
                         .partial_cmp(&a_state.shared_file_ext_weight)
                         .unwrap_or(Ordering::Equal)
@@ -1640,12 +2077,6 @@ fn build_dossier_matches(
                     b_state
                         .shared_file_stem_weight
                         .partial_cmp(&a_state.shared_file_stem_weight)
-                        .unwrap_or(Ordering::Equal)
-                })
-                .then_with(|| {
-                    b_state
-                        .shared_hash_weight
-                        .partial_cmp(&a_state.shared_hash_weight)
                         .unwrap_or(Ordering::Equal)
                 })
                 .then_with(|| {
@@ -1682,30 +2113,236 @@ fn build_dossier_matches(
 fn build_dossier_csv(matches: &[DossierMatch]) -> String {
     let mut csv = String::new();
     csv.push_str(
-        "left_folder,right_folder,overlap_weight,left_weight,right_weight,overlap_ratio,shared_rel_file_count\n",
+        "left_folder,right_folder,overlap_weight,left_weight,right_weight,overlap_ratio,shared_rel_file_count,shared_exact_file_name_count,shared_normalized_file_name_count,shared_file_stem_count,shared_file_ext_count,shared_ext_stem_count,shared_hash_count,shared_folder_token_count,shared_normalized_parent_folder_count,shared_binaryity_count,shared_archive_family_count,shared_language_count,shared_size_class_count,confidence_tier\n",
     );
 
     for item in matches {
         let _ = std::fmt::Write::write_fmt(
             &mut csv,
             format_args!(
-                "{},{},{:.4},{:.4},{:.4},{:.6},{}\n",
+                "{},{},{:.4},{:.4},{:.4},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                 csv_escape(&item.left_folder),
                 csv_escape(&item.right_folder),
                 item.overlap_weight,
                 item.left_weight,
                 item.right_weight,
                 item.overlap_ratio,
-                item.shared_rel_file_count
+                item.shared_rel_file_count,
+                item.shared_exact_file_name_count,
+                item.shared_normalized_file_name_count,
+                item.shared_file_stem_count,
+                item.shared_file_ext_count,
+                item.shared_ext_stem_count,
+                item.shared_hash_count,
+                item.shared_folder_token_count,
+                item.shared_normalized_parent_folder_count,
+                item.shared_binaryity_count,
+                item.shared_archive_family_count,
+                item.shared_language_count,
+                item.shared_size_class_count,
+                item.confidence_tier.as_str()
             ),
         );
     }
     csv
 }
 
-fn build_folder_signatures(rows: &[FileRecord]) -> HashMap<String, FolderSignature> {
-    let mut folders: HashMap<String, FolderSignature> = HashMap::new();
+fn build_file_fingerprint_profile(
+    rel_path: &str,
+    file_type: &str,
+    size: u64,
+) -> FileFingerprintProfile {
+    let is_symlink = file_type == "symlink";
+    let path = Path::new(rel_path);
+    let file_name = path
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_default()
+        .to_lowercase();
+    let folder = normalize_fingerprint_folder(rel_path);
+    if is_symlink {
+        return FileFingerprintProfile {
+            normalized_name: "symlink".to_string(),
+            normalized_folder: folder,
+            ext: String::new(),
+            is_binary: false,
+            is_archive: false,
+            archive_family: None,
+            language: "symlink".to_string(),
+            size_class: infer_size_class(0),
+        };
+    }
 
+    let normalized_name = normalize_fingerprint_name(&file_name);
+    let ext = path
+        .extension()
+        .map(|value| value.to_string_lossy().to_ascii_lowercase());
+    let archive_family = infer_archive_family(&file_name);
+    let is_archive = archive_family.is_some();
+    let is_binary = is_binary_path(&file_type, &file_name, ext.as_deref(), is_archive);
+    let language = infer_source_language(rel_path);
+    let size_class = infer_size_class(size);
+
+    FileFingerprintProfile {
+        normalized_name,
+        normalized_folder: folder,
+        ext: ext.unwrap_or_default(),
+        is_binary,
+        is_archive,
+        archive_family,
+        language,
+        size_class,
+    }
+}
+
+fn normalize_fingerprint_name(file_name: &str) -> String {
+    let path = Path::new(file_name);
+    let stem = path
+        .file_stem()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_name.to_string());
+    let normalized = normalize_fingerprint_token_text(&stem);
+    if normalized.is_empty() {
+        return "unnamed".to_string();
+    }
+    let mut tokens = normalized
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(normalize_fingerprint_token_text)
+        .collect::<Vec<_>>();
+    while let Some(token) = tokens.last() {
+        if is_noise_fingerprint_token(token) {
+            tokens.pop();
+            continue;
+        }
+        break;
+    }
+    if tokens.is_empty() {
+        "unnamed".to_string()
+    } else {
+        tokens.join("_")
+    }
+}
+
+fn normalize_fingerprint_folder(rel_path: &str) -> String {
+    let parent = Path::new(rel_path).parent();
+    let mut segments = Vec::new();
+    if let Some(parent) = parent {
+        for segment in parent.iter() {
+            let segment = segment.to_string_lossy();
+            let normalized = normalize_fingerprint_name(&segment);
+            if !normalized.is_empty() {
+                segments.push(normalized);
+            }
+        }
+    }
+    if segments.is_empty() {
+        ".".to_string()
+    } else {
+        segments.join("/")
+    }
+}
+
+fn normalize_fingerprint_token_text(value: &str) -> String {
+    let lowered = value.to_ascii_lowercase();
+    let normalized = lowered
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
+        .collect::<String>();
+    let mut parts: Vec<&str> = normalized.split_whitespace().collect();
+    while let Some(last) = parts.last() {
+        if is_noise_fingerprint_token(last) {
+            parts.pop();
+            continue;
+        }
+        break;
+    }
+    parts.join(" ")
+}
+
+fn is_noise_fingerprint_token(token: &str) -> bool {
+    let value = token.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return true;
+    }
+    if value == "final"
+        || value == "copy"
+        || value == "old"
+        || value == "clean"
+        || value == "backup"
+        || value == "version"
+    {
+        return true;
+    }
+    if value.starts_with("v") {
+        let suffix = &value[1..];
+        if !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()) {
+            return true;
+        }
+    }
+    if value.starts_with("rev")
+        && value.len() > 3
+        && value[3..].chars().all(|ch| ch.is_ascii_digit())
+    {
+        return true;
+    }
+    if value.starts_with('r') && value.len() > 1 && value[1..].chars().all(|ch| ch.is_ascii_digit())
+    {
+        return true;
+    }
+    if value.len() > 3 && value.chars().all(|ch| ch.is_ascii_digit()) {
+        return true;
+    }
+    if value.len() == 8 && value.chars().all(|ch| ch.is_ascii_digit()) {
+        return true;
+    }
+    if value.len() == 10 {
+        let bytes = value.as_bytes();
+        if (bytes[4] == b'-' || bytes[4] == b'_' || bytes[4] == b'.')
+            && (bytes[7] == b'-' || bytes[7] == b'_' || bytes[7] == b'.')
+            && value[..4].chars().all(|ch| ch.is_ascii_digit())
+            && value[5..7].chars().all(|ch| ch.is_ascii_digit())
+            && value[8..].chars().all(|ch| ch.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_binary_extension(ext: &str) -> bool {
+    BINARY_EXTENSIONS.contains(&ext)
+}
+
+fn is_binary_path(file_type: &str, rel_path: &str, ext: Option<&str>, is_archive: bool) -> bool {
+    if file_type == "symlink" {
+        return false;
+    }
+    if is_archive {
+        return true;
+    }
+
+    if let Some(ext) = ext {
+        if is_binary_extension(ext) {
+            return true;
+        }
+    }
+
+    let lower_path = rel_path.to_ascii_lowercase();
+    BINARY_FOLDER_HINTS
+        .iter()
+        .any(|hint| lower_path.contains(hint))
+}
+
+fn build_folder_signatures(rows: &[FileRecord]) -> HashMap<String, FolderSignature> {
+    build_folder_signatures_with_profiles(rows, &HashMap::new())
+}
+
+fn build_folder_signatures_with_profiles(
+    rows: &[FileRecord],
+    profiles: &HashMap<String, FileFingerprintProfile>,
+) -> HashMap<String, FolderSignature> {
+    let mut folders: HashMap<String, FolderSignature> = HashMap::new();
     for row in rows {
         let folder = folder_path_from_row(&row.rel_path);
         let rel_path = Path::new(&row.rel_path);
@@ -1722,6 +2359,10 @@ fn build_folder_signatures(rows: &[FileRecord]) -> HashMap<String, FolderSignatu
             .extension()
             .map(|value| value.to_string_lossy().to_string().to_lowercase())
             .unwrap_or_default();
+        let profile = profiles.get(&row.rel_path).cloned().unwrap_or_else(|| {
+            build_file_fingerprint_profile(&row.rel_path, &row.file_type, row.size)
+        });
+
         let extension_signature = dossier_extension_signature(&file_name, &extension);
 
         let signature = folders
@@ -1741,6 +2382,18 @@ fn build_folder_signatures(rows: &[FileRecord]) -> HashMap<String, FolderSignatu
             format!("N:{file_name}"),
             DOSSIER_NAME_TOKEN_WEIGHT,
         );
+        add_token(
+            signature,
+            format!("NF:{}", profile.normalized_name),
+            DOSSIER_NORMALIZED_NAME_TOKEN_WEIGHT,
+        );
+        if !profile.normalized_folder.is_empty() {
+            add_token(
+                signature,
+                format!("NFP:{}", profile.normalized_folder),
+                DOSSIER_NORMALIZED_FOLDER_TOKEN_WEIGHT,
+            );
+        }
         add_token(
             signature,
             format!("S:{file_stem}"),
@@ -1769,6 +2422,54 @@ fn build_folder_signatures(rows: &[FileRecord]) -> HashMap<String, FolderSignatu
                 format!("ES:{file_stem}:{archive_ext}"),
                 DOSSIER_EXTENSION_STEM_TOKEN_WEIGHT,
             );
+        }
+        if profile.is_binary {
+            add_token(
+                signature,
+                "BIN:binary".to_string(),
+                DOSSIER_BINARYITY_TOKEN_WEIGHT,
+            );
+        } else {
+            add_token(
+                signature,
+                "TEXT:text".to_string(),
+                DOSSIER_BINARYITY_TOKEN_WEIGHT,
+            );
+        }
+        if profile.language != "unknown" && !profile.language.is_empty() {
+            add_token(
+                signature,
+                format!("LANG:{}", profile.language),
+                DOSSIER_LANGUAGE_TOKEN_WEIGHT,
+            );
+        }
+        if !profile.size_class.is_empty() {
+            add_token(
+                signature,
+                format!("SIZE:{}", profile.size_class),
+                DOSSIER_SIZE_CLASS_TOKEN_WEIGHT,
+            );
+            add_token(
+                signature,
+                format!("SZB:{}", profile.size_class),
+                DOSSIER_SIZE_CLASS_TOKEN_WEIGHT,
+            );
+        }
+        if let Some(archive_family) = &profile.archive_family {
+            let token = format!("ARCH:{archive_family}");
+            add_token(signature, token, DOSSIER_ARCHIVE_TOKEN_WEIGHT);
+            add_token(
+                signature,
+                format!("ARCHFAM:{archive_family}"),
+                DOSSIER_ARCHIVE_TOKEN_WEIGHT,
+            );
+            if let Some(archive_signature) = dossier_archive_signature(archive_family) {
+                add_token(
+                    signature,
+                    format!("ARCHSIG:{archive_signature}"),
+                    DOSSIER_ARCHIVE_SIGNATURE_TOKEN_WEIGHT,
+                );
+            }
         }
         if let Some(hash) = &row.fast_hash {
             add_token(signature, format!("H:{hash}"), DOSSIER_HASH_TOKEN_WEIGHT);
@@ -1824,6 +2525,143 @@ fn dossier_extension_signature(file_name: &str, extension: &str) -> String {
     best_match.unwrap_or(extension).to_string()
 }
 
+fn dossier_archive_signature(file_name: &str) -> Option<String> {
+    let signature = infer_archive_family(file_name)?;
+    let mut parts: Vec<&str> = signature
+        .split(|ch| ch == '.' || ch == '+')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    parts.retain(|part| !part.is_empty());
+    if parts.is_empty() {
+        return None;
+    }
+    let mut root = normalize_archive_token(parts[0]);
+    if root == "raw" {
+        root = "img".to_string();
+    }
+    Some(root)
+}
+
+fn normalize_archive_token(token: &str) -> String {
+    match token {
+        "raw" => "img".to_string(),
+        value => value.to_string(),
+    }
+}
+
+fn infer_archive_family(file_name: &str) -> Option<String> {
+    let lower_name = file_name.to_ascii_lowercase();
+    let mut current_name = lower_name.as_str();
+    let mut parts: Vec<String> = Vec::new();
+
+    loop {
+        let path = Path::new(current_name);
+        let extension = path
+            .extension()
+            .map(|value| value.to_string_lossy().to_ascii_lowercase());
+
+        let extension = match extension {
+            Some(extension) => extension,
+            None => break,
+        };
+
+        let signature = dossier_extension_signature(current_name, &extension);
+        if signature == extension {
+            break;
+        }
+
+        let signature_len = signature.len();
+        if signature_len >= current_name.len() {
+            break;
+        }
+        parts.push(signature.trim_start_matches('.').to_string());
+        current_name = &current_name[..current_name.len() - signature_len];
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        parts.reverse();
+        Some(parts.join("."))
+    }
+}
+
+fn infer_size_class(size: u64) -> String {
+    if size == 0 {
+        "0b".to_string()
+    } else if size <= 4 * 1024 {
+        "small".to_string()
+    } else if size <= 1024 * 1024 {
+        "1m".to_string()
+    } else if size <= 10 * 1024 * 1024 {
+        "10m".to_string()
+    } else if size <= 100 * 1024 * 1024 {
+        "100m".to_string()
+    } else if size <= 1024 * 1024 * 1024 {
+        "1g".to_string()
+    } else {
+        "large".to_string()
+    }
+}
+
+fn infer_source_language(file_name: &str) -> String {
+    let path = Path::new(file_name);
+    let extension = path
+        .extension()
+        .map(|value| value.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let lower_name = file_name.to_ascii_lowercase();
+
+    let language = if lower_name.ends_with(".md")
+        || lower_name.ends_with(".markdown")
+        || lower_name.contains("/readme")
+    {
+        "markdown"
+    } else if lower_name.ends_with(".json") {
+        "json"
+    } else if lower_name.ends_with(".toml")
+        || lower_name.ends_with(".yaml")
+        || lower_name.ends_with(".yml")
+    {
+        "config"
+    } else if lower_name.ends_with(".xml") || lower_name.ends_with(".html") {
+        "markup"
+    } else if lower_name.ends_with(".rs") {
+        "rust"
+    } else if lower_name.ends_with(".py") || lower_name.ends_with(".pyi") {
+        "python"
+    } else if matches!(
+        extension.as_str(),
+        "c" | "h" | "cc" | "cpp" | "cxx" | "m" | "mm"
+    ) {
+        "c_family"
+    } else if extension == "go" {
+        "go"
+    } else if matches!(
+        extension.as_str(),
+        "java" | "kt" | "rb" | "php" | "lua" | "pl"
+    ) {
+        "script"
+    } else if matches!(
+        extension.as_str(),
+        "js" | "ts" | "jsx" | "tsx" | "vue" | "svelte"
+    ) {
+        "javascript"
+    } else if matches!(
+        extension.as_str(),
+        "sh" | "bash" | "zsh" | "cmd" | "ps1" | "bat"
+    ) {
+        "shell"
+    } else {
+        "unknown"
+    };
+
+    language.to_string()
+}
+
 fn dossier_folder_tokens(folder: &str) -> Vec<String> {
     folder
         .replace('\\', "/")
@@ -1840,15 +2678,25 @@ fn dossier_folder_tokens(folder: &str) -> Vec<String> {
 }
 
 fn dossier_token_family(token: &str) -> DossierTokenFamily {
+    if token == "BIN:binary" || token == "TEXT:text" {
+        return DossierTokenFamily::Binaryity;
+    }
+
     let Some((prefix, _)) = token.split_once(':') else {
         return DossierTokenFamily::Other;
     };
     match prefix {
         "N" => DossierTokenFamily::ExactFileName,
+        "NF" => DossierTokenFamily::NormalizedFileName,
         "S" => DossierTokenFamily::FileStem,
         "E" => DossierTokenFamily::FileExtension,
         "ES" => DossierTokenFamily::ExtensionStem,
         "H" => DossierTokenFamily::Hash,
+        "ARCH" | "ARCHFAM" => DossierTokenFamily::ArchiveFamily,
+        "ARCHSIG" => DossierTokenFamily::ArchiveSignature,
+        "LANG" => DossierTokenFamily::Language,
+        "SIZE" | "SZB" => DossierTokenFamily::SizeClass,
+        "NFP" => DossierTokenFamily::NormalizedFolder,
         "F" | "FD" | "FP" => DossierTokenFamily::Folder,
         _ => DossierTokenFamily::Other,
     }
@@ -2017,6 +2865,97 @@ fn filter_plan_by_max_age(plan: &CopyPlan, max_age_ns: i64, now_ns: i64) -> Copy
     filtered
 }
 
+fn filter_plan_by_files_from(plan: &CopyPlan, files_from_patterns: &[PatternSpec]) -> CopyPlan {
+    if files_from_patterns.is_empty() {
+        return plan.clone();
+    }
+
+    let items: Vec<CopyPlanItem> = plan
+        .items
+        .iter()
+        .filter(|item| {
+            files_from_patterns
+                .iter()
+                .any(|pattern| path_pattern_matches_spec(pattern, &item.rel_path))
+        })
+        .cloned()
+        .collect();
+
+    let bytes_to_copy = items.iter().map(|item| item.size).sum();
+    let mut filtered = plan.clone();
+    filtered.summary.files_to_copy = items.len();
+    filtered.summary.bytes_to_copy = bytes_to_copy;
+    filtered.items = items;
+    filtered
+}
+
+fn format_bytes_human(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn backup_existing_entry(existing_path: &Path, backup_dir: &Path, rel_path: &str) -> Result<()> {
+    let backup_path = backup_dir.join(rel_path);
+    if let Some(parent) = backup_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    if backup_path.exists() {
+        let backup_is_symlink = std::fs::symlink_metadata(&backup_path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false);
+        if backup_path.is_dir() && !backup_is_symlink {
+            std::fs::remove_dir_all(&backup_path)
+                .with_context(|| format!("failed to clear {}", backup_path.display()))?;
+        } else {
+            std::fs::remove_file(&backup_path)
+                .with_context(|| format!("failed to clear {}", backup_path.display()))?;
+        }
+    }
+
+    match std::fs::rename(existing_path, &backup_path) {
+        Ok(()) => Ok(()),
+        Err(err) if is_cross_device_link(&err) => {
+            let metadata = std::fs::symlink_metadata(existing_path)
+                .with_context(|| format!("failed to stat {}", existing_path.display()))?;
+            if metadata.file_type().is_symlink() {
+                let target = std::fs::read_link(existing_path)
+                    .with_context(|| format!("failed to read {}", existing_path.display()))?;
+                create_symlink(&target, &backup_path)?;
+                std::fs::remove_file(existing_path)
+                    .with_context(|| format!("failed to remove {}", existing_path.display()))?;
+            } else {
+                std::fs::copy(existing_path, &backup_path)
+                    .with_context(|| format!("failed to back up {}", existing_path.display()))?;
+                std::fs::remove_file(existing_path)
+                    .with_context(|| format!("failed to remove {}", existing_path.display()))?;
+            }
+            Ok(())
+        }
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "failed to back up {} -> {}",
+                existing_path.display(),
+                backup_path.display()
+            )
+        }),
+    }
+}
+
+fn is_cross_device_link(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(18)
+}
+
 fn path_pattern_matches_spec(pattern: &PatternSpec, rel_path: &str) -> bool {
     let dir_only = pattern.dir_only;
     let pattern = normalize_policy_path(&pattern.pattern);
@@ -2134,6 +3073,7 @@ fn execute_copy_missing_command(args: ExecuteCopyMissingArgs) -> Result<()> {
         CopyRunArgs {
             source_root,
             destination_root,
+            backup_dir: None,
             overwrite: args.overwrite,
             dry_run: args.dry_run,
             stop_on_error: args.stop_on_error,
@@ -2186,6 +3126,7 @@ fn execute_plan_command(args: ExecutePlanArgs) -> Result<()> {
                 CopyRunArgs {
                     source_root,
                     destination_root,
+                    backup_dir: None,
                     overwrite: args.overwrite,
                     dry_run: args.dry_run,
                     stop_on_error: args.stop_on_error,
@@ -2231,6 +3172,7 @@ fn sync_copy_missing_command(args: SyncCopyMissingArgs) -> Result<()> {
         CopyRunArgs {
             source_root,
             destination_root,
+            backup_dir: None,
             overwrite: args.overwrite,
             dry_run: args.dry_run,
             stop_on_error: args.stop_on_error,
@@ -2277,6 +3219,33 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
     if runtime.inplace {
         eprintln!("[nightindex {command}] compat flag --inplace accepted");
     }
+    if runtime.stats || runtime.human_readable || runtime.verbosity > 0 {
+        let mut notes = Vec::<String>::new();
+        if runtime.stats {
+            notes.push("stats".to_string());
+        }
+        if runtime.human_readable {
+            notes.push("human-readable".to_string());
+        }
+        if runtime.verbosity > 0 {
+            notes.push(format!("verbose x{}", runtime.verbosity));
+        }
+        eprintln!(
+            "[nightindex {command}] compat output flags: {}",
+            notes.join(", ")
+        );
+    }
+    if runtime.source_trailing_slash || runtime.destination_trailing_slash {
+        eprintln!(
+            "[nightindex {command}] positional roots are normalized; trailing slash is noted but does not change copy-root behavior"
+        );
+    }
+    if !runtime.exclude_if_present.is_empty() {
+        eprintln!(
+            "[nightindex {command}] exclude-if-present markers: {}",
+            runtime.exclude_if_present.join(", ")
+        );
+    }
     let mut policy = load_exclude_policy(runtime.policy.as_deref())?;
 
     if !runtime.exclude_prefixes.is_empty() {
@@ -2320,6 +3289,17 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
                 .join(", ")
         );
     }
+    if !runtime.files_from_patterns.is_empty() {
+        eprintln!(
+            "[nightindex {command}] files-from allowlist: {}",
+            runtime
+                .files_from_patterns
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     if let Some(max_age_ns) = runtime.max_age_ns {
         eprintln!("[nightindex {command}] max-age filter: {} ns", max_age_ns);
     }
@@ -2342,12 +3322,23 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
 
     let source_root = resolve_copy_source_root(&runtime.source, "source")?;
     let destination_root = resolve_copy_destination_root(&runtime.destination)?;
+    let backup_dir = if runtime.backup_requested {
+        Some(
+            runtime
+                .backup_dir
+                .clone()
+                .unwrap_or_else(|| destination_root.join(".nightindex-backup")),
+        )
+    } else {
+        None
+    };
 
     scan_command(ScanArgs {
         db: left_db.clone(),
         label: left_label.clone(),
         root: source_root.clone(),
         exclude_prefixes: runtime.exclude_prefixes.clone(),
+        exclude_if_present: runtime.exclude_if_present.clone(),
         policy: runtime.policy.clone(),
         hash: runtime.hash,
     })?;
@@ -2356,6 +3347,7 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
         label: right_label.clone(),
         root: destination_root.clone(),
         exclude_prefixes: runtime.exclude_prefixes,
+        exclude_if_present: runtime.exclude_if_present,
         policy: runtime.policy.clone(),
         hash: runtime.hash,
     })?;
@@ -2368,6 +3360,7 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
             &right_label,
             DeleteRunArgs {
                 destination_root: destination_root.clone(),
+                backup_dir: backup_dir.clone(),
                 dry_run: runtime.dry_run,
                 stop_on_error: runtime.stop_on_error,
                 log: runtime.log.clone(),
@@ -2392,6 +3385,7 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
         &runtime.include_patterns,
         &runtime.filter_exclude_patterns,
     );
+    let plan = filter_plan_by_files_from(&plan, &runtime.files_from_patterns);
     let plan = if let Some(max_age_ns) = runtime.max_age_ns {
         filter_plan_by_max_age(&plan, max_age_ns, now_ns()?)
     } else {
@@ -2403,6 +3397,7 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
         CopyRunArgs {
             source_root,
             destination_root: destination_root.clone(),
+            backup_dir: backup_dir.clone(),
             overwrite: runtime.overwrite,
             dry_run: runtime.dry_run,
             stop_on_error: runtime.stop_on_error,
@@ -2425,6 +3420,7 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
             &right_label,
             DeleteRunArgs {
                 destination_root: destination_root.clone(),
+                backup_dir: backup_dir.clone(),
                 dry_run: runtime.dry_run,
                 stop_on_error: runtime.stop_on_error,
                 log: runtime.log.clone(),
@@ -2447,6 +3443,24 @@ fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
 
     let json = serde_json::to_string_pretty(&summary)?;
     println!("{json}");
+    if runtime.stats || runtime.human_readable || runtime.verbosity > 0 {
+        let bytes = if runtime.human_readable {
+            format_bytes_human(summary.copied_bytes)
+        } else {
+            summary.copied_bytes.to_string()
+        };
+        eprintln!(
+            "[nightindex {command}] summary planned={} copied={} skipped_existing={} skipped_conflict={} overwritten={} missing_source={} failed={} copied_bytes={}",
+            summary.planned_files,
+            summary.copied_files,
+            summary.skipped_existing,
+            summary.skipped_conflict,
+            summary.overwritten_files,
+            summary.missing_source,
+            summary.failed_files,
+            bytes
+        );
+    }
     Ok(())
 }
 
@@ -2454,6 +3468,8 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
     let mut parsed = CompatRuntime {
         source: PathBuf::new(),
         destination: PathBuf::new(),
+        source_trailing_slash: false,
+        destination_trailing_slash: false,
         overwrite: false,
         dry_run: false,
         stop_on_error: false,
@@ -2465,8 +3481,15 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
         delete_mode: None,
         delete_excluded: false,
         inplace: false,
+        stats: false,
+        human_readable: false,
+        verbosity: 0,
+        backup_requested: false,
+        backup_dir: None,
         exclude_prefixes: Vec::new(),
+        exclude_if_present: Vec::new(),
         include_patterns: Vec::new(),
+        files_from_patterns: Vec::new(),
         filter_exclude_patterns: Vec::new(),
         max_age_ns: None,
         accepted_link_flags: Vec::new(),
@@ -2506,6 +3529,9 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                 "--dry-run" => parsed.dry_run = true,
                 "--ignore-existing" | "--update" => parsed.overwrite = false,
                 "--checksum" | "--hash" => parsed.hash = true,
+                "--stats" => parsed.stats = true,
+                "--human-readable" => parsed.human_readable = true,
+                "--backup" => parsed.backup_requested = true,
                 "--copy-links"
                 | "--copy-unsafe-links"
                 | "--links"
@@ -2536,6 +3562,9 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                     parse_exclude_file(value, &mut parsed.exclude_prefixes)
                         .with_context(|| format!("invalid --exclude-from value '{value}'"))?;
                 }
+                "--exclude-if-present" => {
+                    parsed.exclude_if_present.push(normalize_policy_path(value));
+                }
                 "--progress-every" => {
                     parsed.progress_every = value
                         .parse::<usize>()
@@ -2554,6 +3583,11 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                     parsed.delete_mode = Some(DeleteMode::Before)
                 }
                 "--delete-after" => parsed.delete_mode = Some(DeleteMode::After),
+                "--backup-dir" => parsed.backup_dir = Some(PathBuf::from(value)),
+                "--files-from" => {
+                    parse_include_file(value, &mut parsed.files_from_patterns)
+                        .with_context(|| format!("invalid --files-from value '{value}'"))?;
+                }
                 "--filter" => parse_filter_rule(
                     value,
                     &mut parsed.include_patterns,
@@ -2601,6 +3635,10 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                 "dry-run" => parsed.dry_run = true,
                 "ignore-existing" | "update" => parsed.overwrite = false,
                 "checksum" => parsed.hash = true,
+                "stats" => parsed.stats = true,
+                "human-readable" => parsed.human_readable = true,
+                "backup" => parsed.backup_requested = true,
+                "verbose" => parsed.verbosity = parsed.verbosity.saturating_add(1),
                 "overwrite" => parsed.overwrite = true,
                 "hash" => parsed.hash = true,
                 "copy-links" | "copy-unsafe-links" | "links" | "perms" | "times" | "group"
@@ -2634,6 +3672,12 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                     parse_exclude_file(&value, &mut parsed.exclude_prefixes)
                         .with_context(|| format!("invalid --exclude-from value '{value}'"))?;
                 }
+                "exclude-if-present" => {
+                    let value = next_value(&mut iter, &option)?;
+                    parsed
+                        .exclude_if_present
+                        .push(normalize_policy_path(&value));
+                }
                 "progress-every" => {
                     let value = next_value(&mut iter, &option)?;
                     parsed.progress_every = value
@@ -2645,11 +3689,20 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                 "delete-before" | "delete-during" => parsed.delete_mode = Some(DeleteMode::Before),
                 "delete-after" => parsed.delete_mode = Some(DeleteMode::After),
                 "delete-excluded" => parsed.delete_excluded = true,
+                "backup-dir" => {
+                    let value = next_value(&mut iter, &option)?;
+                    parsed.backup_dir = Some(PathBuf::from(value));
+                }
                 "max-age" => {
                     let value = next_value(&mut iter, &option)?;
                     parsed.max_age_ns = Some(parse_age_value(&value).with_context(|| {
                         format!("invalid --max-age='{value}' in {command} compatibility parsing")
                     })?);
+                }
+                "files-from" => {
+                    let value = next_value(&mut iter, &option)?;
+                    parse_include_file(&value, &mut parsed.files_from_patterns)
+                        .with_context(|| format!("invalid --files-from value '{value}'"))?;
                 }
                 "rsh" | "ssh" | "dry-run-mode" => {
                     let value = next_value(&mut iter, &option)?;
@@ -2728,8 +3781,10 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
                     'n' => parsed.dry_run = true,
                     'u' => parsed.overwrite = false,
                     'c' => parsed.hash = true,
-                    'a' | 'r' | 'v' | 'l' | 't' | 'p' | 'h' | 'H' | 'L' | 'z' | 'R' | 'x' | 'q'
-                    | 'I' | 'S' | 'k' | 'm' | 'D' | 'o' | 'g' | 'P' => {}
+                    'v' => parsed.verbosity = parsed.verbosity.saturating_add(1),
+                    'h' => parsed.human_readable = true,
+                    'a' | 'r' | 'l' | 't' | 'p' | 'H' | 'L' | 'z' | 'R' | 'x' | 'q' | 'I' | 'S'
+                    | 'k' | 'm' | 'D' | 'o' | 'g' | 'P' => {}
                     _ => parsed.unsupported_args.push(format!("-{flag}")),
                 }
             }
@@ -2744,12 +3799,18 @@ fn parse_compat_copy_flags(args: &CompatCopyArgs, command: &str) -> Result<Compa
     }
     parsed.source = PathBuf::from(positionals[0].clone());
     parsed.destination = PathBuf::from(positionals[1].clone());
+    parsed.source_trailing_slash = positionals[0].ends_with('/') || positionals[0].ends_with('\\');
+    parsed.destination_trailing_slash =
+        positionals[1].ends_with('/') || positionals[1].ends_with('\\');
     if positionals.len() > 2 {
         for extra in &positionals[2..] {
             parsed
                 .unsupported_args
                 .push(format!("extra positional: {extra}"));
         }
+    }
+    if parsed.backup_dir.is_some() {
+        parsed.backup_requested = true;
     }
     parsed.progress_every = parsed.progress_every.max(1);
     Ok(parsed)
@@ -2905,6 +3966,19 @@ fn run_copy_plan(
     let mut missing_source = 0usize;
     let mut failed = 0usize;
     let mut copied_bytes = 0u64;
+    let started_at_ns = now_ns()?;
+    let planned_total = items_to_copy.len();
+    let planned_bytes = plan.summary.bytes_to_copy;
+    eprintln!(
+        "{}",
+        format_start_line(
+            &plan.mode,
+            planned_total,
+            planned_bytes,
+            args.dry_run,
+            args.overwrite
+        )
+    );
     let write_event = |log: &mut Option<std::fs::File>, event: &CopyEvent| -> Result<()> {
         if let Some(writer) = log {
             let payload = serde_json::to_vec(event).context("serialize copy event")?;
@@ -2913,7 +3987,6 @@ fn run_copy_plan(
         }
         Ok(())
     };
-
     for (index, item) in items_to_copy.iter().enumerate() {
         let source_path = args.source_root.join(&item.rel_path);
         let destination_path = args.destination_root.join(&item.rel_path);
@@ -3299,7 +4372,20 @@ fn run_copy_plan(
             copied_bytes += source_size;
 
             if (index + 1) % progress_every == 0 {
-                println!("[dry-run] planned={} copied={}", index + 1, copied);
+                emit_copy_progress(
+                    &mut log,
+                    planned_total,
+                    planned_bytes,
+                    index + 1,
+                    copied,
+                    skipped_existing,
+                    skipped_conflict,
+                    overwritten_files,
+                    missing_source,
+                    failed,
+                    copied_bytes,
+                    started_at_ns,
+                )?;
             }
 
             write_event(
@@ -3318,6 +4404,10 @@ fn run_copy_plan(
             continue;
         }
 
+        if let Some(backup_dir) = args.backup_dir.as_ref() {
+            backup_existing_entry(&destination_path, backup_dir, &item.rel_path)?;
+        }
+
         if let Some(parent) = destination_path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!(
@@ -3327,17 +4417,25 @@ fn run_copy_plan(
             })?;
         }
 
-        match fs::copy(&source_path, &destination_path) {
-            Ok(bytes_written) => {
+        match copy_regular_file_via_temp(&source_path, &destination_path, args.overwrite) {
+            Ok(RegularCopyOutcome::Copied(bytes_written)) => {
                 copied += 1;
                 copied_bytes += bytes_written;
                 if (index + 1) % progress_every == 0 {
-                    println!(
-                        "[copy] {} / {} ({} bytes)",
+                    emit_copy_progress(
+                        &mut log,
+                        planned_total,
+                        planned_bytes,
                         index + 1,
-                        items_to_copy.len(),
-                        copied_bytes
-                    );
+                        copied,
+                        skipped_existing,
+                        skipped_conflict,
+                        overwritten_files,
+                        missing_source,
+                        failed,
+                        copied_bytes,
+                        started_at_ns,
+                    )?;
                 }
                 write_event(
                     &mut log,
@@ -3379,10 +4477,27 @@ fn run_copy_plan(
                     err
                 );
             }
+            Ok(RegularCopyOutcome::LostRace) => {
+                skipped_existing += 1;
+                write_event(
+                    &mut log,
+                    &CopyEvent {
+                        schema_version: 2,
+                        rel_path: item.rel_path.clone(),
+                        action: CopyEventAction::SkipExisting,
+                        existing_bytes,
+                        bytes: 0,
+                        dry_run: false,
+                        overwrite: args.overwrite,
+                        reason: Some("destination appeared during copy".to_string()),
+                    },
+                )?;
+            }
         }
     }
 
-    Ok(CopyExecutionSummary {
+    let elapsed_ns = now_ns()? - started_at_ns;
+    let summary = CopyExecutionSummary {
         mode: plan.mode.clone(),
         dry_run: args.dry_run,
         overwrite: args.overwrite,
@@ -3398,7 +4513,63 @@ fn run_copy_plan(
         copied_bytes,
         deleted_files: 0,
         deleted_bytes: 0,
-    })
+    };
+    eprintln!("{}", format_summary_line(&summary, elapsed_ns));
+    write_copy_summary_event(&mut log, &summary, elapsed_ns)?;
+    Ok(summary)
+}
+
+fn emit_copy_progress(
+    log: &mut Option<std::fs::File>,
+    planned_total: usize,
+    planned_bytes: u64,
+    completed_files: usize,
+    copied_files: usize,
+    skipped_existing: usize,
+    skipped_conflict: usize,
+    overwritten_files: usize,
+    missing_source: usize,
+    failed_files: usize,
+    copied_bytes: u64,
+    started_at_ns: i64,
+) -> Result<()> {
+    let elapsed_ns = now_ns()? - started_at_ns;
+    let snapshot = CopyProgressSnapshot {
+        planned_files: planned_total,
+        planned_bytes,
+        completed_files,
+        copied_files,
+        skipped_existing,
+        skipped_conflict,
+        overwritten_files,
+        missing_source,
+        failed_files,
+        copied_bytes,
+        elapsed_ns,
+    };
+    eprintln!("{}", format_progress_line(&snapshot));
+    write_copy_progress_event(log, &snapshot)
+}
+
+fn copy_regular_file_via_temp(
+    source_path: &Path,
+    destination_path: &Path,
+    overwrite: bool,
+) -> Result<RegularCopyOutcome> {
+    let mut stager = CopyStager::new();
+    let stage = stager.stage(destination_path)?;
+    let bytes_written = fs::copy(source_path, stage.temp_path()).with_context(|| {
+        format!(
+            "failed copying {} to temp {}",
+            source_path.display(),
+            stage.temp_path().display()
+        )
+    })?;
+
+    match stage.finalize(destination_path, overwrite)? {
+        CopyFinalizeOutcome::Committed => Ok(RegularCopyOutcome::Copied(bytes_written)),
+        CopyFinalizeOutcome::SkippedConflict { .. } => Ok(RegularCopyOutcome::LostRace),
+    }
 }
 
 #[cfg(unix)]
@@ -3491,6 +4662,53 @@ fn run_delete_pass(
             continue;
         }
 
+        if let Some(backup_dir) = args.backup_dir.as_ref() {
+            if let Err(err) = backup_existing_entry(&target_path, backup_dir, &item.rel_path) {
+                summary.failed_files += 1;
+                if args.stop_on_error {
+                    return Err(err)
+                        .with_context(|| format!("failed backing up {}", target_path.display()));
+                }
+                eprintln!("[err] backup failed: {}: {}", target_path.display(), err);
+                continue;
+            }
+            summary.deleted_files += 1;
+            summary.deleted_bytes += item.size;
+            if (index + 1) % args.progress_every.max(1) == 0 {
+                println!(
+                    "[delete] {} / {} ({} bytes)",
+                    index + 1,
+                    delete_targets.len(),
+                    summary.deleted_bytes
+                );
+            }
+            if let Some(writer) = log.as_mut() {
+                let payload = serde_json::to_vec(&CopyEvent {
+                    schema_version: 2,
+                    rel_path: item.rel_path.clone(),
+                    action: CopyEventAction::Delete,
+                    existing_bytes: Some(item.size),
+                    bytes: item.size,
+                    dry_run: false,
+                    overwrite: false,
+                    reason: Some(
+                        if policy
+                            .map(|policy| should_exclude_path(&item.rel_path, policy))
+                            .unwrap_or(false)
+                        {
+                            "excluded destination entry".to_string()
+                        } else {
+                            "destination-only entry".to_string()
+                        },
+                    ),
+                })
+                .context("serialize delete event")?;
+                writer.write_all(&payload)?;
+                writer.write_all(b"\n")?;
+            }
+            continue;
+        }
+
         match fs::remove_file(&target_path) {
             Ok(()) => {
                 summary.deleted_files += 1;
@@ -3557,7 +4775,30 @@ fn open_db(path: &Path) -> Result<Connection> {
     let conn =
         Connection::open(path).with_context(|| format!("failed to open db {}", path.display()))?;
     conn.execute_batch(SCHEMA)?;
+    ensure_file_fingerprint_columns(&conn)?;
     Ok(conn)
+}
+
+fn ensure_file_fingerprint_columns(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(file_fingerprints)")?;
+    let mut cols = HashSet::new();
+    let mut rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for col in rows.by_ref() {
+        cols.insert(col?);
+    }
+    if !cols.contains("language") {
+        conn.execute(
+            "ALTER TABLE file_fingerprints ADD COLUMN language TEXT NOT NULL DEFAULT 'unknown'",
+            (),
+        )?;
+    }
+    if !cols.contains("size_class") {
+        conn.execute(
+            "ALTER TABLE file_fingerprints ADD COLUMN size_class TEXT NOT NULL DEFAULT 'large'",
+            (),
+        )?;
+    }
+    Ok(())
 }
 
 fn open_readonly_db(path: &Path) -> Result<Connection> {
@@ -3583,6 +4824,76 @@ fn load_label(conn: &Connection, label: &str) -> Result<Vec<FileRecord>> {
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
+    }
+    Ok(out)
+}
+
+fn load_file_fingerprint_profiles(
+    conn: &Connection,
+    label: &str,
+) -> Result<HashMap<String, FileFingerprintProfile>> {
+    let mut columns = HashSet::new();
+    {
+        let mut column_stmt = conn.prepare("PRAGMA table_info(file_fingerprints)")?;
+        let mut col_rows = column_stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for col in col_rows.by_ref() {
+            columns.insert(col?);
+        }
+    }
+
+    let has_language = columns.contains("language");
+    let has_size_class = columns.contains("size_class");
+
+    let mut check_stmt = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='file_fingerprints'")?;
+    let has_profiles = check_stmt.query_row([], |_| Ok(())).optional()?.is_some();
+    if !has_profiles {
+        return Ok(HashMap::new());
+    }
+
+    let query = if has_language && has_size_class {
+        "SELECT rel_path, normalized_name, normalized_folder, ext, is_binary, is_archive, archive_family, language, size_class FROM file_fingerprints WHERE label = ?1 ORDER BY rel_path"
+    } else {
+        "SELECT rel_path, normalized_name, normalized_folder, ext, is_binary, is_archive, archive_family FROM file_fingerprints WHERE label = ?1 ORDER BY rel_path"
+    };
+    let mut stmt = conn.prepare(query)?;
+    let rows = stmt.query_map(params![label], |row| {
+        let is_binary: i64 = row.get(4)?;
+        let is_archive: i64 = row.get(5)?;
+        Ok(match (has_language, has_size_class) {
+            (true, true) => (
+                row.get::<_, String>(0)?,
+                FileFingerprintProfile {
+                    normalized_name: row.get(1)?,
+                    normalized_folder: row.get(2)?,
+                    ext: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    is_binary: is_binary != 0,
+                    is_archive: is_archive != 0,
+                    archive_family: row.get(6)?,
+                    language: row.get(7)?,
+                    size_class: row.get(8)?,
+                },
+            ),
+            _ => (
+                row.get::<_, String>(0)?,
+                FileFingerprintProfile {
+                    normalized_name: row.get(1)?,
+                    normalized_folder: row.get(2)?,
+                    ext: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    is_binary: is_binary != 0,
+                    is_archive: is_archive != 0,
+                    archive_family: row.get(6)?,
+                    language: "unknown".to_string(),
+                    size_class: "large".to_string(),
+                },
+            ),
+        })
+    })?;
+
+    let mut out = HashMap::with_capacity(rows.size_hint().0);
+    for row in rows {
+        let (rel_path, profile) = row?;
+        out.insert(rel_path, profile);
     }
     Ok(out)
 }
@@ -3789,15 +5100,27 @@ fn parse_age_value(value: &str) -> Result<i64> {
     Ok(nanos as i64)
 }
 
-fn should_walk(path: &Path, root: &Path, policy: &ExcludePolicy) -> bool {
+fn should_walk(
+    path: &Path,
+    root: &Path,
+    policy: &ExcludePolicy,
+    exclude_if_present: &[String],
+) -> bool {
     if path == root {
-        return true;
+        return !directory_has_marker(path, exclude_if_present);
     }
     let rel = match path.strip_prefix(root) {
         Ok(path) => path_to_slash(path),
         Err(_) => return true,
     };
-    !should_exclude_path(&rel, policy)
+    !should_exclude_path(&rel, policy) && !directory_has_marker(path, exclude_if_present)
+}
+
+fn directory_has_marker(path: &Path, markers: &[String]) -> bool {
+    if markers.is_empty() || !path.is_dir() {
+        return false;
+    }
+    markers.iter().any(|marker| path.join(marker).exists())
 }
 
 fn path_to_slash(path: &Path) -> String {
@@ -4087,6 +5410,64 @@ mod tests {
     }
 
     #[test]
+    fn parse_compat_copy_flags_supports_common_compat_flags() -> Result<()> {
+        let root = temp_dir("compat_common");
+        let files_from = root.join("files-from.txt");
+        fs::write(&files_from, "keep.bin\nnested/\n#comment\n")?;
+
+        let args = CompatCopyArgs {
+            compat_args: vec![
+                "--files-from".into(),
+                files_from.display().to_string(),
+                "--exclude-if-present".into(),
+                ".nobackup".into(),
+                "--backup".into(),
+                "--backup-dir".into(),
+                "/tmp/nightindex-backups".into(),
+                "--stats".into(),
+                "--human-readable".into(),
+                "-vv".into(),
+                "source/".into(),
+                "dest/".into(),
+            ],
+        };
+
+        let runtime = parse_compat_copy_flags(&args, "rsync")?;
+        assert!(runtime.backup_requested);
+        assert_eq!(
+            runtime.backup_dir,
+            Some(PathBuf::from("/tmp/nightindex-backups"))
+        );
+        assert!(runtime.stats);
+        assert!(runtime.human_readable);
+        assert_eq!(runtime.verbosity, 2);
+        assert!(runtime.source_trailing_slash);
+        assert!(runtime.destination_trailing_slash);
+        assert_eq!(
+            runtime
+                .exclude_if_present
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec![".nobackup"]
+        );
+        assert!(
+            runtime
+                .files_from_patterns
+                .iter()
+                .any(|item| item.display_value() == "keep.bin")
+        );
+        assert!(
+            runtime
+                .files_from_patterns
+                .iter()
+                .any(|item| item.display_value() == "nested/")
+        );
+        fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[test]
     fn parse_compat_copy_flags_ignores_empty_include_values() -> Result<()> {
         let args = CompatCopyArgs {
             compat_args: vec!["--include=/".into(), "source".into(), "dest".into()],
@@ -4164,6 +5545,77 @@ mod tests {
     }
 
     #[test]
+    fn filter_plan_by_files_from_keeps_listed_paths() {
+        let plan = CopyPlan {
+            mode: "copy-missing".to_string(),
+            left_label: "left".to_string(),
+            right_label: "right".to_string(),
+            left_db: None,
+            right_db: None,
+            generated_at_ns: 0,
+            summary: CopyPlanSummary {
+                files_to_copy: 3,
+                bytes_to_copy: 12,
+                left_files: 3,
+                right_files: 0,
+            },
+            items: vec![
+                CopyPlanItem {
+                    rel_path: "keep.bin".to_string(),
+                    file_type: "file".to_string(),
+                    size: 2,
+                    mtime_ns: 1,
+                    fast_hash: None,
+                },
+                CopyPlanItem {
+                    rel_path: "nested/item.txt".to_string(),
+                    file_type: "file".to_string(),
+                    size: 4,
+                    mtime_ns: 2,
+                    fast_hash: None,
+                },
+                CopyPlanItem {
+                    rel_path: "other.bin".to_string(),
+                    file_type: "file".to_string(),
+                    size: 6,
+                    mtime_ns: 3,
+                    fast_hash: None,
+                },
+            ],
+        };
+
+        let filtered = filter_plan_by_files_from(
+            &plan,
+            &[
+                PatternSpec::parse("keep.bin").expect("file pattern"),
+                PatternSpec::parse("nested/").expect("dir pattern"),
+            ],
+        );
+
+        assert_eq!(filtered.summary.files_to_copy, 2);
+        assert_eq!(filtered.summary.bytes_to_copy, 6);
+        assert_eq!(filtered.items.len(), 2);
+        assert!(
+            filtered
+                .items
+                .iter()
+                .any(|item| item.rel_path == "keep.bin")
+        );
+        assert!(
+            filtered
+                .items
+                .iter()
+                .any(|item| item.rel_path == "nested/item.txt")
+        );
+        assert!(
+            !filtered
+                .items
+                .iter()
+                .any(|item| item.rel_path == "other.bin")
+        );
+    }
+
+    #[test]
     fn filter_plan_by_max_age_keeps_only_recent_items() {
         let plan = CopyPlan {
             mode: "copy-missing".to_string(),
@@ -4238,6 +5690,7 @@ mod tests {
             label: "left".to_string(),
             root: source_root,
             exclude_prefixes: Vec::new(),
+            exclude_if_present: Vec::new(),
             policy: None,
             hash: false,
         })?;
@@ -4246,6 +5699,7 @@ mod tests {
             label: "right".to_string(),
             root: destination_root.clone(),
             exclude_prefixes: Vec::new(),
+            exclude_if_present: Vec::new(),
             policy: None,
             hash: false,
         })?;
@@ -4257,6 +5711,7 @@ mod tests {
             "right",
             DeleteRunArgs {
                 destination_root: destination_root.clone(),
+                backup_dir: None,
                 dry_run: true,
                 stop_on_error: false,
                 log: None,
@@ -4298,6 +5753,7 @@ mod tests {
             label: "left".to_string(),
             root: source_root,
             exclude_prefixes: Vec::new(),
+            exclude_if_present: Vec::new(),
             policy: None,
             hash: false,
         })?;
@@ -4306,6 +5762,7 @@ mod tests {
             label: "right".to_string(),
             root: destination_root.clone(),
             exclude_prefixes: Vec::new(),
+            exclude_if_present: Vec::new(),
             policy: None,
             hash: false,
         })?;
@@ -4324,6 +5781,7 @@ mod tests {
             "right",
             DeleteRunArgs {
                 destination_root: destination_root.clone(),
+                backup_dir: None,
                 dry_run: false,
                 stop_on_error: false,
                 log: None,
@@ -4359,6 +5817,7 @@ mod tests {
             label: "left".to_string(),
             root: source_root,
             exclude_prefixes: Vec::new(),
+            exclude_if_present: Vec::new(),
             policy: None,
             hash: false,
         })?;
@@ -4404,6 +5863,7 @@ mod tests {
             label: "left".to_string(),
             root: source_root.clone(),
             exclude_prefixes: Vec::new(),
+            exclude_if_present: Vec::new(),
             policy: None,
             hash: false,
         })?;
@@ -4412,6 +5872,7 @@ mod tests {
             label: "right".to_string(),
             root: destination_root.clone(),
             exclude_prefixes: Vec::new(),
+            exclude_if_present: Vec::new(),
             policy: None,
             hash: false,
         })?;
@@ -4428,6 +5889,7 @@ mod tests {
             CopyRunArgs {
                 source_root: source_root.clone(),
                 destination_root: destination_root.clone(),
+                backup_dir: None,
                 overwrite: false,
                 dry_run: false,
                 stop_on_error: false,
@@ -4469,6 +5931,7 @@ mod tests {
             label: "left".to_string(),
             root: source_root.clone(),
             exclude_prefixes: Vec::new(),
+            exclude_if_present: Vec::new(),
             policy: None,
             hash: false,
         })?;
@@ -4477,6 +5940,7 @@ mod tests {
             label: "right".to_string(),
             root: destination_root.clone(),
             exclude_prefixes: Vec::new(),
+            exclude_if_present: Vec::new(),
             policy: None,
             hash: false,
         })?;
@@ -4487,6 +5951,7 @@ mod tests {
             CopyRunArgs {
                 source_root: source_root.clone(),
                 destination_root: destination_root.clone(),
+                backup_dir: None,
                 overwrite: false,
                 dry_run: false,
                 stop_on_error: false,
@@ -4655,9 +6120,867 @@ mod tests {
         assert_eq!(matches[0].right_folder, "beta");
         assert!((matches[0].overlap_weight > 0.0));
         assert_eq!(matches[0].shared_rel_file_count, 2);
+        assert_eq!(matches[0].shared_exact_file_name_count, 2);
+        assert_eq!(matches[0].shared_normalized_file_name_count, 2);
+        assert_eq!(matches[0].shared_file_stem_count, 2);
+        assert_eq!(matches[0].shared_file_ext_count, 2);
+        assert_eq!(matches[0].shared_ext_stem_count, 3);
+        assert_eq!(matches[0].shared_hash_count, 2);
+        assert_eq!(matches[0].shared_folder_token_count, 0);
+        assert_eq!(matches[0].shared_normalized_parent_folder_count, 0);
 
         let all = build_dossier_matches(&left_signatures, &right_signatures, 5);
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn dossier_matching_reports_hash_signal_for_divergent_file_names() {
+        let left_rows = vec![
+            FileRecord {
+                rel_path: "alpha/raw-seed-01.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 101,
+                mtime_ns: 1,
+                fast_hash: Some("h1".to_string()),
+            },
+            FileRecord {
+                rel_path: "alpha/results-final.bin".to_string(),
+                file_type: "file".to_string(),
+                size: 202,
+                mtime_ns: 2,
+                fast_hash: Some("h2".to_string()),
+            },
+        ];
+        let right_rows = vec![
+            FileRecord {
+                rel_path: "renamed/seed-block.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 111,
+                mtime_ns: 10,
+                fast_hash: Some("h1".to_string()),
+            },
+            FileRecord {
+                rel_path: "renamed/chosen-output.bin".to_string(),
+                file_type: "file".to_string(),
+                size: 112,
+                mtime_ns: 11,
+                fast_hash: Some("h2".to_string()),
+            },
+        ];
+
+        let left_signatures = build_folder_signatures(&left_rows);
+        let right_signatures = build_folder_signatures(&right_rows);
+        let matches = build_dossier_matches(&left_signatures, &right_signatures, 1);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].left_folder, "alpha");
+        assert_eq!(matches[0].right_folder, "renamed");
+        assert!(matches[0].overlap_weight > 0.0);
+        assert_eq!(matches[0].shared_exact_file_name_count, 0);
+        assert_eq!(matches[0].shared_normalized_file_name_count, 0);
+        assert_eq!(matches[0].shared_file_stem_count, 0);
+        assert_eq!(matches[0].shared_ext_stem_count, 0);
+        assert_eq!(matches[0].shared_hash_count, 2);
+        assert_eq!(matches[0].shared_rel_file_count, 0);
+        assert_eq!(matches[0].confidence_tier, DossierConfidenceTier::Similar);
+    }
+
+    #[test]
+    fn dossier_matching_shows_weak_extension_only_for_mismatched_patterns() {
+        let left_rows = vec![
+            FileRecord {
+                rel_path: "source-pack/logs-alpha.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 101,
+                mtime_ns: 1,
+                fast_hash: Some("left-h1".to_string()),
+            },
+            FileRecord {
+                rel_path: "source-pack/chunk-beta.bin".to_string(),
+                file_type: "file".to_string(),
+                size: 202,
+                mtime_ns: 2,
+                fast_hash: Some("left-h2".to_string()),
+            },
+        ];
+        let right_rows = vec![
+            FileRecord {
+                rel_path: "payload-v2/alpha-log.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 111,
+                mtime_ns: 10,
+                fast_hash: Some("right-h3".to_string()),
+            },
+            FileRecord {
+                rel_path: "payload-v2/block-zed.bin".to_string(),
+                file_type: "file".to_string(),
+                size: 222,
+                mtime_ns: 11,
+                fast_hash: Some("right-h4".to_string()),
+            },
+        ];
+
+        let left_signatures = build_folder_signatures(&left_rows);
+        let right_signatures = build_folder_signatures(&right_rows);
+        let matches = build_dossier_matches(&left_signatures, &right_signatures, 1);
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].left_folder, "source-pack");
+        assert_eq!(matches[0].right_folder, "payload-v2");
+        assert!(matches[0].overlap_weight > 0.0);
+        assert_eq!(matches[0].shared_exact_file_name_count, 0);
+        assert_eq!(matches[0].shared_normalized_file_name_count, 0);
+        assert_eq!(matches[0].shared_file_stem_count, 0);
+        assert_eq!(matches[0].shared_file_ext_count, 2);
+        assert_eq!(matches[0].shared_hash_count, 0);
+        assert_eq!(matches[0].confidence_tier, DossierConfidenceTier::Manual);
+    }
+
+    #[test]
+    fn dossier_matching_prefers_language_signal_when_names_drift() {
+        let left_rows = vec![
+            FileRecord {
+                rel_path: "readme-source/readme-a.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 128,
+                mtime_ns: 1,
+                fast_hash: None,
+            },
+            FileRecord {
+                rel_path: "readme-source/notes-a.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 256,
+                mtime_ns: 2,
+                fast_hash: None,
+            },
+        ];
+        let right_rows = vec![
+            FileRecord {
+                rel_path: "readme-copy/readme-b.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 136,
+                mtime_ns: 10,
+                fast_hash: None,
+            },
+            FileRecord {
+                rel_path: "readme-copy/notes-b.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 274,
+                mtime_ns: 11,
+                fast_hash: None,
+            },
+            FileRecord {
+                rel_path: "candidate-plain/doc-a.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 136,
+                mtime_ns: 12,
+                fast_hash: None,
+            },
+            FileRecord {
+                rel_path: "candidate-plain/doc-b.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 274,
+                mtime_ns: 13,
+                fast_hash: None,
+            },
+        ];
+
+        let left_signatures = build_folder_signatures_with_profiles(&left_rows, &HashMap::new());
+        let right_signatures = build_folder_signatures_with_profiles(&right_rows, &HashMap::new());
+        let matches = build_dossier_matches(&left_signatures, &right_signatures, 2);
+
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].left_folder, "readme-source");
+        assert_eq!(matches[0].right_folder, "readme-copy");
+        assert_eq!(matches[0].shared_language_count, 1);
+        assert_eq!(matches[0].shared_size_class_count, 2);
+        assert_eq!(matches[1].right_folder, "candidate-plain");
+        assert_eq!(matches[1].shared_language_count, 0);
+        assert!(matches[0].overlap_ratio > matches[1].overlap_ratio);
+    }
+
+    #[test]
+    fn dossier_matching_prefers_size_bucket_signal_when_names_drift() {
+        let left_rows = vec![
+            FileRecord {
+                rel_path: "size-drift/alpha.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 128,
+                mtime_ns: 1,
+                fast_hash: None,
+            },
+            FileRecord {
+                rel_path: "size-drift/beta.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 256,
+                mtime_ns: 2,
+                fast_hash: None,
+            },
+        ];
+        let right_rows = vec![
+            FileRecord {
+                rel_path: "size-match/branch-one.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 80,
+                mtime_ns: 10,
+                fast_hash: None,
+            },
+            FileRecord {
+                rel_path: "size-match/branch-two.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 200,
+                mtime_ns: 11,
+                fast_hash: None,
+            },
+            FileRecord {
+                rel_path: "size-mismatch/branch-one.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 80,
+                mtime_ns: 12,
+                fast_hash: None,
+            },
+            FileRecord {
+                rel_path: "size-mismatch/branch-two.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 20 * 1024 * 1024,
+                mtime_ns: 13,
+                fast_hash: None,
+            },
+        ];
+
+        let left_signatures = build_folder_signatures_with_profiles(&left_rows, &HashMap::new());
+        let right_signatures = build_folder_signatures_with_profiles(&right_rows, &HashMap::new());
+        let matches = build_dossier_matches(&left_signatures, &right_signatures, 2);
+
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].left_folder, "size-drift");
+        assert_eq!(matches[0].right_folder, "size-match");
+        assert_eq!(matches[0].shared_size_class_count, 2);
+        assert_eq!(matches[1].right_folder, "size-mismatch");
+        assert_eq!(matches[1].shared_size_class_count, 2);
+        assert!(matches[0].overlap_ratio > matches[1].overlap_ratio);
+    }
+
+    #[test]
+    fn build_dossier_csv_emits_signal_count_columns() {
+        let rows = vec![DossierMatch {
+            left_folder: "alpha".to_string(),
+            right_folder: "beta".to_string(),
+            overlap_weight: 1.25,
+            left_weight: 2.0,
+            right_weight: 2.5,
+            overlap_ratio: 0.357,
+            shared_rel_file_count: 1,
+            shared_exact_file_name_count: 2,
+            shared_normalized_file_name_count: 1,
+            shared_file_stem_count: 1,
+            shared_file_ext_count: 1,
+            shared_ext_stem_count: 1,
+            shared_hash_count: 1,
+            shared_folder_token_count: 0,
+            shared_normalized_parent_folder_count: 1,
+            shared_binaryity_count: 2,
+            shared_archive_family_count: 0,
+            shared_language_count: 0,
+            shared_size_class_count: 0,
+            confidence_tier: DossierConfidenceTier::Possible,
+        }];
+
+        let csv = build_dossier_csv(&rows);
+        assert!(csv.starts_with(
+            "left_folder,right_folder,overlap_weight,left_weight,right_weight,overlap_ratio,shared_rel_file_count,shared_exact_file_name_count,shared_normalized_file_name_count,shared_file_stem_count,shared_file_ext_count,shared_ext_stem_count,shared_hash_count,shared_folder_token_count,shared_normalized_parent_folder_count,shared_binaryity_count,shared_archive_family_count,shared_language_count,shared_size_class_count,confidence_tier\n",
+        ));
+        assert!(csv.contains(
+            "alpha,beta,1.2500,2.0000,2.5000,0.357000,1,2,1,1,1,1,1,0,1,2,0,0,0,possible"
+        ));
+    }
+
+    fn make_confidence_match(
+        overlap_ratio: f64,
+        shared_normalized_file_name_count: usize,
+        shared_hash_count: usize,
+        shared_normalized_parent_folder_count: usize,
+        shared_file_ext_count: usize,
+        shared_ext_stem_count: usize,
+        shared_rel_file_count: usize,
+    ) -> DossierMatch {
+        DossierMatch {
+            left_folder: "left".to_string(),
+            right_folder: "right".to_string(),
+            overlap_weight: 1.0,
+            left_weight: 2.0,
+            right_weight: 2.0,
+            overlap_ratio,
+            shared_rel_file_count,
+            shared_exact_file_name_count: 0,
+            shared_normalized_file_name_count,
+            shared_file_stem_count: 0,
+            shared_file_ext_count,
+            shared_ext_stem_count,
+            shared_hash_count,
+            shared_folder_token_count: 0,
+            shared_normalized_parent_folder_count,
+            shared_binaryity_count: 0,
+            shared_archive_family_count: 0,
+            shared_language_count: 0,
+            shared_size_class_count: 0,
+            confidence_tier: DossierConfidenceTier::Manual,
+        }
+    }
+
+    #[test]
+    fn dossier_confidence_tiers_are_bucketed_by_signal_strength() {
+        let identical = make_confidence_match(0.92, 1, 2, 1, 0, 0, 1);
+        assert_eq!(
+            dossier_confidence_tier(&identical),
+            DossierConfidenceTier::Identical
+        );
+
+        let similar = make_confidence_match(0.65, 1, 1, 1, 0, 0, 0);
+        assert_eq!(
+            dossier_confidence_tier(&similar),
+            DossierConfidenceTier::Similar
+        );
+
+        let possible = make_confidence_match(0.30, 0, 0, 0, 1, 0, 0);
+        assert_eq!(
+            dossier_confidence_tier(&possible),
+            DossierConfidenceTier::Possible
+        );
+
+        let manual = make_confidence_match(0.10, 0, 0, 0, 0, 0, 0);
+        assert_eq!(
+            dossier_confidence_tier(&manual),
+            DossierConfidenceTier::Manual
+        );
+    }
+
+    #[test]
+    fn infer_archive_family_detects_compound_nested_formats() {
+        assert_eq!(
+            infer_archive_family("backup.tar.gz"),
+            Some("tar.gz".to_string())
+        );
+        assert_eq!(
+            infer_archive_family("snapshot.tar.xz"),
+            Some("tar.xz".to_string())
+        );
+        assert_eq!(
+            infer_archive_family("bundle.tar.bz2"),
+            Some("tar.bz2".to_string())
+        );
+        assert_eq!(
+            infer_archive_family("image.archive.img.raw"),
+            Some("img.raw".to_string())
+        );
+        assert_eq!(
+            infer_archive_family("archive.zip+txt"),
+            Some("zip+txt".to_string())
+        );
+        assert_eq!(infer_archive_family("notes.txt"), None);
+        assert_eq!(
+            dossier_archive_signature("bundle.tar.gz"),
+            Some("tar".to_string())
+        );
+        assert_eq!(
+            dossier_archive_signature("image.zip+txt"),
+            Some("zip".to_string())
+        );
+    }
+
+    #[test]
+    fn dossier_matching_uses_archive_signature_for_compressed_payload_variants() {
+        let left_rows = vec![FileRecord {
+            rel_path: "left/source-a.tar.gz".to_string(),
+            file_type: "file".to_string(),
+            size: 101,
+            mtime_ns: 1,
+            fast_hash: None,
+        }];
+        let right_rows = vec![FileRecord {
+            rel_path: "right/delta_payload.tar.xz".to_string(),
+            file_type: "file".to_string(),
+            size: 102,
+            mtime_ns: 2,
+            fast_hash: None,
+        }];
+
+        let left_signatures = build_folder_signatures(&left_rows);
+        let right_signatures = build_folder_signatures(&right_rows);
+        let matches = build_dossier_matches(&left_signatures, &right_signatures, 1);
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].left_folder, "left");
+        assert_eq!(matches[0].right_folder, "right");
+        assert_eq!(matches[0].shared_binaryity_count, 1);
+        assert_eq!(matches[0].shared_archive_family_count, 0);
+        assert!(matches[0].overlap_weight > 0.0);
+    }
+
+    #[test]
+    fn dossier_matching_uses_fingerprint_profiles_for_renamed_paths() {
+        let left_rows = vec![
+            FileRecord {
+                rel_path: "case-final-v2/readme-final.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 101,
+                mtime_ns: 1,
+                fast_hash: Some("hash-readme".to_string()),
+            },
+            FileRecord {
+                rel_path: "case-final-v2/chain.bin".to_string(),
+                file_type: "file".to_string(),
+                size: 202,
+                mtime_ns: 2,
+                fast_hash: Some("hash-chain".to_string()),
+            },
+        ];
+        let right_rows = vec![
+            FileRecord {
+                rel_path: "case_v2_case/readme.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 111,
+                mtime_ns: 10,
+                fast_hash: Some("hash-readme".to_string()),
+            },
+            FileRecord {
+                rel_path: "case_v2_case/chain-final.bin".to_string(),
+                file_type: "file".to_string(),
+                size: 222,
+                mtime_ns: 11,
+                fast_hash: Some("hash-chain".to_string()),
+            },
+        ];
+
+        let mut left_profiles = HashMap::new();
+        left_profiles.insert(
+            "case-final-v2/readme-final.txt".to_string(),
+            build_file_fingerprint_profile(
+                &left_rows[0].rel_path,
+                &left_rows[0].file_type,
+                left_rows[0].size,
+            ),
+        );
+        left_profiles.insert(
+            "case-final-v2/chain.bin".to_string(),
+            build_file_fingerprint_profile(
+                &left_rows[1].rel_path,
+                &left_rows[1].file_type,
+                left_rows[1].size,
+            ),
+        );
+        let mut right_profiles = HashMap::new();
+        right_profiles.insert(
+            "case_v2_case/readme.txt".to_string(),
+            build_file_fingerprint_profile(
+                &right_rows[0].rel_path,
+                &right_rows[0].file_type,
+                right_rows[0].size,
+            ),
+        );
+        right_profiles.insert(
+            "case_v2_case/chain-final.bin".to_string(),
+            build_file_fingerprint_profile(
+                &right_rows[1].rel_path,
+                &right_rows[1].file_type,
+                right_rows[1].size,
+            ),
+        );
+
+        let left_signatures = build_folder_signatures_with_profiles(&left_rows, &left_profiles);
+        let right_signatures = build_folder_signatures_with_profiles(&right_rows, &right_profiles);
+        let matches = build_dossier_matches(&left_signatures, &right_signatures, 1);
+
+        assert_eq!(left_signatures.len(), 1);
+        assert_eq!(right_signatures.len(), 1);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].left_folder, "case-final-v2");
+        assert_eq!(matches[0].right_folder, "case_v2_case");
+        assert!(matches[0].overlap_weight > 0.0);
+    }
+
+    #[test]
+    fn dossier_matching_falls_back_to_derived_profiles() {
+        let left_rows = vec![
+            FileRecord {
+                rel_path: "case-final-v2/readme-final.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 101,
+                mtime_ns: 1,
+                fast_hash: Some("hash-readme".to_string()),
+            },
+            FileRecord {
+                rel_path: "case-final-v2/chain.bin".to_string(),
+                file_type: "file".to_string(),
+                size: 202,
+                mtime_ns: 2,
+                fast_hash: Some("hash-chain".to_string()),
+            },
+        ];
+        let right_rows = vec![
+            FileRecord {
+                rel_path: "case_v2_case/readme.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 111,
+                mtime_ns: 10,
+                fast_hash: Some("hash-readme".to_string()),
+            },
+            FileRecord {
+                rel_path: "case_v2_case/chain-final.bin".to_string(),
+                file_type: "file".to_string(),
+                size: 222,
+                mtime_ns: 11,
+                fast_hash: Some("hash-chain".to_string()),
+            },
+        ];
+
+        let left_signatures = build_folder_signatures_with_profiles(&left_rows, &HashMap::new());
+        let right_signatures = build_folder_signatures_with_profiles(&right_rows, &HashMap::new());
+        let matches = build_dossier_matches(&left_signatures, &right_signatures, 1);
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].left_folder, "case-final-v2");
+        assert_eq!(matches[0].right_folder, "case_v2_case");
+        assert!(matches[0].overlap_weight > 0.0);
+    }
+
+    #[test]
+    fn dossier_matching_uses_persisted_profiles_from_databases() -> Result<()> {
+        let root = temp_dir("dossier_db_profiles");
+        let left_root = root.join("source");
+        let right_root = root.join("destination");
+        fs::create_dir_all(left_root.join("Case-Final-20240101"))?;
+        fs::create_dir_all(right_root.join("case-v2").join("copy"))?;
+
+        fs::write(
+            left_root.join("Case-Final-20240101/readme-0134.log"),
+            b"left-a",
+        )?;
+        fs::write(
+            left_root.join("Case-Final-20240101/settings-0189.cfg"),
+            b"left-b",
+        )?;
+        fs::write(right_root.join("case-v2/copy/readme-zzz.txt"), b"right-a")?;
+        fs::write(right_root.join("case-v2/copy/settings-x.bin"), b"right-b")?;
+
+        let left_db = root.join("left.sqlite");
+        let right_db = root.join("right.sqlite");
+
+        scan_command(ScanArgs {
+            db: left_db.clone(),
+            label: "left".to_string(),
+            root: left_root,
+            exclude_prefixes: Vec::new(),
+            exclude_if_present: Vec::new(),
+            policy: None,
+            hash: false,
+        })?;
+        scan_command(ScanArgs {
+            db: right_db.clone(),
+            label: "right".to_string(),
+            root: right_root,
+            exclude_prefixes: Vec::new(),
+            exclude_if_present: Vec::new(),
+            policy: None,
+            hash: false,
+        })?;
+
+        let left_conn = open_db(&left_db)?;
+        let right_conn = open_db(&right_db)?;
+
+        left_conn.execute(
+            "UPDATE file_fingerprints SET normalized_name = 'readme_case', normalized_folder = 'case', is_binary = 0, is_archive = 0 WHERE label = 'left' AND rel_path = 'Case-Final-20240101/readme-0134.log'",
+            params![],
+        )?;
+        left_conn.execute(
+            "UPDATE file_fingerprints SET normalized_name = 'settings_case', normalized_folder = 'case', is_binary = 0, is_archive = 0 WHERE label = 'left' AND rel_path = 'Case-Final-20240101/settings-0189.cfg'",
+            params![],
+        )?;
+        right_conn.execute(
+            "UPDATE file_fingerprints SET normalized_name = 'readme_case', normalized_folder = 'case', is_binary = 0, is_archive = 0 WHERE label = 'right' AND rel_path = 'case-v2/copy/readme-zzz.txt'",
+            params![],
+        )?;
+        right_conn.execute(
+            "UPDATE file_fingerprints SET normalized_name = 'settings_case', normalized_folder = 'case', is_binary = 0, is_archive = 0 WHERE label = 'right' AND rel_path = 'case-v2/copy/settings-x.bin'",
+            params![],
+        )?;
+
+        let left_rows = load_label(&open_readonly_db(&left_db)?, "left")?;
+        let right_rows = load_label(&open_readonly_db(&right_db)?, "right")?;
+        let left_profiles = load_file_fingerprint_profiles(&open_readonly_db(&left_db)?, "left")?;
+        let right_profiles =
+            load_file_fingerprint_profiles(&open_readonly_db(&right_db)?, "right")?;
+
+        let fallback_left_signatures =
+            build_folder_signatures_with_profiles(&left_rows, &HashMap::new());
+        let fallback_right_signatures =
+            build_folder_signatures_with_profiles(&right_rows, &HashMap::new());
+        let fallback_matches =
+            build_dossier_matches(&fallback_left_signatures, &fallback_right_signatures, 1);
+        assert_eq!(fallback_matches.len(), 1);
+        assert_eq!(fallback_matches[0].shared_normalized_file_name_count, 0);
+        assert_eq!(fallback_matches[0].shared_normalized_parent_folder_count, 0);
+
+        let left_signatures = build_folder_signatures_with_profiles(&left_rows, &left_profiles);
+        let right_signatures = build_folder_signatures_with_profiles(&right_rows, &right_profiles);
+        let matches = build_dossier_matches(&left_signatures, &right_signatures, 1);
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].left_folder, "Case-Final-20240101");
+        assert_eq!(matches[0].right_folder, "case-v2/copy");
+        assert!(matches[0].overlap_weight > 0.0);
+        assert!(matches[0].shared_normalized_file_name_count > 0);
+        assert!(
+            fallback_matches[0].shared_normalized_file_name_count
+                < matches[0].shared_normalized_file_name_count
+        );
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn dossier_matching_falls_back_when_some_profiles_are_missing() -> Result<()> {
+        let root = temp_dir("dossier_profiles_partial_missing");
+        let left_root = root.join("source");
+        let right_root = root.join("destination");
+        fs::create_dir_all(left_root.join("Case-Final-20240101"))?;
+        fs::create_dir_all(right_root.join("case-v2").join("copy"))?;
+
+        fs::write(
+            left_root.join("Case-Final-20240101/readme-0134.log"),
+            b"left-a",
+        )?;
+        fs::write(
+            left_root.join("Case-Final-20240101/settings-0189.cfg"),
+            b"left-b",
+        )?;
+        fs::write(right_root.join("case-v2/copy/readme-zzz.txt"), b"right-a")?;
+        fs::write(right_root.join("case-v2/copy/settings-x.bin"), b"right-b")?;
+
+        let left_db = root.join("left.sqlite");
+        let right_db = root.join("right.sqlite");
+
+        scan_command(ScanArgs {
+            db: left_db.clone(),
+            label: "left".to_string(),
+            root: left_root,
+            exclude_prefixes: Vec::new(),
+            exclude_if_present: Vec::new(),
+            policy: None,
+            hash: false,
+        })?;
+        scan_command(ScanArgs {
+            db: right_db.clone(),
+            label: "right".to_string(),
+            root: right_root,
+            exclude_prefixes: Vec::new(),
+            exclude_if_present: Vec::new(),
+            policy: None,
+            hash: false,
+        })?;
+
+        let left_conn = open_db(&left_db)?;
+        let right_conn = open_db(&right_db)?;
+
+        left_conn.execute(
+            "UPDATE file_fingerprints SET normalized_name = 'readme_case', normalized_folder = 'case', is_binary = 0, is_archive = 0 WHERE label = 'left' AND rel_path = 'Case-Final-20240101/readme-0134.log'",
+            params![],
+        )?;
+        left_conn.execute(
+            "UPDATE file_fingerprints SET normalized_name = 'settings_case', normalized_folder = 'case', is_binary = 0, is_archive = 0 WHERE label = 'left' AND rel_path = 'Case-Final-20240101/settings-0189.cfg'",
+            params![],
+        )?;
+        right_conn.execute(
+            "UPDATE file_fingerprints SET normalized_name = 'readme_case', normalized_folder = 'case', is_binary = 0, is_archive = 0 WHERE label = 'right' AND rel_path = 'case-v2/copy/readme-zzz.txt'",
+            params![],
+        )?;
+        right_conn.execute(
+            "UPDATE file_fingerprints SET normalized_name = 'settings_case', normalized_folder = 'case', is_binary = 0, is_archive = 0 WHERE label = 'right' AND rel_path = 'case-v2/copy/settings-x.bin'",
+            params![],
+        )?;
+
+        let left_rows = load_label(&open_readonly_db(&left_db)?, "left")?;
+        let right_rows = load_label(&open_readonly_db(&right_db)?, "right")?;
+
+        let full_left_profiles =
+            load_file_fingerprint_profiles(&open_readonly_db(&left_db)?, "left")?;
+        let full_right_profiles =
+            load_file_fingerprint_profiles(&open_readonly_db(&right_db)?, "right")?;
+
+        let mut partial_left_profiles = full_left_profiles.clone();
+        partial_left_profiles.remove("Case-Final-20240101/settings-0189.cfg");
+
+        let full_left = build_folder_signatures_with_profiles(&left_rows, &full_left_profiles);
+        let full_right = build_folder_signatures_with_profiles(&right_rows, &full_right_profiles);
+        let full_matches = build_dossier_matches(&full_left, &full_right, 1);
+
+        let partial_left =
+            build_folder_signatures_with_profiles(&left_rows, &partial_left_profiles);
+        let partial_right = full_right;
+        let partial_matches = build_dossier_matches(&partial_left, &partial_right, 1);
+
+        assert_eq!(full_matches.len(), 1);
+        assert_eq!(partial_matches.len(), 1);
+        assert!(partial_matches[0].overlap_weight > 0.0);
+        assert!(
+            full_matches[0].shared_normalized_file_name_count
+                > partial_matches[0].shared_normalized_file_name_count
+        );
+        assert!(partial_matches[0].overlap_weight < full_matches[0].overlap_weight);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn load_file_fingerprint_profiles_returns_normalized_values() -> Result<()> {
+        let root = temp_dir("load_fingerprint_profiles");
+        let source_root = root.join("source");
+        fs::create_dir_all(source_root.join("case-final-20240101"))?;
+        fs::write(
+            source_root.join("case-final-20240101/readme_final.txt"),
+            b"one",
+        )?;
+        fs::write(
+            source_root.join("case-final-20240101/notes_old.bin"),
+            b"two",
+        )?;
+        fs::write(
+            source_root.join("case-final-20240101/bundle_20240101.cfg"),
+            b"three",
+        )?;
+
+        let db = root.join("scan.sqlite");
+        scan_command(ScanArgs {
+            db: db.clone(),
+            label: "left".to_string(),
+            root: source_root,
+            exclude_prefixes: Vec::new(),
+            exclude_if_present: Vec::new(),
+            policy: None,
+            hash: false,
+        })?;
+
+        let conn = open_readonly_db(&db)?;
+        let profiles = load_file_fingerprint_profiles(&conn, "left")?;
+
+        let readme_profile = profiles.get("case-final-20240101/readme_final.txt");
+        assert!(readme_profile.is_some());
+        let readme_profile = readme_profile.expect("readme profile");
+        assert_eq!(readme_profile.normalized_name, "readme");
+        assert_eq!(readme_profile.normalized_folder, "case");
+        assert_eq!(readme_profile.ext, "txt".to_string());
+        assert_eq!(readme_profile.language, "markdown");
+        assert_eq!(readme_profile.size_class, "small");
+
+        let notes_profile = profiles.get("case-final-20240101/notes_old.bin");
+        assert!(notes_profile.is_some());
+        let notes_profile = notes_profile.expect("notes profile");
+        assert_eq!(notes_profile.normalized_name, "notes");
+        assert_eq!(notes_profile.normalized_folder, "case");
+        assert_eq!(notes_profile.ext, "bin".to_string());
+        assert_eq!(notes_profile.language, "unknown");
+        assert_eq!(notes_profile.size_class, "small");
+
+        let bundle_profile = profiles.get("case-final-20240101/bundle_20240101.cfg");
+        assert!(bundle_profile.is_some());
+        let bundle_profile = bundle_profile.expect("bundle profile");
+        assert_eq!(bundle_profile.normalized_name, "bundle");
+        assert_eq!(bundle_profile.normalized_folder, "case");
+        assert_eq!(bundle_profile.ext, "cfg".to_string());
+        assert_eq!(bundle_profile.language, "unknown");
+        assert_eq!(bundle_profile.size_class, "small");
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn dossier_matching_respects_policy_filters_and_renamed_folders() {
+        let policy = ExcludePolicy {
+            directory_prefixes: vec!["noise".to_string()],
+            folder_name_additions: Vec::new(),
+            subtree_overrides: HashMap::new(),
+            enabled: true,
+        };
+
+        let left_rows = vec![
+            FileRecord {
+                rel_path: "renamed-alpha/readme.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 101,
+                mtime_ns: 1,
+                fast_hash: Some("hash-readme".to_string()),
+            },
+            FileRecord {
+                rel_path: "renamed-alpha/app.bin".to_string(),
+                file_type: "file".to_string(),
+                size: 202,
+                mtime_ns: 2,
+                fast_hash: Some("hash-app".to_string()),
+            },
+            FileRecord {
+                rel_path: "noise/ignored.bin".to_string(),
+                file_type: "file".to_string(),
+                size: 303,
+                mtime_ns: 3,
+                fast_hash: Some("hash-noise".to_string()),
+            },
+        ];
+        let right_rows = vec![
+            FileRecord {
+                rel_path: "renamed-beta/readme.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 111,
+                mtime_ns: 10,
+                fast_hash: Some("hash-readme".to_string()),
+            },
+            FileRecord {
+                rel_path: "renamed-beta/app.bin".to_string(),
+                file_type: "file".to_string(),
+                size: 222,
+                mtime_ns: 11,
+                fast_hash: Some("hash-app".to_string()),
+            },
+            FileRecord {
+                rel_path: "noise/ignored.bin".to_string(),
+                file_type: "file".to_string(),
+                size: 333,
+                mtime_ns: 12,
+                fast_hash: Some("hash-noise".to_string()),
+            },
+        ];
+
+        let left_rows: Vec<FileRecord> = left_rows
+            .into_iter()
+            .filter(|row| !should_exclude_path(&row.rel_path, &policy))
+            .collect();
+        let right_rows: Vec<FileRecord> = right_rows
+            .into_iter()
+            .filter(|row| !should_exclude_path(&row.rel_path, &policy))
+            .collect();
+
+        assert_eq!(left_rows.len(), 2);
+        assert_eq!(right_rows.len(), 2);
+        assert!(
+            left_rows
+                .iter()
+                .all(|row| !row.rel_path.starts_with("noise/"))
+        );
+        assert!(
+            right_rows
+                .iter()
+                .all(|row| !row.rel_path.starts_with("noise/"))
+        );
+
+        let left_signatures = build_folder_signatures(&left_rows);
+        let right_signatures = build_folder_signatures(&right_rows);
+        let matches = build_dossier_matches(&left_signatures, &right_signatures, 3);
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].left_folder, "renamed-alpha");
+        assert_eq!(matches[0].right_folder, "renamed-beta");
+        assert_eq!(matches[0].shared_rel_file_count, 2);
     }
 
     #[test]

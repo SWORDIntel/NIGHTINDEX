@@ -68,7 +68,7 @@ nightindex sync \
 ## Commands
 
 `scan`  
-Build or refresh a tree manifest.
+Build or refresh a tree manifest. Prints a short stderr summary with file, symlink, hash, reuse, and exclude counts.
 
 ```bash
 nightindex scan --root <path> --label <name> --db <manifest.sqlite> \
@@ -88,7 +88,7 @@ nightindex compare-summary \
 ```
 
 `brief`  
-Compact aggregate diff with copy estimate.
+Compact aggregate diff with copy estimate. Prints JSON plus a short stderr summary with copy counts and ETA when available.
 
 ```bash
 nightindex brief \
@@ -101,7 +101,35 @@ nightindex brief \
 
 `dossier` (alias: `intel`)  
 Read-only folder identity scoring between two manifests. Useful for matching renamed
-folders and renumbered exploit buckets.
+folders and renumbered exploit buckets where paths drift but semantic content stays related.
+
+`dossier` now combines legacy dossier signals with normalized fingerprint signals:
+- `N:` exact file names, `S:` stems, `E:` extensions, `ES:` archive-aware extension stems, `H:` hashes, and folder tokens.
+- `NF:` normalized file-name aliases from `file_fingerprints`.
+- `NFP:` normalized parent-folder aliases and prefix variants.
+- `BIN` / `TEXT`: binaryity class.
+- `ARCH:<family>` and `ARCHFAM:<family>`: archive family grouping.
+- `ARCHSIG:<payload>`: archive payload signature for related compressions (`tar` for both `tar.gz` and `tar.xz`).
+
+Confidence tiers are interpreted as follows:
+
+`identical`
+- Multiple `N:` exact-name overlaps plus at least one `H:` file hash overlap.
+- High overlap ratio and strong matching anchor counts.
+
+`similar`
+- `NF:` and `NFP:` signal clusters match while exact names diverge.
+- Archive family (`ARCH`, `ARCHFAM`) and binaryity (`BIN`, `TEXT`) alignment.
+
+`possible`
+- Folder structure, extension/family overlap, or hash overlap without stronger anchors.
+
+`manual`
+- Weak or conflicting evidence only.
+
+Compatibility expectation
+- If a database lacks `file_fingerprints` rows, `dossier` gracefully falls back to legacy scoring.
+- Output remains read-only JSON/CSV and does not mutate the source/destination databases.
 
 ```bash
 nightindex dossier \
@@ -116,7 +144,7 @@ nightindex dossier \
 ```
 
 `extcheck`  
-Compare archive-like payload families and extraction potential between two trees.
+Compare archive-like payload families and extraction potential between two trees. Prints JSON plus a short stderr summary of exact and stem matches.
 
 ```bash
 nightindex extcheck \
@@ -174,6 +202,8 @@ nightindex sync \
 `rclone` and `rsync`  
 Compatibility frontends that accept common transfer flags and execute the same copy plan logic.
 Mapped and accepted options are applied; unsupported ones are reported to stderr.
+Positional source and destination arguments are treated as roots; a trailing slash is accepted but
+does not switch the command into a separate "copy contents" mode.
 
 ```bash
 nightindex rsync \
@@ -190,6 +220,8 @@ Common mapped options:
 - `-n`, `--dry-run` → dry-run mode  
 - `--ignore-existing`, `--update`, `-u` → skip existing files (no overwrite)  
 - `--checksum`, `-c` → force hash-based file matching  
+- `--files-from <file>` → allowlist relative paths from a newline-delimited file  
+- `--exclude-if-present <name>` → skip any directory containing the named marker file  
 - `--stop-on-error` → fail fast on the first copy error  
 - `--exclude <pattern>` and `--exclude-from <file>` → import excludes into scan policy  
 - `--delete`, `--delete-before`, `--delete-during`, `--delete-after` → delete destination-only files  
@@ -204,6 +236,9 @@ Common mapped options:
   `10m`, `2h`, or `7d`
 - `--copy-links`, `--copy-unsafe-links` → dereference symlinks and copy target contents
 - `--links` → preserve symlinks
+- `--backup`, `--backup-dir <path>` → back up overwritten or deleted destination entries before replacement
+  (`--backup` uses a local `.nightindex-backup` tree under the destination root)
+- `--stats`, `--human-readable`, `-h`, `--verbose`, `-v` → accepted compatibility flags that add stderr notes
 - Accepted and ignored: `--perms`, `--times`, `--group`, `--owner`, `--chmod`, `--progress`
 - Accepted compat flag: `--inplace`
 - Still unsupported in direct compat mode: `--rsh`, `--ssh`, `--dry-run-mode`
