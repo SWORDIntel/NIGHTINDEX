@@ -51,6 +51,34 @@ CREATE TABLE IF NOT EXISTS copy_runs (
 CREATE INDEX IF NOT EXISTS idx_copy_runs_pair_mode_at
 ON copy_runs(left_label, right_label, mode, copied_at);
 
+CREATE TABLE IF NOT EXISTS copy_resume_sessions (
+    session_id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL,
+    left_label TEXT NOT NULL,
+    right_label TEXT NOT NULL,
+    source_root TEXT,
+    destination_root TEXT,
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    planned_files INTEGER NOT NULL DEFAULT 0,
+    copied_files INTEGER NOT NULL DEFAULT 0,
+    failed_files INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS copy_resume_items (
+    session_id TEXT NOT NULL,
+    rel_path TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    bytes_done INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, rel_path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_copy_resume_items_status
+ON copy_resume_items(session_id, status);
+
 CREATE TABLE IF NOT EXISTS file_fingerprints (
     label TEXT NOT NULL,
     rel_path TEXT NOT NULL,
@@ -156,6 +184,8 @@ enum Commands {
         alias = "sync"
     )]
     SyncCopyMissing(SyncCopyMissingArgs),
+    #[command(about = "Summarize NDJSON copy logs")]
+    Logs(LogsArgs),
     #[command(
         name = "rclone",
         about = "Compatibility frontend for rclone-like command style",
@@ -352,6 +382,16 @@ struct SyncCopyMissingArgs {
     progress_every: usize,
     #[arg(long)]
     write_plan: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct LogsArgs {
+    #[arg(long = "file")]
+    file: PathBuf,
+    #[arg(long = "tail", default_value_t = 200)]
+    tail: usize,
+    #[arg(long = "failures-only")]
+    failures_only: bool,
 }
 
 #[derive(Args, Clone)]
@@ -891,6 +931,7 @@ fn main() -> Result<()> {
         Commands::ExecuteCopyMissing(args) => execute_copy_missing_command(args),
         Commands::ExecutePlan(args) => execute_plan_command(args),
         Commands::SyncCopyMissing(args) => sync_copy_missing_command(args),
+        Commands::Logs(args) => logs_command(args),
         Commands::Rclone(args) => compat_copy_command(args, "rclone"),
         Commands::Rsync(args) => compat_copy_command(args, "rsync"),
     }
@@ -948,6 +989,8 @@ fn scan_command(args: ScanArgs) -> Result<()> {
     let mut excluded = 0usize;
     let mut errors = 0usize;
     let mut symlinks_seen = 0usize;
+    let mut fingerprint_reused = 0usize;
+    let mut fingerprint_recomputed = 0usize;
 
     for entry in WalkDir::new(&root)
         .follow_links(false)
@@ -1051,6 +1094,12 @@ fn scan_command(args: ScanArgs) -> Result<()> {
             )
             .optional()?;
 
+        let file_meta_unchanged = existing
+            .as_ref()
+            .is_some_and(|(old_file_type, old_size, old_mtime_ns, _)| {
+                *old_file_type == file_type && *old_size == size && *old_mtime_ns == mtime_ns
+            });
+
         let fast_hash = if let Some((old_file_type, old_size, old_mtime_ns, old_hash)) = existing {
             if file_type == "symlink" {
                 if old_file_type == file_type
@@ -1085,7 +1134,37 @@ fn scan_command(args: ScanArgs) -> Result<()> {
             None
         };
 
-        let fingerprint_profile = build_file_fingerprint_profile(&rel_path, &file_type, size);
+        let existing_profile = if file_meta_unchanged {
+            conn.query_row(
+                "SELECT normalized_name, normalized_folder, ext, is_binary, is_archive, archive_family, language, size_class FROM file_fingerprints WHERE label = ?1 AND rel_path = ?2",
+                params![&args.label, &rel_path],
+                |row| {
+                    let is_binary: i64 = row.get(3)?;
+                    let is_archive: i64 = row.get(4)?;
+                    Ok(FileFingerprintProfile {
+                        normalized_name: row.get(0)?,
+                        normalized_folder: row.get(1)?,
+                        ext: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        is_binary: is_binary != 0,
+                        is_archive: is_archive != 0,
+                        archive_family: row.get(5)?,
+                        language: row.get(6)?,
+                        size_class: row.get(7)?,
+                    })
+                },
+            )
+            .optional()?
+        } else {
+            None
+        };
+
+        let fingerprint_profile = if let Some(profile) = existing_profile {
+            fingerprint_reused += 1;
+            profile
+        } else {
+            fingerprint_recomputed += 1;
+            build_file_fingerprint_profile(&rel_path, &file_type, size)
+        };
 
         conn.execute(
             r#"
@@ -1154,15 +1233,15 @@ fn scan_command(args: ScanArgs) -> Result<()> {
         files_seen += 1;
         if files_seen % 500 == 0 {
             println!(
-                "[scan] files={} hashed={} reused={} excluded={} errors={}",
-                files_seen, hashed, reused, excluded, errors
+                "[scan] files={} hashed={} reused={} fp_reused={} fp_recomputed={} excluded={} errors={}",
+                files_seen, hashed, reused, fingerprint_reused, fingerprint_recomputed, excluded, errors
             );
         }
     }
 
     println!(
-        "[scan] summary: files={} symlinks={} hashed={} reused={} excluded={} errors={}",
-        files_seen, symlinks_seen, hashed, reused, excluded, errors
+        "[scan] summary: files={} symlinks={} hashed={} reused={} fp_reused={} fp_recomputed={} excluded={} errors={}",
+        files_seen, symlinks_seen, hashed, reused, fingerprint_reused, fingerprint_recomputed, excluded, errors
     );
     Ok(())
 }
@@ -1677,6 +1756,87 @@ fn dossier_command(args: DossierArgs) -> Result<()> {
             report.left_folder_count, report.right_folder_count
         );
     }
+    Ok(())
+}
+
+fn logs_command(args: LogsArgs) -> Result<()> {
+    let raw = std::fs::read_to_string(&args.file)
+        .with_context(|| format!("failed to read {}", args.file.display()))?;
+    let mut lines: Vec<&str> = raw.lines().collect();
+    if args.tail > 0 && lines.len() > args.tail {
+        lines = lines.split_off(lines.len() - args.tail);
+    }
+
+    let mut copied_bytes = 0u64;
+    let mut planned_bytes = 0u64;
+    let mut completed_files = 0u64;
+    let mut planned_files = 0u64;
+    let mut failed_files = 0u64;
+    let mut failures = 0usize;
+    let mut events_seen = 0usize;
+
+    for line in &lines {
+        let parsed: serde_json::Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+
+        let event = parsed.get("event").and_then(|v| v.as_str()).unwrap_or_default();
+        if event.is_empty() {
+            let action = parsed.get("action").and_then(|v| v.as_str()).unwrap_or_default();
+            if action == "fail" {
+                failures += 1;
+                if args.failures_only {
+                    println!("{}", line);
+                }
+            }
+            continue;
+        }
+
+        events_seen += 1;
+        if event == "copy_progress" || event == "copy_summary" {
+            copied_bytes = parsed
+                .get("copied_bytes")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(copied_bytes);
+            planned_bytes = parsed
+                .get("planned_bytes")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(planned_bytes);
+            completed_files = parsed
+                .get("completed_files")
+                .and_then(|v| v.as_u64())
+                .or_else(|| parsed.get("copied_files").and_then(|v| v.as_u64()))
+                .unwrap_or(completed_files);
+            planned_files = parsed
+                .get("planned_files")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(planned_files);
+            failed_files = parsed
+                .get("failed_files")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(failed_files);
+        }
+    }
+
+    let pct = if planned_bytes > 0 {
+        (copied_bytes as f64) * 100.0 / (planned_bytes as f64)
+    } else {
+        0.0
+    };
+    println!(
+        "[logs] file={} events_seen={} copied={}/{} bytes ({:.2}%) files={}/{} failed={} failure_events={}",
+        args.file.display(),
+        events_seen,
+        copied_bytes,
+        planned_bytes,
+        pct,
+        completed_files,
+        planned_files,
+        failed_files,
+        failures
+    );
+
     Ok(())
 }
 
@@ -6686,6 +6846,28 @@ mod tests {
         assert_eq!(DossierConfidenceTier::Similar.action(), DossierAction::Review);
         assert_eq!(DossierConfidenceTier::Possible.action(), DossierAction::Review);
         assert_eq!(DossierConfidenceTier::Manual.action(), DossierAction::Manual);
+    }
+
+    #[test]
+    fn logs_command_parses_progress_and_summary_lines() -> Result<()> {
+        let root = temp_dir("logs_command_parse");
+        fs::create_dir_all(&root)?;
+        let path = root.join("copy.ndjson");
+        fs::write(
+            &path,
+            concat!(
+                "{\"event\":\"copy_progress\",\"planned_files\":10,\"planned_bytes\":1000,\"completed_files\":3,\"copied_bytes\":250,\"failed_files\":1}\n",
+                "{\"schema_version\":2,\"rel_path\":\"x\",\"action\":\"fail\",\"bytes\":0}\n",
+                "{\"event\":\"copy_summary\",\"planned_files\":10,\"planned_bytes\":1000,\"copied_files\":7,\"copied_bytes\":900,\"failed_files\":2}\n"
+            ),
+        )?;
+        logs_command(LogsArgs {
+            file: path,
+            tail: 200,
+            failures_only: false,
+        })?;
+        fs::remove_dir_all(root).ok();
+        Ok(())
     }
 
     #[test]

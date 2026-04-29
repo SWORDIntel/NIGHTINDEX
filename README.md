@@ -159,6 +159,16 @@ nightindex extcheck \
   [--out-json <file>] [--out-csv <file>]
 ```
 
+`logs`  
+Summarize NDJSON copy logs produced by `--log` during execute/sync/compat copy runs.
+
+```bash
+nightindex logs \
+  --file <copy.ndjson> \
+  [--tail 200] \
+  [--failures-only]
+```
+
 `plan-copy-missing` (alias: `plan`)  
 Generate a deterministic copy plan for missing or changed files.
 
