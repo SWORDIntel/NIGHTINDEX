@@ -90,6 +90,9 @@ CREATE TABLE IF NOT EXISTS file_fingerprints (
     archive_family TEXT,
     language TEXT NOT NULL DEFAULT 'unknown',
     size_class TEXT NOT NULL DEFAULT 'large',
+    binary_signature TEXT,
+    text_signature TEXT,
+    archive_signature TEXT,
     scanned_at INTEGER NOT NULL,
     PRIMARY KEY (label, rel_path)
 );
@@ -153,8 +156,10 @@ const DOSSIER_HASH_TOKEN_WEIGHT: f64 = 2.5;
 const DOSSIER_NORMALIZED_NAME_TOKEN_WEIGHT: f64 = 0.85;
 const DOSSIER_NORMALIZED_FOLDER_TOKEN_WEIGHT: f64 = 0.15;
 const DOSSIER_BINARYITY_TOKEN_WEIGHT: f64 = 0.4;
+const DOSSIER_BINARY_SIGNATURE_TOKEN_WEIGHT: f64 = 0.32;
 const DOSSIER_ARCHIVE_TOKEN_WEIGHT: f64 = 0.35;
 const DOSSIER_ARCHIVE_SIGNATURE_TOKEN_WEIGHT: f64 = 0.22;
+const DOSSIER_TEXT_SIGNATURE_TOKEN_WEIGHT: f64 = 0.3;
 const DOSSIER_LANGUAGE_TOKEN_WEIGHT: f64 = 0.28;
 const DOSSIER_SIZE_CLASS_TOKEN_WEIGHT: f64 = 0.18;
 const DOSSIER_FOLDER_TOKEN_WEIGHT: f64 = 0.1;
@@ -650,6 +655,9 @@ struct FileFingerprintProfile {
     archive_family: Option<String>,
     language: String,
     size_class: String,
+    binary_signature: Option<String>,
+    text_signature: Option<String>,
+    archive_signature: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1300,7 +1308,7 @@ fn scan_command(args: ScanArgs) -> Result<()> {
 
         let existing_profile = if file_meta_unchanged {
             conn.query_row(
-                "SELECT normalized_name, normalized_folder, ext, is_binary, is_archive, archive_family, language, size_class FROM file_fingerprints WHERE label = ?1 AND rel_path = ?2",
+                "SELECT normalized_name, normalized_folder, ext, is_binary, is_archive, archive_family, language, size_class, binary_signature, text_signature, archive_signature FROM file_fingerprints WHERE label = ?1 AND rel_path = ?2",
                 params![&args.label, &rel_path],
                 |row| {
                     let is_binary: i64 = row.get(3)?;
@@ -1314,6 +1322,9 @@ fn scan_command(args: ScanArgs) -> Result<()> {
                         archive_family: row.get(5)?,
                         language: row.get(6)?,
                         size_class: row.get(7)?,
+                        binary_signature: row.get(8)?,
+                        text_signature: row.get(9)?,
+                        archive_signature: row.get(10)?,
                     })
                 },
             )
@@ -1386,9 +1397,12 @@ fn scan_command(args: ScanArgs) -> Result<()> {
                 archive_family,
                 language,
                 size_class,
+                binary_signature,
+                text_signature,
+                archive_signature,
                 scanned_at
             )
-            VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             ON CONFLICT(label, rel_path) DO UPDATE SET
                 normalized_name = excluded.normalized_name,
                 normalized_folder = excluded.normalized_folder,
@@ -1398,6 +1412,9 @@ fn scan_command(args: ScanArgs) -> Result<()> {
                 archive_family = excluded.archive_family,
                 language = excluded.language,
                 size_class = excluded.size_class,
+                binary_signature = excluded.binary_signature,
+                text_signature = excluded.text_signature,
+                archive_signature = excluded.archive_signature,
                 scanned_at = excluded.scanned_at
             "#,
             params![
@@ -1411,6 +1428,9 @@ fn scan_command(args: ScanArgs) -> Result<()> {
                 &fingerprint_profile.archive_family,
                 &fingerprint_profile.language,
                 &fingerprint_profile.size_class,
+                &fingerprint_profile.binary_signature,
+                &fingerprint_profile.text_signature,
+                &fingerprint_profile.archive_signature,
                 scanned_at
             ],
         )?;
@@ -3501,6 +3521,9 @@ fn build_file_fingerprint_profile(
             archive_family: None,
             language: "symlink".to_string(),
             size_class: infer_size_class(0),
+            binary_signature: None,
+            text_signature: None,
+            archive_signature: None,
         };
     }
 
@@ -3513,6 +3536,24 @@ fn build_file_fingerprint_profile(
     let is_binary = is_binary_path(&file_type, &file_name, ext.as_deref(), is_archive);
     let language = infer_source_language(rel_path);
     let size_class = infer_size_class(size);
+    let archive_signature = archive_family
+        .as_deref()
+        .and_then(|family| infer_archive_payload_signature(rel_path, family));
+    let binary_signature = if is_binary {
+        Some(infer_binary_signature(
+            rel_path,
+            ext.as_deref(),
+            archive_family.as_deref(),
+            &size_class,
+        ))
+    } else {
+        None
+    };
+    let text_signature = if !is_binary && language != "unknown" {
+        Some(infer_text_signature(rel_path, &language, &normalized_name))
+    } else {
+        None
+    };
 
     FileFingerprintProfile {
         normalized_name,
@@ -3523,6 +3564,9 @@ fn build_file_fingerprint_profile(
         archive_family,
         language,
         size_class,
+        binary_signature,
+        text_signature,
+        archive_signature,
     }
 }
 
@@ -3760,12 +3804,26 @@ fn build_folder_signatures_with_profiles(
                 "BIN:binary".to_string(),
                 DOSSIER_BINARYITY_TOKEN_WEIGHT,
             );
+            if let Some(binary_signature) = &profile.binary_signature {
+                add_token(
+                    signature,
+                    format!("BINSIG:{binary_signature}"),
+                    DOSSIER_BINARY_SIGNATURE_TOKEN_WEIGHT,
+                );
+            }
         } else {
             add_token(
                 signature,
                 "TEXT:text".to_string(),
                 DOSSIER_BINARYITY_TOKEN_WEIGHT,
             );
+            if let Some(text_signature) = &profile.text_signature {
+                add_token(
+                    signature,
+                    format!("TEXTSIG:{text_signature}"),
+                    DOSSIER_TEXT_SIGNATURE_TOKEN_WEIGHT,
+                );
+            }
         }
         if profile.language != "unknown" && !profile.language.is_empty() {
             add_token(
@@ -3798,6 +3856,13 @@ fn build_folder_signatures_with_profiles(
                 add_token(
                     signature,
                     format!("ARCHSIG:{archive_signature}"),
+                    DOSSIER_ARCHIVE_SIGNATURE_TOKEN_WEIGHT,
+                );
+            }
+            if let Some(archive_signature) = &profile.archive_signature {
+                add_token(
+                    signature,
+                    format!("ARCHPAY:{archive_signature}"),
                     DOSSIER_ARCHIVE_SIGNATURE_TOKEN_WEIGHT,
                 );
             }
@@ -3938,6 +4003,62 @@ fn infer_size_class(size: u64) -> String {
     }
 }
 
+fn infer_binary_signature(
+    rel_path: &str,
+    ext: Option<&str>,
+    archive_family: Option<&str>,
+    size_class: &str,
+) -> String {
+    let family = archive_family
+        .and_then(archive_payload_root_from_family)
+        .or_else(|| ext.map(|value| value.trim_start_matches('.').to_string()))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "raw".to_string());
+    let folder_hint = rel_path
+        .replace('\\', "/")
+        .split('/')
+        .rev()
+        .nth(1)
+        .map(normalize_fingerprint_name)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| ".".to_string());
+    format!("{family}:{size_class}:{folder_hint}")
+}
+
+fn infer_text_signature(rel_path: &str, language: &str, normalized_name: &str) -> String {
+    let semantic_name = if normalized_name.is_empty() {
+        normalize_fingerprint_name(rel_path)
+    } else {
+        normalized_name.to_string()
+    };
+    format!("{language}:{semantic_name}")
+}
+
+fn infer_archive_payload_signature(rel_path: &str, archive_family: &str) -> Option<String> {
+    let payload = archive_payload_root_from_family(archive_family)?;
+    let stem = normalize_fingerprint_name(&build_archive_stem(rel_path));
+    if stem.is_empty() {
+        Some(payload)
+    } else {
+        Some(format!("{payload}:{stem}"))
+    }
+}
+
+fn archive_payload_root_from_family(archive_family: &str) -> Option<String> {
+    let mut parts: Vec<&str> = archive_family
+        .split(|ch| ch == '.' || ch == '+')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let mut root = normalize_archive_token(parts.remove(0));
+    if root.is_empty() {
+        root = "archive".to_string();
+    }
+    Some(root)
+}
+
 fn infer_source_language(file_name: &str) -> String {
     let path = Path::new(file_name);
     let extension = path
@@ -4024,9 +4145,10 @@ fn dossier_token_family(token: &str) -> DossierTokenFamily {
         "ES" => DossierTokenFamily::ExtensionStem,
         "H" => DossierTokenFamily::Hash,
         "ARCH" | "ARCHFAM" => DossierTokenFamily::ArchiveFamily,
-        "ARCHSIG" => DossierTokenFamily::ArchiveSignature,
-        "LANG" => DossierTokenFamily::Language,
+        "ARCHSIG" | "ARCHPAY" => DossierTokenFamily::ArchiveSignature,
+        "LANG" | "TEXTSIG" => DossierTokenFamily::Language,
         "SIZE" | "SZB" => DossierTokenFamily::SizeClass,
+        "BINSIG" => DossierTokenFamily::Binaryity,
         "NFP" => DossierTokenFamily::NormalizedFolder,
         "F" | "FD" | "FP" => DossierTokenFamily::Folder,
         _ => DossierTokenFamily::Other,
@@ -6349,6 +6471,24 @@ fn ensure_file_fingerprint_columns(conn: &Connection) -> Result<()> {
             (),
         )?;
     }
+    if !cols.contains("binary_signature") {
+        conn.execute(
+            "ALTER TABLE file_fingerprints ADD COLUMN binary_signature TEXT",
+            (),
+        )?;
+    }
+    if !cols.contains("text_signature") {
+        conn.execute(
+            "ALTER TABLE file_fingerprints ADD COLUMN text_signature TEXT",
+            (),
+        )?;
+    }
+    if !cols.contains("archive_signature") {
+        conn.execute(
+            "ALTER TABLE file_fingerprints ADD COLUMN archive_signature TEXT",
+            (),
+        )?;
+    }
     Ok(())
 }
 
@@ -6485,6 +6625,9 @@ fn load_file_fingerprint_profiles(
 
     let has_language = columns.contains("language");
     let has_size_class = columns.contains("size_class");
+    let has_signature_columns = columns.contains("binary_signature")
+        && columns.contains("text_signature")
+        && columns.contains("archive_signature");
 
     let mut check_stmt = conn
         .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='file_fingerprints'")?;
@@ -6493,7 +6636,9 @@ fn load_file_fingerprint_profiles(
         return Ok(HashMap::new());
     }
 
-    let query = if has_language && has_size_class {
+    let query = if has_language && has_size_class && has_signature_columns {
+        "SELECT rel_path, normalized_name, normalized_folder, ext, is_binary, is_archive, archive_family, language, size_class, binary_signature, text_signature, archive_signature FROM file_fingerprints WHERE label = ?1 ORDER BY rel_path"
+    } else if has_language && has_size_class {
         "SELECT rel_path, normalized_name, normalized_folder, ext, is_binary, is_archive, archive_family, language, size_class FROM file_fingerprints WHERE label = ?1 ORDER BY rel_path"
     } else {
         "SELECT rel_path, normalized_name, normalized_folder, ext, is_binary, is_archive, archive_family FROM file_fingerprints WHERE label = ?1 ORDER BY rel_path"
@@ -6502,34 +6647,58 @@ fn load_file_fingerprint_profiles(
     let rows = stmt.query_map(params![label], |row| {
         let is_binary: i64 = row.get(4)?;
         let is_archive: i64 = row.get(5)?;
-        Ok(match (has_language, has_size_class) {
-            (true, true) => (
-                row.get::<_, String>(0)?,
-                FileFingerprintProfile {
-                    normalized_name: row.get(1)?,
-                    normalized_folder: row.get(2)?,
-                    ext: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    is_binary: is_binary != 0,
-                    is_archive: is_archive != 0,
-                    archive_family: row.get(6)?,
-                    language: row.get(7)?,
-                    size_class: row.get(8)?,
-                },
-            ),
-            _ => (
-                row.get::<_, String>(0)?,
-                FileFingerprintProfile {
-                    normalized_name: row.get(1)?,
-                    normalized_folder: row.get(2)?,
-                    ext: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    is_binary: is_binary != 0,
-                    is_archive: is_archive != 0,
-                    archive_family: row.get(6)?,
-                    language: "unknown".to_string(),
-                    size_class: "large".to_string(),
-                },
-            ),
-        })
+        Ok(
+            match (has_language, has_size_class, has_signature_columns) {
+                (true, true, true) => (
+                    row.get::<_, String>(0)?,
+                    FileFingerprintProfile {
+                        normalized_name: row.get(1)?,
+                        normalized_folder: row.get(2)?,
+                        ext: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        is_binary: is_binary != 0,
+                        is_archive: is_archive != 0,
+                        archive_family: row.get(6)?,
+                        language: row.get(7)?,
+                        size_class: row.get(8)?,
+                        binary_signature: row.get(9)?,
+                        text_signature: row.get(10)?,
+                        archive_signature: row.get(11)?,
+                    },
+                ),
+                (true, true, false) => (
+                    row.get::<_, String>(0)?,
+                    FileFingerprintProfile {
+                        normalized_name: row.get(1)?,
+                        normalized_folder: row.get(2)?,
+                        ext: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        is_binary: is_binary != 0,
+                        is_archive: is_archive != 0,
+                        archive_family: row.get(6)?,
+                        language: row.get(7)?,
+                        size_class: row.get(8)?,
+                        binary_signature: None,
+                        text_signature: None,
+                        archive_signature: None,
+                    },
+                ),
+                _ => (
+                    row.get::<_, String>(0)?,
+                    FileFingerprintProfile {
+                        normalized_name: row.get(1)?,
+                        normalized_folder: row.get(2)?,
+                        ext: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        is_binary: is_binary != 0,
+                        is_archive: is_archive != 0,
+                        archive_family: row.get(6)?,
+                        language: "unknown".to_string(),
+                        size_class: "large".to_string(),
+                        binary_signature: None,
+                        text_signature: None,
+                        archive_signature: None,
+                    },
+                ),
+            },
+        )
     })?;
 
     let mut out = HashMap::with_capacity(rows.size_hint().0);
@@ -9479,6 +9648,7 @@ mod tests {
         .expect("cache hit");
         assert_eq!(cached.language, "python");
         assert_eq!(cached.normalized_name, profile.normalized_name);
+        assert_eq!(cached.text_signature, Some("python:poc".to_string()));
 
         let changed_mtime = load_cached_file_fingerprint_profile(
             &conn,
@@ -9495,5 +9665,22 @@ mod tests {
         assert_eq!(rows, 1);
         fs::remove_dir_all(root).ok();
         Ok(())
+    }
+
+    #[test]
+    fn fingerprint_profiles_include_cached_signature_classes() {
+        let archive = build_file_fingerprint_profile("fw/qcom_payload_final.tar.gz", "file", 4096);
+        assert!(archive.is_archive);
+        assert_eq!(archive.archive_family, Some("tar.gz".to_string()));
+        assert_eq!(archive.binary_signature, Some("tar:small:fw".to_string()));
+        assert_eq!(
+            archive.archive_signature,
+            Some("tar:qcom_payload".to_string())
+        );
+
+        let source = build_file_fingerprint_profile("01_EXPLOITS/010001/poc_final.py", "file", 512);
+        assert_eq!(source.language, "python");
+        assert_eq!(source.text_signature, Some("python:poc".to_string()));
+        assert!(source.binary_signature.is_none());
     }
 }

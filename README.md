@@ -37,13 +37,14 @@ Implemented and shipping on the active branch:
 - Ops visibility: `status` command for DB/run health summary, richer `logs` error-class summaries.
 - Merge workflow: `merge-plan` + hardened `merge-apply` with recursive directory materialization,
   deterministic `keep-both` naming, and richer apply summary counters.
-- Persistent cache v1: cross-label file fingerprint profile cache in SQLite with size/mtime/hash
-  invalidation and `status` visibility.
+- Persistent cache v2: cross-label file fingerprint profile cache in SQLite with size/mtime/hash
+  invalidation, `status` visibility, and cached binary/text/archive signature fields for dossier
+  matching.
 
 In progress:
-- Extend persistent caching from scan-time fingerprint profiles into deeper compare/archive/text
-  signatures.
 - Archive-recursive indexing and semantic code/text signatures.
+- Extend cached signatures from deterministic metadata signals into deeper content-derived
+  binary/text/archive descriptors.
 
 ## Recommended recovery use-case
 

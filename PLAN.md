@@ -2,7 +2,7 @@
 
 ## Current Status
 
-Estimated total progress: about 86%.
+Estimated total progress: about 88%.
 
 Done:
 - Core `nightindex` / `ndex` binaries and command aliases.
@@ -16,17 +16,20 @@ Done:
 - Dossier documentation updated with normalized fingerprint matching signals, confidence-tier interpretation, and fallback/compatibility expectations.
 - Archive-aware dossier matching added via `ARCH:`/`ARCHFAM:` and payload signature (`ARCHSIG:`), enabling multi-part archive-family matching without extraction.
 - NOT_STISLA-like dossier hardening: binaryity, archive-family, and size-class evidence now participate in dossier tie-breaks.
-- Current test baseline: `cargo test -q` passes 55 tests for both binaries.
+- Current test baseline: `cargo test -q` passes 56 tests for both binaries.
 - Deep dossier scoring now uses normalized fingerprint profiles for renamed-folder/file matching (suffix-noise robust: `final`, `v2`, `old`, `copy`, date-ish).
 - Resume, logs/status, and merge-apply hardening are implemented and pushed.
 - Persistent cache v1 is implemented: scan-time file fingerprint profiles are cached in SQLite by
   path/type/size/mtime/hash input, reused across labels, invalidated by changed file metadata, and
   exposed through `status` as `signature_cache_rows`.
+- Persistent cache v2 is underway and usable: file fingerprint profiles now include cached
+  binary/text/archive signature fields, persisted in `file_fingerprints`, migrated onto older DBs,
+  and consumed as dossier evidence tokens.
 
 ## Next Highest-Value Work
 
 1. Extend persistent fingerprint cache.
-   Add cached binary/text/archive signatures and report hit/miss counts in compare/dossier output.
+   Add content-derived binary/text/archive descriptors and report hit/miss counts in compare/dossier output.
 
 2. Archive recursive indexing.
    Inspect nested archives as virtual trees without needing full extraction first.
