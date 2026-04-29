@@ -156,6 +156,9 @@ const DEFAULT_NOISE_DIRS: &[&str] = &[
 ];
 const COMPARE_SUMMARY_REPORT_SCHEMA: &str = "nightindex.compare_summary";
 const DOSSIER_REPORT_SCHEMA: &str = "nightindex.dossier";
+const ARCHIVE_MEMBER_DIFF_REPORT_SCHEMA: &str = "nightindex.archive_member_diff";
+const ARCHIVE_MEMBER_PLAN_REPORT_SCHEMA: &str = "nightindex.archive_member_plan";
+const ARCHIVE_MEMBER_PLAN_ROW_SCHEMA: &str = "nightindex.archive_member_plan.row";
 const REPORT_VERSION_V1: u32 = 1;
 
 const ARCHIVE_EXTENSIONS: &[&str] = &[
@@ -188,6 +191,10 @@ const DOSSIER_SIZE_CLASS_TOKEN_WEIGHT: f64 = 0.18;
 const DOSSIER_FOLDER_TOKEN_WEIGHT: f64 = 0.1;
 const DOSSIER_FOLDER_PREFIX_TOKEN_WEIGHT: f64 = 0.05;
 const DOSSIER_FOLDER_DEPTH_TOKEN_WEIGHT: f64 = 0.02;
+const DESCRIPTOR_MAX_COMPONENT_LEN: usize = 48;
+const DESCRIPTOR_MAX_COMPOSITE_LEN: usize = 192;
+const DESCRIPTOR_MIN_TOKEN_LEN: usize = 2;
+const DESCRIPTOR_MAX_KEY_TOKEN_LEN: usize = 32;
 
 #[derive(Parser)]
 #[command(
@@ -221,6 +228,11 @@ enum Commands {
         alias = "amdiff"
     )]
     ArchiveMemberDiff(ArchiveMemberDiffArgs),
+    #[command(
+        about = "Plan reconcile/merge actions from archive-member diff signals",
+        alias = "amplan"
+    )]
+    ArchiveMemberPlan(ArchiveMemberPlanArgs),
     #[command(about = "Create a plan for missing file copy", alias = "plan")]
     PlanCopyMissing(PlanCopyMissingArgs),
     #[command(about = "Build retry plan from resume state", alias = "resume")]
@@ -338,6 +350,22 @@ struct ExtractCheckArgs {
 
 #[derive(Args)]
 struct ArchiveMemberDiffArgs {
+    #[arg(long = "left-db")]
+    left_db: PathBuf,
+    #[arg(long = "right-db")]
+    right_db: PathBuf,
+    #[arg(long)]
+    left: String,
+    #[arg(long)]
+    right: String,
+    #[arg(long)]
+    out_json: Option<PathBuf>,
+    #[arg(long)]
+    out_csv: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct ArchiveMemberPlanArgs {
     #[arg(long = "left-db")]
     left_db: PathBuf,
     #[arg(long = "right-db")]
@@ -832,6 +860,34 @@ struct ArchiveMemberDiffReport {
     right_only: Vec<ArchiveMemberDiffEntry>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+struct ArchiveMemberPlanRow {
+    row_schema: String,
+    row_version: u32,
+    action_class: String,
+    side: String,
+    virtual_member: String,
+    rel_path: String,
+    archive_family: Option<String>,
+    payload_signature: Option<String>,
+    archive_depth: usize,
+    size: u64,
+    mtime_ns: i64,
+    fast_hash: Option<String>,
+    signal: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ArchiveMemberPlanReport {
+    report_schema: String,
+    report_version: u32,
+    left_label: String,
+    right_label: String,
+    source_report_schema: String,
+    source_report_version: u32,
+    rows: Vec<ArchiveMemberPlanRow>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct CopyPlan {
     mode: String,
@@ -1040,6 +1096,33 @@ struct ReportCacheMetrics {
 struct CacheUsageCounters {
     hits: usize,
     misses: usize,
+    analytics: CacheUsageAnalytics,
+}
+
+#[derive(Debug, Serialize, Default, Clone, Copy, PartialEq)]
+struct CacheUsageAnalytics {
+    coverage: CacheCoverageMetrics,
+    descriptor_density: CacheDescriptorDensityMetrics,
+}
+
+#[derive(Debug, Serialize, Default, Clone, Copy, PartialEq)]
+struct CacheCoverageMetrics {
+    total_rows: usize,
+    profile_rows: usize,
+    coverage_ratio: f64,
+}
+
+#[derive(Debug, Serialize, Default, Clone, Copy, PartialEq)]
+struct CacheDescriptorDensityMetrics {
+    profiled_rows: usize,
+    with_binary_descriptor: usize,
+    with_text_signature: usize,
+    with_archive_signature: usize,
+    with_any_descriptor: usize,
+    binary_descriptor_ratio: f64,
+    text_signature_ratio: f64,
+    archive_signature_ratio: f64,
+    any_descriptor_ratio: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
@@ -1216,6 +1299,7 @@ fn main() -> Result<()> {
         Commands::Dossier(args) => dossier_command(args),
         Commands::ExtractCheck(args) => extract_check_command(args),
         Commands::ArchiveMemberDiff(args) => archive_member_diff_command(args),
+        Commands::ArchiveMemberPlan(args) => archive_member_plan_command(args),
         Commands::PlanCopyMissing(args) => plan_copy_missing_command(args),
         Commands::ResumePlan(args) => resume_plan_command(args),
         Commands::ExecuteCopyMissing(args) => execute_copy_missing_command(args),
@@ -1906,22 +1990,48 @@ fn extract_check_command(args: ExtractCheckArgs) -> Result<()> {
 }
 
 fn archive_member_diff_command(args: ArchiveMemberDiffArgs) -> Result<()> {
-    let left_conn = open_db(&args.left_db)?;
-    let right_conn = open_db(&args.right_db)?;
+    let left_conn = open_readonly_db(&args.left_db)?;
+    let right_conn = open_readonly_db(&args.right_db)?;
+    let report = build_archive_member_diff_report(&left_conn, &right_conn, &args.left, &args.right)?;
+    let json = serde_json::to_string_pretty(&report)?;
+    println!("{json}");
+    if let Some(path) = args.out_json {
+        std::fs::write(&path, format!("{json}\n"))
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    if let Some(path) = args.out_csv {
+        let csv = build_archive_member_diff_csv(&report);
+        std::fs::write(&path, csv)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    eprintln!(
+        "[archive-member-diff] summary: {} exact, {} payload-family, {} left-only, {} right-only",
+        report.exact_member_matches,
+        report.payload_family_matches,
+        report.left_only_count,
+        report.right_only_count
+    );
+    Ok(())
+}
 
-    let mut left_entries = load_virtual_archive_entries(&left_conn, &args.left)?;
+fn build_archive_member_diff_report(
+    left_conn: &Connection,
+    right_conn: &Connection,
+    left_label: &str,
+    right_label: &str,
+) -> Result<ArchiveMemberDiffReport> {
+    let mut left_entries = load_virtual_archive_entries(left_conn, left_label)?;
     if left_entries.is_empty() {
-        let left_rows = load_label(&left_conn, &args.left)?;
+        let left_rows = load_label(left_conn, left_label)?;
         left_entries = build_archive_entries(&left_rows)?;
     }
-    let mut right_entries = load_virtual_archive_entries(&right_conn, &args.right)?;
+    let mut right_entries = load_virtual_archive_entries(right_conn, right_label)?;
     if right_entries.is_empty() {
-        let right_rows = load_label(&right_conn, &args.right)?;
+        let right_rows = load_label(right_conn, right_label)?;
         right_entries = build_archive_entries(&right_rows)?;
     }
 
-    let mut left_map: HashMap<String, ExtractCheckEntry> =
-        HashMap::with_capacity(left_entries.len());
+    let mut left_map: HashMap<String, ExtractCheckEntry> = HashMap::with_capacity(left_entries.len());
     let mut right_map: HashMap<String, ExtractCheckEntry> =
         HashMap::with_capacity(right_entries.len());
     for entry in left_entries {
@@ -1984,11 +2094,11 @@ fn archive_member_diff_command(args: ArchiveMemberDiffArgs) -> Result<()> {
     left_only.sort_by(|a, b| a.virtual_member.cmp(&b.virtual_member));
     right_only.sort_by(|a, b| a.virtual_member.cmp(&b.virtual_member));
 
-    let report = ArchiveMemberDiffReport {
-        report_schema: "nightindex.archive_member_diff".to_string(),
-        report_version: 1,
-        left_label: args.left,
-        right_label: args.right,
+    Ok(ArchiveMemberDiffReport {
+        report_schema: ARCHIVE_MEMBER_DIFF_REPORT_SCHEMA.to_string(),
+        report_version: REPORT_VERSION_V1,
+        left_label: left_label.to_string(),
+        right_label: right_label.to_string(),
         left_members: left_map.len(),
         right_members: right_map.len(),
         exact_member_matches,
@@ -1997,6 +2107,107 @@ fn archive_member_diff_command(args: ArchiveMemberDiffArgs) -> Result<()> {
         right_only_count: right_only.len(),
         left_only,
         right_only,
+    })
+}
+
+fn build_archive_member_plan_rows(report: &ArchiveMemberDiffReport) -> Vec<ArchiveMemberPlanRow> {
+    let mut rows = Vec::new();
+    let mut left_payload_keys = HashSet::new();
+    let mut right_payload_keys = HashSet::new();
+    for item in &report.left_only {
+        if let (Some(fam), Some(sig)) = (&item.archive_family, &item.payload_signature) {
+            left_payload_keys.insert(format!("{fam}|{sig}"));
+        }
+    }
+    for item in &report.right_only {
+        if let (Some(fam), Some(sig)) = (&item.archive_family, &item.payload_signature) {
+            right_payload_keys.insert(format!("{fam}|{sig}"));
+        }
+    }
+
+    for item in &report.left_only {
+        let payload_key = item
+            .archive_family
+            .as_deref()
+            .zip(item.payload_signature.as_deref())
+            .map(|(fam, sig)| format!("{fam}|{sig}"));
+        let matched_family = payload_key
+            .as_ref()
+            .is_some_and(|key| right_payload_keys.contains(key));
+        let (action_class, signal) = if matched_family {
+            ("review_payload_family_match", "payload_family_match")
+        } else if item.payload_signature.is_some() {
+            ("copy_left_only", "left_only")
+        } else {
+            ("review_conflict", "left_only_no_payload_signature")
+        };
+        rows.push(ArchiveMemberPlanRow {
+            row_schema: ARCHIVE_MEMBER_PLAN_ROW_SCHEMA.to_string(),
+            row_version: REPORT_VERSION_V1,
+            action_class: action_class.to_string(),
+            side: "left".to_string(),
+            virtual_member: item.virtual_member.clone(),
+            rel_path: item.rel_path.clone(),
+            archive_family: item.archive_family.clone(),
+            payload_signature: item.payload_signature.clone(),
+            archive_depth: item.archive_depth,
+            size: item.size,
+            mtime_ns: item.mtime_ns,
+            fast_hash: item.fast_hash.clone(),
+            signal: signal.to_string(),
+        });
+    }
+
+    for item in &report.right_only {
+        let payload_key = item
+            .archive_family
+            .as_deref()
+            .zip(item.payload_signature.as_deref())
+            .map(|(fam, sig)| format!("{fam}|{sig}"));
+        let matched_family = payload_key
+            .as_ref()
+            .is_some_and(|key| left_payload_keys.contains(key));
+        let (action_class, signal) = if matched_family {
+            ("review_payload_family_match", "payload_family_match")
+        } else if item.payload_signature.is_some() {
+            ("copy_right_only", "right_only")
+        } else {
+            ("review_conflict", "right_only_no_payload_signature")
+        };
+        rows.push(ArchiveMemberPlanRow {
+            row_schema: ARCHIVE_MEMBER_PLAN_ROW_SCHEMA.to_string(),
+            row_version: REPORT_VERSION_V1,
+            action_class: action_class.to_string(),
+            side: "right".to_string(),
+            virtual_member: item.virtual_member.clone(),
+            rel_path: item.rel_path.clone(),
+            archive_family: item.archive_family.clone(),
+            payload_signature: item.payload_signature.clone(),
+            archive_depth: item.archive_depth,
+            size: item.size,
+            mtime_ns: item.mtime_ns,
+            fast_hash: item.fast_hash.clone(),
+            signal: signal.to_string(),
+        });
+    }
+
+    rows.sort_by(|a, b| a.virtual_member.cmp(&b.virtual_member).then(a.side.cmp(&b.side)));
+    rows
+}
+
+fn archive_member_plan_command(args: ArchiveMemberPlanArgs) -> Result<()> {
+    let left_conn = open_readonly_db(&args.left_db)?;
+    let right_conn = open_readonly_db(&args.right_db)?;
+    let diff = build_archive_member_diff_report(&left_conn, &right_conn, &args.left, &args.right)?;
+    let rows = build_archive_member_plan_rows(&diff);
+    let report = ArchiveMemberPlanReport {
+        report_schema: ARCHIVE_MEMBER_PLAN_REPORT_SCHEMA.to_string(),
+        report_version: REPORT_VERSION_V1,
+        left_label: diff.left_label.clone(),
+        right_label: diff.right_label.clone(),
+        source_report_schema: diff.report_schema.clone(),
+        source_report_version: diff.report_version,
+        rows,
     };
     let json = serde_json::to_string_pretty(&report)?;
     println!("{json}");
@@ -2005,17 +2216,11 @@ fn archive_member_diff_command(args: ArchiveMemberDiffArgs) -> Result<()> {
             .with_context(|| format!("failed to write {}", path.display()))?;
     }
     if let Some(path) = args.out_csv {
-        let csv = build_archive_member_diff_csv(&report);
+        let csv = build_archive_member_plan_csv(&report);
         std::fs::write(&path, csv)
             .with_context(|| format!("failed to write {}", path.display()))?;
     }
-    eprintln!(
-        "[archive-member-diff] summary: {} exact, {} payload-family, {} left-only, {} right-only",
-        report.exact_member_matches,
-        report.payload_family_matches,
-        report.left_only_count,
-        report.right_only_count
-    );
+    eprintln!("[archive-member-plan] rows: {}", report.rows.len());
     Ok(())
 }
 
@@ -4387,6 +4592,32 @@ fn normalize_fingerprint_token_text(value: &str) -> String {
     parts.join(" ")
 }
 
+fn sanitize_descriptor_component(value: &str, max_len: usize) -> String {
+    let normalized = normalize_fingerprint_name(value);
+    if normalized.is_empty() || normalized == "unnamed" {
+        return String::new();
+    }
+    normalized.chars().take(max_len).collect()
+}
+
+fn clamp_descriptor(value: String, max_len: usize) -> String {
+    value.chars().take(max_len).collect()
+}
+
+fn is_low_signal_semantic_token(token: &str) -> bool {
+    let trimmed = token.trim();
+    if trimmed.len() < DESCRIPTOR_MIN_TOKEN_LEN {
+        return true;
+    }
+    if trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+        return true;
+    }
+    matches!(
+        trimmed,
+        "tmp" | "var" | "key" | "val" | "cfg" | "data" | "test" | "misc" | "none"
+    )
+}
+
 fn is_noise_fingerprint_token(token: &str) -> bool {
     let value = token.trim().to_ascii_lowercase();
     if value.is_empty() {
@@ -4793,6 +5024,7 @@ fn infer_binary_signature(
     let family = archive_family
         .and_then(archive_payload_root_from_family)
         .or_else(|| ext.map(|value| value.trim_start_matches('.').to_string()))
+        .map(|value| sanitize_descriptor_component(&value, DESCRIPTOR_MAX_COMPONENT_LEN))
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "raw".to_string());
     let folder_hint = rel_path
@@ -4800,10 +5032,13 @@ fn infer_binary_signature(
         .split('/')
         .rev()
         .nth(1)
-        .map(normalize_fingerprint_name)
+        .map(|value| sanitize_descriptor_component(&value, DESCRIPTOR_MAX_COMPONENT_LEN))
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| ".".to_string());
-    format!("{family}:{size_class}:{folder_hint}")
+    clamp_descriptor(
+        format!("{family}:{size_class}:{folder_hint}"),
+        DESCRIPTOR_MAX_COMPOSITE_LEN,
+    )
 }
 
 fn infer_binary_descriptor(
@@ -4817,6 +5052,7 @@ fn infer_binary_descriptor(
     let family = archive_family
         .and_then(archive_payload_root_from_family)
         .or_else(|| ext.map(|value| value.trim_start_matches('.').to_string()))
+        .map(|value| sanitize_descriptor_component(&value, DESCRIPTOR_MAX_COMPONENT_LEN))
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "raw".to_string());
     let mut parent = rel_path.replace('\\', "/");
@@ -4829,7 +5065,7 @@ fn infer_binary_descriptor(
         .split('/')
         .filter(|segment| !segment.is_empty())
         .next_back()
-        .map(normalize_fingerprint_name)
+        .map(|value| sanitize_descriptor_component(&value, DESCRIPTOR_MAX_COMPONENT_LEN))
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| ".".to_string());
     let hash_hint = fast_hash
@@ -4837,9 +5073,15 @@ fn infer_binary_descriptor(
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "nohash".to_string());
     if let Some(sampled_signature) = sampled_signature.filter(|value| !value.is_empty()) {
-        return format!("{family}:{size_class}:{parent_tail}:{hash_hint}:s{sampled_signature}");
+        return clamp_descriptor(
+            format!("{family}:{size_class}:{parent_tail}:{hash_hint}:s{sampled_signature}"),
+            DESCRIPTOR_MAX_COMPOSITE_LEN,
+        );
     }
-    format!("{family}:{size_class}:{parent_tail}:{hash_hint}")
+    clamp_descriptor(
+        format!("{family}:{size_class}:{parent_tail}:{hash_hint}"),
+        DESCRIPTOR_MAX_COMPOSITE_LEN,
+    )
 }
 
 fn infer_binary_sample_signature_from_file(path: &Path, size: u64) -> Option<String> {
@@ -4942,6 +5184,9 @@ fn infer_semantic_text_signature_from_content(
         }
 
         if let Some(value) = parse_import_like(trimmed, language) {
+            if is_low_signal_semantic_token(&value) {
+                continue;
+            }
             import_tokens.insert(value);
         }
         if let Some(value) = parse_call_like(trimmed, language) {
@@ -4971,7 +5216,12 @@ fn infer_semantic_text_signature_from_content(
     let semantic_name = if normalized_name.is_empty() {
         "unnamed".to_string()
     } else {
-        normalized_name.to_string()
+        sanitize_descriptor_component(normalized_name, DESCRIPTOR_MAX_COMPONENT_LEN)
+    };
+    let semantic_name = if semantic_name.is_empty() {
+        "unnamed".to_string()
+    } else {
+        semantic_name
     };
     let mut parts = vec![format!("{language}:{semantic_name}")];
     if !import_vec.is_empty() {
@@ -4986,12 +5236,12 @@ fn infer_semantic_text_signature_from_content(
     if !section_vec.is_empty() {
         parts.push(format!("s:{}", section_vec.join("+")));
     }
-    parts.join("|")
+    clamp_descriptor(parts.join("|"), DESCRIPTOR_MAX_COMPOSITE_LEN)
 }
 
 fn parse_import_like(line: &str, language: &str) -> Option<String> {
     let normalize = |value: &str| {
-        normalize_fingerprint_name(value)
+        sanitize_descriptor_component(value, DESCRIPTOR_MAX_COMPONENT_LEN)
             .split('_')
             .next()
             .map(str::to_string)
@@ -5061,26 +5311,38 @@ fn parse_call_like(line: &str, language: &str) -> Option<String> {
     if language == "python" && line.starts_with("def ") {
         let name = line.trim_start_matches("def ").split('(').next()?.trim();
         if !name.is_empty() {
-            return Some(normalize_fingerprint_name(name));
+            let normalized = sanitize_descriptor_component(name, DESCRIPTOR_MAX_COMPONENT_LEN);
+            if !is_low_signal_semantic_token(&normalized) {
+                return Some(normalized);
+            }
         }
     }
     if language == "rust" && line.starts_with("fn ") {
         let name = line.trim_start_matches("fn ").split('(').next()?.trim();
         if !name.is_empty() {
-            return Some(normalize_fingerprint_name(name));
+            let normalized = sanitize_descriptor_component(name, DESCRIPTOR_MAX_COMPONENT_LEN);
+            if !is_low_signal_semantic_token(&normalized) {
+                return Some(normalized);
+            }
         }
     }
     if language == "go" && line.starts_with("func ") {
         let name = line.trim_start_matches("func ").split('(').next()?.trim();
         if !name.is_empty() {
-            return Some(normalize_fingerprint_name(name));
+            let normalized = sanitize_descriptor_component(name, DESCRIPTOR_MAX_COMPONENT_LEN);
+            if !is_low_signal_semantic_token(&normalized) {
+                return Some(normalized);
+            }
         }
     }
     if language == "c_family" && line.contains('(') && line.contains(')') && line.ends_with('{') {
         let prefix = line.split('(').next()?.trim();
         let name = prefix.split_whitespace().next_back()?;
         if !name.is_empty() {
-            return Some(normalize_fingerprint_name(name));
+            let normalized = sanitize_descriptor_component(name, DESCRIPTOR_MAX_COMPONENT_LEN);
+            if !is_low_signal_semantic_token(&normalized) {
+                return Some(normalized);
+            }
         }
     }
     None
@@ -5095,11 +5357,12 @@ fn parse_key_like(line: &str) -> Option<String> {
         None
     }?;
     let key = assign.trim().trim_matches('"').trim_matches('\'');
-    if key.is_empty() || key.len() > 48 {
+    if key.is_empty() || key.len() > DESCRIPTOR_MAX_KEY_TOKEN_LEN {
         return None;
     }
-    let normalized = normalize_fingerprint_name(key);
-    if normalized.is_empty() || normalized == "unnamed" {
+    let normalized = sanitize_descriptor_component(key, DESCRIPTOR_MAX_COMPONENT_LEN);
+    if normalized.is_empty() || normalized == "unnamed" || is_low_signal_semantic_token(&normalized)
+    {
         None
     } else {
         Some(normalized)
@@ -5114,16 +5377,27 @@ fn parse_section_like(line: &str) -> Option<String> {
     if section.is_empty() {
         return None;
     }
-    Some(normalize_fingerprint_name(section))
+    let normalized = sanitize_descriptor_component(section, DESCRIPTOR_MAX_COMPONENT_LEN);
+    if normalized.is_empty() || is_low_signal_semantic_token(&normalized) {
+        return None;
+    }
+    Some(normalized)
 }
 
 fn infer_archive_payload_signature(rel_path: &str, archive_family: &str) -> Option<String> {
-    let payload = archive_payload_root_from_family(archive_family)?;
-    let stem = normalize_fingerprint_name(&build_archive_stem(rel_path));
+    let payload = sanitize_descriptor_component(
+        &archive_payload_root_from_family(archive_family)?,
+        DESCRIPTOR_MAX_COMPONENT_LEN,
+    );
+    let stem =
+        sanitize_descriptor_component(&build_archive_stem(rel_path), DESCRIPTOR_MAX_COMPONENT_LEN);
     if stem.is_empty() {
-        Some(payload)
+        Some(clamp_descriptor(payload, DESCRIPTOR_MAX_COMPOSITE_LEN))
     } else {
-        Some(format!("{payload}:{stem}"))
+        Some(clamp_descriptor(
+            format!("{payload}:{stem}"),
+            DESCRIPTOR_MAX_COMPOSITE_LEN,
+        ))
     }
 }
 
@@ -7833,13 +8107,78 @@ fn profile_cache_usage(
     rows: &[FileRecord],
     profiles: &HashMap<String, FileFingerprintProfile>,
 ) -> CacheUsageCounters {
-    let hits = rows
-        .iter()
-        .filter(|row| profiles.contains_key(&row.rel_path))
-        .count();
+    let mut hits = 0usize;
+    let mut with_binary_descriptor = 0usize;
+    let mut with_text_signature = 0usize;
+    let mut with_archive_signature = 0usize;
+    let mut with_any_descriptor = 0usize;
+
+    for row in rows {
+        if let Some(profile) = profiles.get(&row.rel_path) {
+            hits += 1;
+            let has_binary_descriptor = profile
+                .binary_descriptor
+                .as_deref()
+                .is_some_and(|value| !value.is_empty());
+            let has_text_signature = profile
+                .text_signature
+                .as_deref()
+                .is_some_and(|value| !value.is_empty());
+            let has_archive_signature = profile
+                .archive_signature
+                .as_deref()
+                .is_some_and(|value| !value.is_empty());
+
+            if has_binary_descriptor {
+                with_binary_descriptor += 1;
+            }
+            if has_text_signature {
+                with_text_signature += 1;
+            }
+            if has_archive_signature {
+                with_archive_signature += 1;
+            }
+            if has_binary_descriptor || has_text_signature || has_archive_signature {
+                with_any_descriptor += 1;
+            }
+        }
+    }
+    let total_rows = rows.len();
+    let misses = total_rows.saturating_sub(hits);
+    let coverage_ratio = if total_rows == 0 {
+        0.0
+    } else {
+        (hits as f64) / (total_rows as f64)
+    };
+    let to_ratio = |count: usize| -> f64 {
+        if hits == 0 {
+            0.0
+        } else {
+            (count as f64) / (hits as f64)
+        }
+    };
+
     CacheUsageCounters {
         hits,
-        misses: rows.len().saturating_sub(hits),
+        misses,
+        analytics: CacheUsageAnalytics {
+            coverage: CacheCoverageMetrics {
+                total_rows,
+                profile_rows: hits,
+                coverage_ratio,
+            },
+            descriptor_density: CacheDescriptorDensityMetrics {
+                profiled_rows: hits,
+                with_binary_descriptor,
+                with_text_signature,
+                with_archive_signature,
+                with_any_descriptor,
+                binary_descriptor_ratio: to_ratio(with_binary_descriptor),
+                text_signature_ratio: to_ratio(with_text_signature),
+                archive_signature_ratio: to_ratio(with_archive_signature),
+                any_descriptor_ratio: to_ratio(with_any_descriptor),
+            },
+        },
     }
 }
 
@@ -10735,7 +11074,93 @@ mod tests {
         );
 
         let counters = profile_cache_usage(&rows, &profiles);
-        assert_eq!(counters, CacheUsageCounters { hits: 1, misses: 1 });
+        assert_eq!(counters.hits, 1);
+        assert_eq!(counters.misses, 1);
+        assert_eq!(counters.analytics.coverage.total_rows, 2);
+        assert_eq!(counters.analytics.coverage.profile_rows, 1);
+        assert!((counters.analytics.coverage.coverage_ratio - 0.5).abs() < 1e-9);
+        assert_eq!(
+            counters.analytics.descriptor_density.profiled_rows,
+            counters.hits
+        );
+    }
+
+    #[test]
+    fn profile_cache_usage_tracks_descriptor_density() {
+        let rows = vec![
+            FileRecord {
+                rel_path: "alpha/readme.txt".to_string(),
+                file_type: "file".to_string(),
+                size: 10,
+                mtime_ns: 1,
+                fast_hash: None,
+            },
+            FileRecord {
+                rel_path: "alpha/archive.tar.gz".to_string(),
+                file_type: "file".to_string(),
+                size: 11,
+                mtime_ns: 2,
+                fast_hash: None,
+            },
+            FileRecord {
+                rel_path: "alpha/missing.bin".to_string(),
+                file_type: "file".to_string(),
+                size: 12,
+                mtime_ns: 3,
+                fast_hash: None,
+            },
+        ];
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "alpha/readme.txt".to_string(),
+            FileFingerprintProfile {
+                normalized_name: "readme".to_string(),
+                normalized_folder: "alpha".to_string(),
+                ext: "txt".to_string(),
+                is_binary: false,
+                is_archive: false,
+                archive_family: None,
+                language: "markdown".to_string(),
+                size_class: "small".to_string(),
+                binary_signature: None,
+                binary_descriptor: None,
+                text_signature: Some("markdown:readme".to_string()),
+                archive_signature: None,
+            },
+        );
+        profiles.insert(
+            "alpha/archive.tar.gz".to_string(),
+            FileFingerprintProfile {
+                normalized_name: "archive".to_string(),
+                normalized_folder: "alpha".to_string(),
+                ext: "gz".to_string(),
+                is_binary: true,
+                is_archive: true,
+                archive_family: Some("tar".to_string()),
+                language: "unknown".to_string(),
+                size_class: "small".to_string(),
+                binary_signature: Some("sig".to_string()),
+                binary_descriptor: Some("desc".to_string()),
+                text_signature: None,
+                archive_signature: Some("tar+gz".to_string()),
+            },
+        );
+
+        let counters = profile_cache_usage(&rows, &profiles);
+        assert_eq!(counters.hits, 2);
+        assert_eq!(counters.misses, 1);
+        assert!((counters.analytics.coverage.coverage_ratio - (2.0 / 3.0)).abs() < 1e-9);
+        assert_eq!(
+            counters.analytics.descriptor_density.with_binary_descriptor,
+            1
+        );
+        assert_eq!(counters.analytics.descriptor_density.with_text_signature, 1);
+        assert_eq!(
+            counters.analytics.descriptor_density.with_archive_signature,
+            1
+        );
+        assert_eq!(counters.analytics.descriptor_density.with_any_descriptor, 2);
+        assert!((counters.analytics.descriptor_density.any_descriptor_ratio - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -10752,8 +11177,16 @@ mod tests {
             left_only: 2,
             right_only: 4,
             cache_metrics: ReportCacheMetrics {
-                left_profile_cache: CacheUsageCounters { hits: 7, misses: 3 },
-                right_profile_cache: CacheUsageCounters { hits: 9, misses: 3 },
+                left_profile_cache: CacheUsageCounters {
+                    hits: 7,
+                    misses: 3,
+                    ..Default::default()
+                },
+                right_profile_cache: CacheUsageCounters {
+                    hits: 9,
+                    misses: 3,
+                    ..Default::default()
+                },
             },
         };
 
@@ -10778,6 +11211,20 @@ mod tests {
                 .and_then(|v| v.as_u64()),
             Some(3)
         );
+        assert_eq!(
+            value
+                .pointer("/cache_metrics/left_profile_cache/analytics/coverage/coverage_ratio")
+                .and_then(|v| v.as_f64()),
+            Some(0.0)
+        );
+        assert_eq!(
+            value
+                .pointer(
+                    "/cache_metrics/right_profile_cache/analytics/descriptor_density/with_any_descriptor"
+                )
+                .and_then(|v| v.as_u64()),
+            Some(0)
+        );
     }
 
     #[test]
@@ -10797,11 +11244,27 @@ mod tests {
             archive_signal_candidates: 1,
             archive_signal_ratio: 0.5,
             cache_metrics: ReportCacheMetrics {
-                left_profile_cache: CacheUsageCounters { hits: 5, misses: 1 },
-                right_profile_cache: CacheUsageCounters { hits: 4, misses: 2 },
+                left_profile_cache: CacheUsageCounters {
+                    hits: 5,
+                    misses: 1,
+                    ..Default::default()
+                },
+                right_profile_cache: CacheUsageCounters {
+                    hits: 4,
+                    misses: 2,
+                    ..Default::default()
+                },
             },
-            left_profile_cache: CacheUsageCounters { hits: 5, misses: 1 },
-            right_profile_cache: CacheUsageCounters { hits: 4, misses: 2 },
+            left_profile_cache: CacheUsageCounters {
+                hits: 5,
+                misses: 1,
+                ..Default::default()
+            },
+            right_profile_cache: CacheUsageCounters {
+                hits: 4,
+                misses: 2,
+                ..Default::default()
+            },
             confidence_counts: DossierConfidenceCounts::default(),
             candidates: Vec::new(),
         };
@@ -10826,6 +11289,18 @@ mod tests {
                 .pointer("/cache_metrics/right_profile_cache/misses")
                 .and_then(|v| v.as_u64()),
             Some(2)
+        );
+        assert_eq!(
+            value
+                .pointer("/left_profile_cache/analytics/coverage/total_rows")
+                .and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            value
+                .pointer("/right_profile_cache/analytics/descriptor_density/any_descriptor_ratio")
+                .and_then(|v| v.as_f64()),
+            Some(0.0)
         );
     }
 
@@ -11135,6 +11610,21 @@ mod tests {
     }
 
     #[test]
+    fn binary_sample_signature_handles_tiny_binary() -> Result<()> {
+        let root = temp_dir("binary_sample_tiny");
+        fs::create_dir_all(&root)?;
+        let path = root.join("tiny.bin");
+        fs::write(&path, [0xAB])?;
+        let size = fs::metadata(&path)?.len();
+        let first = infer_binary_sample_signature_from_file(&path, size);
+        let second = infer_binary_sample_signature_from_file(&path, size);
+        assert!(first.is_some());
+        assert_eq!(first, second);
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
     fn dossier_signatures_emit_binary_descriptor_token() {
         let rows = vec![FileRecord {
             rel_path: "firmware/bin/agent.sys".to_string(),
@@ -11146,6 +11636,22 @@ mod tests {
         let signatures = build_folder_signatures(&rows);
         let folder = signatures.get("firmware/bin").expect("folder signature");
         assert!(folder.tokens.contains_key("BINDESC:sys:1m:bin:abcdef1234"));
+    }
+
+    #[test]
+    fn binary_descriptor_is_bounded_for_long_noisy_paths() {
+        let long_segment = "Firmware-VERY-LONG-SEGMENT_with_noise_v1234_final_copy_20250101";
+        let rel_path = format!("{long_segment}/{long_segment}/{long_segment}.sys");
+        let descriptor = infer_binary_descriptor(
+            &rel_path,
+            Some("sys"),
+            None,
+            "1m",
+            Some("abcdef1234567890"),
+            Some("fedcba0987654321fedcba0987654321"),
+        );
+        assert!(descriptor.len() <= DESCRIPTOR_MAX_COMPOSITE_LEN);
+        assert!(descriptor.starts_with("sys:1m:"));
     }
 
     #[test]
@@ -11161,6 +11667,39 @@ def collect_results(path):
         assert!(signature.starts_with("python:collector"));
         assert!(signature.contains("i:os+pathlib") || signature.contains("i:pathlib+os"));
         assert!(signature.contains("f:collect_results"));
+    }
+
+    #[test]
+    fn semantic_text_signature_suppresses_low_signal_and_malformed_lines() {
+        let content = r#"
+import a
+import tmp
+import urllib.request
+def x(v):
+key = "value"
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa = 1
+[x]
+[main-service]
+bad::::line
+"#;
+        let signature = infer_semantic_text_signature_from_content("python", "collector", content);
+        assert!(signature.contains("python:collector"));
+        assert!(!signature.contains("i:a"));
+        assert!(!signature.contains("i:tmp"));
+        assert!(!signature.contains("f:x"));
+        assert!(!signature.contains("k:key"));
+        assert!(signature.contains("i:urllib"));
+        assert!(signature.contains("s:main_service"));
+        assert!(signature.len() <= DESCRIPTOR_MAX_COMPOSITE_LEN);
+    }
+
+    #[test]
+    fn archive_payload_signature_is_bounded_and_normalized() {
+        let rel_path = "fw/Very Long Payload Name FINAL Copy 20250101.tar.gz";
+        let signature =
+            infer_archive_payload_signature(rel_path, "tar.gz").expect("archive payload signature");
+        assert!(signature.starts_with("tar:"));
+        assert!(signature.len() <= DESCRIPTOR_MAX_COMPOSITE_LEN);
     }
 
     #[test]
