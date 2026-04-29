@@ -35,12 +35,15 @@ Implemented and shipping on the active branch:
 - Dossier workflow: confidence tiers, action filtering, archive-signal coverage metrics.
 - Compatibility workflow: `ndex rsync ...` and `ndex rclone ...` frontends with mapped flag support.
 - Ops visibility: `status` command for DB/run health summary, richer `logs` error-class summaries.
-- Merge workflow baseline: `merge-plan` + `merge-apply` command set.
+- Merge workflow: `merge-plan` + hardened `merge-apply` with recursive directory materialization,
+  deterministic `keep-both` naming, and richer apply summary counters.
+- Persistent cache v1: cross-label file fingerprint profile cache in SQLite with size/mtime/hash
+  invalidation and `status` visibility.
 
 In progress:
-- `merge-apply` hardening for recursive directory materialization, deterministic `keep-both` target
-  naming, and richer apply summary counters.
-- Persistent compare-signature caching for faster repeated deep compares.
+- Extend persistent caching from scan-time fingerprint profiles into deeper compare/archive/text
+  signatures.
+- Archive-recursive indexing and semantic code/text signatures.
 
 ## Recommended recovery use-case
 

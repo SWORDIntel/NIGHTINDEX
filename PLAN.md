@@ -2,7 +2,7 @@
 
 ## Current Status
 
-Estimated total progress: about 82%.
+Estimated total progress: about 86%.
 
 Done:
 - Core `nightindex` / `ndex` binaries and command aliases.
@@ -16,53 +16,51 @@ Done:
 - Dossier documentation updated with normalized fingerprint matching signals, confidence-tier interpretation, and fallback/compatibility expectations.
 - Archive-aware dossier matching added via `ARCH:`/`ARCHFAM:` and payload signature (`ARCHSIG:`), enabling multi-part archive-family matching without extraction.
 - NOT_STISLA-like dossier hardening: binaryity, archive-family, and size-class evidence now participate in dossier tie-breaks.
-- Current test baseline: `cargo test -q` passes 29 tests for both binaries.
+- Current test baseline: `cargo test -q` passes 55 tests for both binaries.
 - Deep dossier scoring now uses normalized fingerprint profiles for renamed-folder/file matching (suffix-noise robust: `final`, `v2`, `old`, `copy`, date-ish).
+- Resume, logs/status, and merge-apply hardening are implemented and pushed.
+- Persistent cache v1 is implemented: scan-time file fingerprint profiles are cached in SQLite by
+  path/type/size/mtime/hash input, reused across labels, invalidated by changed file metadata, and
+  exposed through `status` as `signature_cache_rows`.
 
 ## Next Highest-Value Work
 
-1. Persistent fingerprint cache.
-   Avoid rehashing and reparsing large trees across repeated scans.
+1. Extend persistent fingerprint cache.
+   Add cached binary/text/archive signatures and report hit/miss counts in compare/dossier output.
 
-2. Resume database.
-   Keep durable per-run copy state instead of relying only on destination file existence.
-
-3. Real merge materialization.
-   Generate merge plans from `_imports` into canonical trees using keep-best, newer, larger, and manual-review rules.
-
-4. Archive recursive indexing.
+2. Archive recursive indexing.
    Inspect nested archives as virtual trees without needing full extraction first.
+
+3. Semantic source parsing.
+   Add language-aware signatures for C, Rust, Python, Markdown, JSON, shell, and project metadata.
+
+4. Binary similarity (NOT_STISLA-like improvements).
+   Add archive/block-aware binary descriptors plus approximate matching for renamed large payloads.
 
 5. Deep dossier tuning.
    Refine deep-dossier normalization thresholds and suffix-noise handling for rename-heavy datasets.
 
-6. NDJSON log viewer.
-   Summarize copy logs into human status, failures, ETA, retry lists, and speed history.
+6. Merge apply polish.
+   Add optional materialized manifest output and a conflict review CSV for manual decisions.
 
 7. Parallel copy engine.
    Add bounded workers with per-disk throttles so USB2 and ZFS jobs stay sane.
 
-8. Semantic source parsing.
-   Add language-aware signatures for C, Rust, Python, Markdown, JSON, and shell.
-
-9. Binary similarity (NOT_STISLA-like improvements).
-   Add archive/block-aware binary descriptors plus approximate matching for renamed large payloads (size/entropy/rolling-hash blocks) and then integrate confidence boosts into dossier tiering.
-
-10. Deeper rsync/rclone compatibility.
+8. Deeper rsync/rclone compatibility.
     Map more flags accurately, especially trailing slash behavior, partial-dir, backup suffixes, and checksum choices.
 
 ## Implementation Order
 
-Immediate next step:
-1. Build persistent fingerprint cache and resume database together.
+Immediate next step after reboot:
+1. Extend `signature_cache` to store deeper `binary_signature`, `text_signature`, and
+   `archive_signature` records with cache hit/miss counters in dossier/compare output.
 
 Then:
-2. Add the NDJSON log viewer, because it will validate copy/resume behavior.
-3. Add merge materialization from `_imports` to canonical trees.
-4. Add archive recursive indexing.
-5. Tune deep dossier normalization thresholds and suffix-noise coverage (rename-robust matching).
-6. Add binary similarity and semantic source parsing.
-7. Add bounded parallel copy after state tracking is durable.
+2. Add archive recursive indexing using normalized virtual paths.
+3. Add semantic source parsing and feed those tokens into dossier scoring.
+4. Tune deep dossier normalization thresholds and suffix-noise coverage.
+5. Add binary similarity descriptors and confidence boosts.
+6. Add bounded parallel copy after the matching/index layers settle.
 
 ## Design Notes
 

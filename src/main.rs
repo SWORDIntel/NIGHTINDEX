@@ -96,6 +96,21 @@ CREATE TABLE IF NOT EXISTS file_fingerprints (
 
 CREATE INDEX IF NOT EXISTS idx_file_fingerprints_label_rel_path
 ON file_fingerprints(label, rel_path);
+
+CREATE TABLE IF NOT EXISTS signature_cache (
+    cache_key TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    rel_path TEXT NOT NULL,
+    file_type TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    mtime_ns INTEGER NOT NULL,
+    fast_hash TEXT,
+    value_json TEXT NOT NULL,
+    computed_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_signature_cache_kind_path
+ON signature_cache(kind, rel_path);
 "#;
 
 const DEFAULT_NOISE_DIRS: &[&str] = &[
@@ -625,7 +640,7 @@ struct FileRecord {
     fast_hash: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct FileFingerprintProfile {
     normalized_name: String,
     normalized_folder: String,
@@ -1137,6 +1152,7 @@ fn scan_command(args: ScanArgs) -> Result<()> {
     let mut errors = 0usize;
     let mut symlinks_seen = 0usize;
     let mut fingerprint_reused = 0usize;
+    let mut fingerprint_cache_hits = 0usize;
     let mut fingerprint_recomputed = 0usize;
 
     for entry in WalkDir::new(&root)
@@ -1241,11 +1257,12 @@ fn scan_command(args: ScanArgs) -> Result<()> {
             )
             .optional()?;
 
-        let file_meta_unchanged = existing
-            .as_ref()
-            .is_some_and(|(old_file_type, old_size, old_mtime_ns, _)| {
-                *old_file_type == file_type && *old_size == size && *old_mtime_ns == mtime_ns
-            });
+        let file_meta_unchanged =
+            existing
+                .as_ref()
+                .is_some_and(|(old_file_type, old_size, old_mtime_ns, _)| {
+                    *old_file_type == file_type && *old_size == size && *old_mtime_ns == mtime_ns
+                });
 
         let fast_hash = if let Some((old_file_type, old_size, old_mtime_ns, old_hash)) = existing {
             if file_type == "symlink" {
@@ -1308,9 +1325,30 @@ fn scan_command(args: ScanArgs) -> Result<()> {
         let fingerprint_profile = if let Some(profile) = existing_profile {
             fingerprint_reused += 1;
             profile
+        } else if let Some(profile) = load_cached_file_fingerprint_profile(
+            &conn,
+            &rel_path,
+            &file_type,
+            size,
+            mtime_ns,
+            fast_hash.as_deref(),
+        )? {
+            fingerprint_cache_hits += 1;
+            profile
         } else {
             fingerprint_recomputed += 1;
-            build_file_fingerprint_profile(&rel_path, &file_type, size)
+            let profile = build_file_fingerprint_profile(&rel_path, &file_type, size);
+            store_cached_file_fingerprint_profile(
+                &conn,
+                &rel_path,
+                &file_type,
+                size,
+                mtime_ns,
+                fast_hash.as_deref(),
+                &profile,
+                scanned_at,
+            )?;
+            profile
         };
 
         conn.execute(
@@ -1380,15 +1418,30 @@ fn scan_command(args: ScanArgs) -> Result<()> {
         files_seen += 1;
         if files_seen % 500 == 0 {
             println!(
-                "[scan] files={} hashed={} reused={} fp_reused={} fp_recomputed={} excluded={} errors={}",
-                files_seen, hashed, reused, fingerprint_reused, fingerprint_recomputed, excluded, errors
+                "[scan] files={} hashed={} reused={} fp_reused={} fp_cache_hits={} fp_recomputed={} excluded={} errors={}",
+                files_seen,
+                hashed,
+                reused,
+                fingerprint_reused,
+                fingerprint_cache_hits,
+                fingerprint_recomputed,
+                excluded,
+                errors
             );
         }
     }
 
     println!(
-        "[scan] summary: files={} symlinks={} hashed={} reused={} fp_reused={} fp_recomputed={} excluded={} errors={}",
-        files_seen, symlinks_seen, hashed, reused, fingerprint_reused, fingerprint_recomputed, excluded, errors
+        "[scan] summary: files={} symlinks={} hashed={} reused={} fp_reused={} fp_cache_hits={} fp_recomputed={} excluded={} errors={}",
+        files_seen,
+        symlinks_seen,
+        hashed,
+        reused,
+        fingerprint_reused,
+        fingerprint_cache_hits,
+        fingerprint_recomputed,
+        excluded,
+        errors
     );
     Ok(())
 }
@@ -1945,9 +1998,15 @@ fn logs_command(args: LogsArgs) -> Result<()> {
             Err(_) => continue,
         };
 
-        let event = parsed.get("event").and_then(|v| v.as_str()).unwrap_or_default();
+        let event = parsed
+            .get("event")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         if event.is_empty() {
-            let action = parsed.get("action").and_then(|v| v.as_str()).unwrap_or_default();
+            let action = parsed
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             if action == "fail" {
                 failures += 1;
                 let reason = parsed
@@ -2051,6 +2110,7 @@ struct StatusReport {
     labels: usize,
     resume_sessions: usize,
     recent_copy_runs: usize,
+    signature_cache_rows: usize,
     latest_bytes_per_second: Option<f64>,
 }
 
@@ -2069,6 +2129,8 @@ fn status_command(args: StatusArgs) -> Result<()> {
         params![since],
         |row| row.get(0),
     )?;
+    let signature_cache_rows: i64 =
+        conn.query_row("SELECT COUNT(*) FROM signature_cache", [], |row| row.get(0))?;
     let latest_rate: Option<f64> = conn
         .query_row(
             "SELECT copied_bytes, duration_ns FROM copy_runs WHERE copied_bytes > 0 AND duration_ns > 0 ORDER BY copied_at DESC LIMIT 1",
@@ -2089,6 +2151,7 @@ fn status_command(args: StatusArgs) -> Result<()> {
         labels: labels.max(0) as usize,
         resume_sessions: sessions.max(0) as usize,
         recent_copy_runs: recent_runs.max(0) as usize,
+        signature_cache_rows: signature_cache_rows.max(0) as usize,
         latest_bytes_per_second: latest_rate,
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2184,7 +2247,11 @@ fn merge_plan_command(args: MergePlanArgs) -> Result<()> {
             reason,
         });
     }
-    items.sort_by(|a, b| a.left_folder.cmp(&b.left_folder).then(a.right_folder.cmp(&b.right_folder)));
+    items.sort_by(|a, b| {
+        a.left_folder
+            .cmp(&b.left_folder)
+            .then(a.right_folder.cmp(&b.right_folder))
+    });
     let plan = MergePlan {
         schema_version: 1,
         generated_at_ns: now_ns()?,
@@ -2249,7 +2316,13 @@ fn merge_apply_command(args: MergeApplyArgs) -> Result<()> {
                         applied += 1;
                         continue;
                     }
-                    copy_directory_tree(source, &target, false, &mut skipped_existing, &mut conflicts)?;
+                    copy_directory_tree(
+                        source,
+                        &target,
+                        false,
+                        &mut skipped_existing,
+                        &mut conflicts,
+                    )?;
                     applied += 1;
                 } else {
                     failed += 1;
@@ -2294,7 +2367,15 @@ fn merge_apply_command(args: MergeApplyArgs) -> Result<()> {
     }
     println!(
         "{{\"applied\":{},\"manual\":{},\"kept_both\":{},\"skipped_existing\":{},\"conflicts\":{},\"failed\":{},\"renamed_targets\":{},\"dry_run\":{},\"policy\":\"{}\"}}",
-        applied, manual, kept_both, skipped_existing, conflicts, failed, renamed_targets, args.dry_run, plan.policy
+        applied,
+        manual,
+        kept_both,
+        skipped_existing,
+        conflicts,
+        failed,
+        renamed_targets,
+        args.dry_run,
+        plan.policy
     );
     Ok(())
 }
@@ -2336,8 +2417,8 @@ fn remove_destination_entry(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to stat {}", path.display()))?;
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
     if metadata.file_type().is_symlink() || metadata.is_file() {
         fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))?;
     } else if metadata.is_dir() {
@@ -2651,7 +2732,10 @@ impl ResumeRecorder {
                 ],
             )?;
         }
-        Ok(Some(Self { session_id, db_paths }))
+        Ok(Some(Self {
+            session_id,
+            db_paths,
+        }))
     }
 
     fn mark_status(
@@ -2936,8 +3020,10 @@ fn prune_resume_completed_rows(
     };
     let (scope, deleted_rows) = if let Some(session_id) = session_id {
         if dry_run {
-            let query =
-                format!("SELECT COUNT(*) FROM copy_resume_items WHERE {}", where_clause);
+            let query = format!(
+                "SELECT COUNT(*) FROM copy_resume_items WHERE {}",
+                where_clause
+            );
             let count: i64 = conn.query_row(&query, params![session_id], |row| row.get(0))?;
             (format!("session:{session_id}"), count.max(0) as usize)
         } else {
@@ -4308,8 +4394,12 @@ fn resume_plan_command(args: ResumePlanArgs) -> Result<()> {
     if let Some(path) = args.jsonl_out.as_ref() {
         let session = load_resume_session_meta(&conn, args.session_id.as_deref())?
             .ok_or_else(|| anyhow!("no resume session found"))?;
-        let rows =
-            load_resume_items_for_export(&conn, &session.session_id, args.only_failed, args.max_attempts)?;
+        let rows = load_resume_items_for_export(
+            &conn,
+            &session.session_id,
+            args.only_failed,
+            args.max_attempts,
+        )?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -4330,7 +4420,8 @@ fn resume_plan_command(args: ResumePlanArgs) -> Result<()> {
     }
 
     if args.prune_completed {
-        let result = prune_resume_completed_rows(&conn, args.session_id.as_deref(), args.dry_run_prune)?;
+        let result =
+            prune_resume_completed_rows(&conn, args.session_id.as_deref(), args.dry_run_prune)?;
         if args.vacuum && !args.dry_run_prune {
             conn.execute_batch("VACUUM")?;
         }
@@ -4395,11 +4486,15 @@ fn resume_plan_command(args: ResumePlanArgs) -> Result<()> {
         );
 
         let source_root = resolve_copy_source_root(
-            args.from.as_deref().ok_or_else(|| anyhow!("--from is required with --execute"))?,
+            args.from
+                .as_deref()
+                .ok_or_else(|| anyhow!("--from is required with --execute"))?,
             "source",
         )?;
         let destination_root = resolve_copy_destination_root(
-            args.to.as_deref().ok_or_else(|| anyhow!("--to is required with --execute"))?,
+            args.to
+                .as_deref()
+                .ok_or_else(|| anyhow!("--to is required with --execute"))?,
         )?;
         let policy = load_exclude_policy(args.policy.as_deref())?;
         let started_at_ns = now_ns()?;
@@ -5385,13 +5480,7 @@ fn run_copy_plan(
                 },
             )?;
             if let Some(recorder) = resume.as_ref() {
-                recorder.mark_status(
-                    &item.rel_path,
-                    "failed",
-                    0,
-                    Some("missing source"),
-                    false,
-                )?;
+                recorder.mark_status(&item.rel_path, "failed", 0, Some("missing source"), false)?;
             }
             if args.stop_on_error {
                 bail!("missing source file: {}", source_path.display());
@@ -5842,13 +5931,7 @@ fn run_copy_plan(
                 },
             )?;
             if let Some(recorder) = resume.as_ref() {
-                recorder.mark_status(
-                    &item.rel_path,
-                    "planned",
-                    source_size,
-                    None,
-                    false,
-                )?;
+                recorder.mark_status(&item.rel_path, "planned", source_size, None, false)?;
             }
             continue;
         }
@@ -5900,13 +5983,7 @@ fn run_copy_plan(
                     },
                 )?;
                 if let Some(recorder) = resume.as_ref() {
-                    recorder.mark_status(
-                        &item.rel_path,
-                        "done",
-                        bytes_written,
-                        None,
-                        false,
-                    )?;
+                    recorder.mark_status(&item.rel_path, "done", bytes_written, None, false)?;
                 }
             }
             Err(err) => {
@@ -5930,13 +6007,7 @@ fn run_copy_plan(
                     },
                 )?;
                 if let Some(recorder) = resume.as_ref() {
-                    recorder.mark_status(
-                        &item.rel_path,
-                        "failed",
-                        0,
-                        Some(&err_text),
-                        false,
-                    )?;
+                    recorder.mark_status(&item.rel_path, "failed", 0, Some(&err_text), false)?;
                 }
                 eprintln!(
                     "[err] copy failed: {} -> {}: {}",
@@ -6278,6 +6349,97 @@ fn ensure_file_fingerprint_columns(conn: &Connection) -> Result<()> {
             (),
         )?;
     }
+    Ok(())
+}
+
+fn file_signature_cache_key(
+    kind: &str,
+    rel_path: &str,
+    file_type: &str,
+    size: u64,
+    mtime_ns: i64,
+    fast_hash: Option<&str>,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(kind.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(rel_path.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(file_type.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(size.to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(mtime_ns.to_string().as_bytes());
+    hasher.update(b"\0");
+    if let Some(hash) = fast_hash {
+        hasher.update(hash.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn load_cached_file_fingerprint_profile(
+    conn: &Connection,
+    rel_path: &str,
+    file_type: &str,
+    size: u64,
+    mtime_ns: i64,
+    fast_hash: Option<&str>,
+) -> Result<Option<FileFingerprintProfile>> {
+    let cache_key = file_signature_cache_key(
+        "file_fingerprint_profile",
+        rel_path,
+        file_type,
+        size,
+        mtime_ns,
+        fast_hash,
+    );
+    let value_json: Option<String> = conn
+        .query_row(
+            "SELECT value_json FROM signature_cache WHERE cache_key = ?1",
+            params![cache_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    value_json
+        .map(|json| {
+            serde_json::from_str(&json).context("failed to decode cached fingerprint profile")
+        })
+        .transpose()
+}
+
+fn store_cached_file_fingerprint_profile(
+    conn: &Connection,
+    rel_path: &str,
+    file_type: &str,
+    size: u64,
+    mtime_ns: i64,
+    fast_hash: Option<&str>,
+    profile: &FileFingerprintProfile,
+    computed_at: i64,
+) -> Result<()> {
+    let kind = "file_fingerprint_profile";
+    let cache_key = file_signature_cache_key(kind, rel_path, file_type, size, mtime_ns, fast_hash);
+    let value_json = serde_json::to_string(profile)?;
+    conn.execute(
+        r#"
+        INSERT INTO signature_cache(cache_key, kind, rel_path, file_type, size, mtime_ns, fast_hash, value_json, computed_at)
+        VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ON CONFLICT(cache_key) DO UPDATE SET
+            value_json = excluded.value_json,
+            computed_at = excluded.computed_at
+        "#,
+        params![
+            cache_key,
+            kind,
+            rel_path,
+            file_type,
+            size,
+            mtime_ns,
+            fast_hash,
+            value_json,
+            computed_at
+        ],
+    )?;
     Ok(())
 }
 
@@ -7928,9 +8090,7 @@ mod tests {
             "left_folder,rank,right_folder,confidence_tier,next_action,overlap_ratio,shared_hash_count,shared_normalized_file_name_count,shared_rel_file_count\n"
         ));
         assert!(csv.contains("alpha,1,beta,possible,review before applying,0.357000,1,1,1"));
-        assert!(csv.contains(
-            "alpha,2,gamma,manual,manual inspection required,0.157000,0,0,0"
-        ));
+        assert!(csv.contains("alpha,2,gamma,manual,manual inspection required,0.157000,0,0,0"));
     }
 
     #[test]
@@ -8049,10 +8209,22 @@ mod tests {
 
     #[test]
     fn dossier_confidence_tier_maps_to_actions() {
-        assert_eq!(DossierConfidenceTier::Identical.action(), DossierAction::Apply);
-        assert_eq!(DossierConfidenceTier::Similar.action(), DossierAction::Review);
-        assert_eq!(DossierConfidenceTier::Possible.action(), DossierAction::Review);
-        assert_eq!(DossierConfidenceTier::Manual.action(), DossierAction::Manual);
+        assert_eq!(
+            DossierConfidenceTier::Identical.action(),
+            DossierAction::Apply
+        );
+        assert_eq!(
+            DossierConfidenceTier::Similar.action(),
+            DossierAction::Review
+        );
+        assert_eq!(
+            DossierConfidenceTier::Possible.action(),
+            DossierAction::Review
+        );
+        assert_eq!(
+            DossierConfidenceTier::Manual.action(),
+            DossierAction::Manual
+        );
     }
 
     #[test]
@@ -9276,5 +9448,52 @@ mod tests {
         assert!(db_path.exists());
         assert!(open_readonly_db(&db_path).is_ok());
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn signature_cache_reuses_and_invalidates_fingerprint_profiles() -> Result<()> {
+        let root = temp_dir("signature_cache");
+        let db_path = root.join("cache.sqlite");
+        let conn = open_db(&db_path)?;
+        let profile = build_file_fingerprint_profile("010001/poc_final.py", "file", 128);
+
+        store_cached_file_fingerprint_profile(
+            &conn,
+            "010001/poc_final.py",
+            "file",
+            128,
+            10,
+            Some("hash-a"),
+            &profile,
+            99,
+        )?;
+
+        let cached = load_cached_file_fingerprint_profile(
+            &conn,
+            "010001/poc_final.py",
+            "file",
+            128,
+            10,
+            Some("hash-a"),
+        )?
+        .expect("cache hit");
+        assert_eq!(cached.language, "python");
+        assert_eq!(cached.normalized_name, profile.normalized_name);
+
+        let changed_mtime = load_cached_file_fingerprint_profile(
+            &conn,
+            "010001/poc_final.py",
+            "file",
+            128,
+            11,
+            Some("hash-a"),
+        )?;
+        assert!(changed_mtime.is_none());
+
+        let rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM signature_cache", [], |row| row.get(0))?;
+        assert_eq!(rows, 1);
+        fs::remove_dir_all(root).ok();
+        Ok(())
     }
 }
