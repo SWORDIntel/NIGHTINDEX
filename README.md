@@ -139,6 +139,7 @@ nightindex dossier \
   --right <right_label> \
   --top-k 15 \
   [--confidence <manual|possible|similar|identical>] \
+  [--only-action <apply|review|manual>] \
   [--one-per-left] \
   --out-json <file> \
   --out-csv <file> \

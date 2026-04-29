@@ -216,6 +216,8 @@ struct DossierArgs {
     right: String,
     #[arg(long = "top-k", default_value_t = 10)]
     top_k: usize,
+    #[arg(long = "only-action")]
+    only_action: Option<DossierAction>,
     #[arg(long = "one-per-left")]
     one_per_left: bool,
     #[arg(long = "confidence", default_value_t = DossierConfidenceTier::Manual)]
@@ -708,10 +710,20 @@ struct DossierReport {
     right_label: String,
     top_k: usize,
     min_confidence: DossierConfidenceTier,
+    only_action: Option<DossierAction>,
     left_folder_count: usize,
     right_folder_count: usize,
     confidence_counts: DossierConfidenceCounts,
     candidates: Vec<DossierMatch>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[value(rename_all = "lowercase")]
+enum DossierAction {
+    Apply,
+    Review,
+    Manual,
 }
 
 #[derive(Debug, Serialize, Default, Clone)]
@@ -755,6 +767,14 @@ impl DossierConfidenceTier {
             Self::Similar => "review and likely apply",
             Self::Possible => "review before applying",
             Self::Manual => "manual inspection required",
+        }
+    }
+
+    fn action(self) -> DossierAction {
+        match self {
+            Self::Identical => DossierAction::Apply,
+            Self::Similar | Self::Possible => DossierAction::Review,
+            Self::Manual => DossierAction::Manual,
         }
     }
 }
@@ -1586,6 +1606,9 @@ fn dossier_command(args: DossierArgs) -> Result<()> {
         .into_iter()
         .filter(|item| item.confidence_tier.should_emit(min_confidence))
         .collect();
+    if let Some(only_action) = args.only_action {
+        candidates.retain(|item| item.confidence_tier.action() == only_action);
+    }
     if args.one_per_left {
         candidates = keep_top_candidate_per_left(&candidates);
     }
@@ -1601,6 +1624,7 @@ fn dossier_command(args: DossierArgs) -> Result<()> {
         right_label: args.right,
         top_k: args.top_k,
         min_confidence,
+        only_action: args.only_action,
         left_folder_count: left_signatures.len(),
         right_folder_count: right_signatures.len(),
         confidence_counts: confidence_counts.clone(),
@@ -6654,6 +6678,14 @@ mod tests {
             dossier_confidence_tier(&manual),
             DossierConfidenceTier::Manual
         );
+    }
+
+    #[test]
+    fn dossier_confidence_tier_maps_to_actions() {
+        assert_eq!(DossierConfidenceTier::Identical.action(), DossierAction::Apply);
+        assert_eq!(DossierConfidenceTier::Similar.action(), DossierAction::Review);
+        assert_eq!(DossierConfidenceTier::Possible.action(), DossierAction::Review);
+        assert_eq!(DossierConfidenceTier::Manual.action(), DossierAction::Manual);
     }
 
     #[test]
