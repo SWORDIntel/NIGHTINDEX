@@ -1086,13 +1086,13 @@ struct DossierReport {
     candidates: Vec<DossierMatch>,
 }
 
-#[derive(Debug, Serialize, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Default, Clone, Copy, PartialEq)]
 struct ReportCacheMetrics {
     left_profile_cache: CacheUsageCounters,
     right_profile_cache: CacheUsageCounters,
 }
 
-#[derive(Debug, Serialize, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Default, Clone, Copy, PartialEq)]
 struct CacheUsageCounters {
     hits: usize,
     misses: usize,
@@ -1992,7 +1992,8 @@ fn extract_check_command(args: ExtractCheckArgs) -> Result<()> {
 fn archive_member_diff_command(args: ArchiveMemberDiffArgs) -> Result<()> {
     let left_conn = open_readonly_db(&args.left_db)?;
     let right_conn = open_readonly_db(&args.right_db)?;
-    let report = build_archive_member_diff_report(&left_conn, &right_conn, &args.left, &args.right)?;
+    let report =
+        build_archive_member_diff_report(&left_conn, &right_conn, &args.left, &args.right)?;
     let json = serde_json::to_string_pretty(&report)?;
     println!("{json}");
     if let Some(path) = args.out_json {
@@ -2031,7 +2032,8 @@ fn build_archive_member_diff_report(
         right_entries = build_archive_entries(&right_rows)?;
     }
 
-    let mut left_map: HashMap<String, ExtractCheckEntry> = HashMap::with_capacity(left_entries.len());
+    let mut left_map: HashMap<String, ExtractCheckEntry> =
+        HashMap::with_capacity(left_entries.len());
     let mut right_map: HashMap<String, ExtractCheckEntry> =
         HashMap::with_capacity(right_entries.len());
     for entry in left_entries {
@@ -2191,7 +2193,11 @@ fn build_archive_member_plan_rows(report: &ArchiveMemberDiffReport) -> Vec<Archi
         });
     }
 
-    rows.sort_by(|a, b| a.virtual_member.cmp(&b.virtual_member).then(a.side.cmp(&b.side)));
+    rows.sort_by(|a, b| {
+        a.virtual_member
+            .cmp(&b.virtual_member)
+            .then(a.side.cmp(&b.side))
+    });
     rows
 }
 
@@ -2671,6 +2677,37 @@ fn build_archive_member_diff_csv(report: &ArchiveMemberDiffReport) -> String {
                 csv_escape(&report.left_label),
                 csv_escape(&report.right_label),
                 csv_escape(&item.virtual_member)
+            ),
+        );
+    }
+    csv
+}
+
+fn build_archive_member_plan_csv(report: &ArchiveMemberPlanReport) -> String {
+    let mut csv = String::new();
+    csv.push_str("report_schema,report_version,left_label,right_label,row_schema,row_version,action_class,side,virtual_member,rel_path,archive_family,payload_signature,archive_depth,size,mtime_ns,fast_hash,signal\n");
+    for row in &report.rows {
+        let _ = std::fmt::Write::write_fmt(
+            &mut csv,
+            format_args!(
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                csv_escape(&report.report_schema),
+                report.report_version,
+                csv_escape(&report.left_label),
+                csv_escape(&report.right_label),
+                csv_escape(&row.row_schema),
+                row.row_version,
+                csv_escape(&row.action_class),
+                csv_escape(&row.side),
+                csv_escape(&row.virtual_member),
+                csv_escape(&row.rel_path),
+                csv_escape(row.archive_family.as_deref().unwrap_or("")),
+                csv_escape(row.payload_signature.as_deref().unwrap_or("")),
+                row.archive_depth,
+                row.size,
+                row.mtime_ns,
+                csv_escape(row.fast_hash.as_deref().unwrap_or("")),
+                csv_escape(&row.signal)
             ),
         );
     }
@@ -11787,6 +11824,132 @@ bad::::line
         assert!(raw.contains("\"exact_member_matches\": 1"));
         assert!(raw.contains("\"left_only_count\": 1"));
         fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn archive_member_plan_rows_classify_actions() {
+        let report = ArchiveMemberDiffReport {
+            report_schema: ARCHIVE_MEMBER_DIFF_REPORT_SCHEMA.to_string(),
+            report_version: REPORT_VERSION_V1,
+            left_label: "left".to_string(),
+            right_label: "right".to_string(),
+            left_members: 3,
+            right_members: 3,
+            exact_member_matches: 1,
+            payload_family_matches: 1,
+            left_only_count: 2,
+            right_only_count: 2,
+            left_only: vec![
+                ArchiveMemberDiffEntry {
+                    rel_path: "left/match.tar.gz".to_string(),
+                    virtual_member: "v/match.tar.gz".to_string(),
+                    archive_family: Some("tar.gz".to_string()),
+                    payload_signature: Some("sig-match".to_string()),
+                    archive_depth: 2,
+                    size: 100,
+                    mtime_ns: 10,
+                    fast_hash: Some("h1".to_string()),
+                },
+                ArchiveMemberDiffEntry {
+                    rel_path: "left/conflict.iso".to_string(),
+                    virtual_member: "v/conflict.iso".to_string(),
+                    archive_family: Some("iso".to_string()),
+                    payload_signature: None,
+                    archive_depth: 1,
+                    size: 200,
+                    mtime_ns: 20,
+                    fast_hash: Some("h2".to_string()),
+                },
+            ],
+            right_only: vec![
+                ArchiveMemberDiffEntry {
+                    rel_path: "right/match-copy.tar.gz".to_string(),
+                    virtual_member: "v/other.tar.gz".to_string(),
+                    archive_family: Some("tar.gz".to_string()),
+                    payload_signature: Some("sig-match".to_string()),
+                    archive_depth: 2,
+                    size: 110,
+                    mtime_ns: 11,
+                    fast_hash: Some("h3".to_string()),
+                },
+                ArchiveMemberDiffEntry {
+                    rel_path: "right/copy.iso".to_string(),
+                    virtual_member: "v/copy.iso".to_string(),
+                    archive_family: Some("iso".to_string()),
+                    payload_signature: Some("sig-copy".to_string()),
+                    archive_depth: 1,
+                    size: 210,
+                    mtime_ns: 21,
+                    fast_hash: Some("h4".to_string()),
+                },
+            ],
+        };
+        let rows = build_archive_member_plan_rows(&report);
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().any(|row| row.virtual_member == "v/match.tar.gz"
+            && row.action_class == "review_payload_family_match"));
+        assert!(rows.iter().any(|row| row.virtual_member == "v/other.tar.gz"
+            && row.action_class == "review_payload_family_match"));
+        assert!(
+            rows.iter()
+                .any(|row| row.virtual_member == "v/copy.iso"
+                    && row.action_class == "copy_right_only")
+        );
+        assert!(
+            rows.iter().any(|row| row.virtual_member == "v/conflict.iso"
+                && row.action_class == "review_conflict")
+        );
+    }
+
+    #[test]
+    fn archive_member_plan_serialization_includes_schema_and_csv_columns() -> Result<()> {
+        let report = ArchiveMemberPlanReport {
+            report_schema: ARCHIVE_MEMBER_PLAN_REPORT_SCHEMA.to_string(),
+            report_version: REPORT_VERSION_V1,
+            left_label: "left".to_string(),
+            right_label: "right".to_string(),
+            source_report_schema: ARCHIVE_MEMBER_DIFF_REPORT_SCHEMA.to_string(),
+            source_report_version: REPORT_VERSION_V1,
+            rows: vec![ArchiveMemberPlanRow {
+                row_schema: ARCHIVE_MEMBER_PLAN_ROW_SCHEMA.to_string(),
+                row_version: REPORT_VERSION_V1,
+                action_class: "copy_left_only".to_string(),
+                side: "left".to_string(),
+                virtual_member: "v/only-left.tar.gz".to_string(),
+                rel_path: "left/only-left.tar.gz".to_string(),
+                archive_family: Some("tar.gz".to_string()),
+                payload_signature: Some("sig-left".to_string()),
+                archive_depth: 2,
+                size: 123,
+                mtime_ns: 55,
+                fast_hash: Some("hash-left".to_string()),
+                signal: "left_only".to_string(),
+            }],
+        };
+
+        let value = serde_json::to_value(&report)?;
+        assert_eq!(
+            value.get("report_schema").and_then(|v| v.as_str()),
+            Some(ARCHIVE_MEMBER_PLAN_REPORT_SCHEMA)
+        );
+        assert_eq!(
+            value
+                .get("rows")
+                .and_then(|v| v.as_array())
+                .and_then(|rows| rows.first())
+                .and_then(|row| row.get("row_schema"))
+                .and_then(|v| v.as_str()),
+            Some(ARCHIVE_MEMBER_PLAN_ROW_SCHEMA)
+        );
+
+        let csv = build_archive_member_plan_csv(&report);
+        assert!(csv.starts_with(
+            "report_schema,report_version,left_label,right_label,row_schema,row_version,action_class,side,virtual_member,rel_path,archive_family,payload_signature,archive_depth,size,mtime_ns,fast_hash,signal\n"
+        ));
+        assert!(csv.contains(
+            "nightindex.archive_member_plan,1,left,right,nightindex.archive_member_plan.row,1,copy_left_only,left,v/only-left.tar.gz,left/only-left.tar.gz,tar.gz,sig-left,2,123,55,hash-left,left_only"
+        ));
         Ok(())
     }
 }
