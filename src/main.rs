@@ -2051,6 +2051,113 @@ fn record_copy_run_stats(plan: &CopyPlan, summary: &CopyExecutionSummary, elapse
     }
 }
 
+struct ResumeRecorder {
+    session_id: String,
+    db_paths: Vec<String>,
+}
+
+impl ResumeRecorder {
+    fn start(plan: &CopyPlan, args: &CopyRunArgs, planned_files: usize) -> Result<Option<Self>> {
+        let mut db_paths = Vec::new();
+        if let Some(left_db) = &plan.left_db {
+            db_paths.push(left_db.clone());
+        }
+        if let Some(right_db) = &plan.right_db {
+            if Some(right_db.as_str()) != plan.left_db.as_deref() {
+                db_paths.push(right_db.clone());
+            }
+        }
+        if db_paths.is_empty() {
+            return Ok(None);
+        }
+
+        let started_at = now_ns()?;
+        let session_id = format!("{}-{}", std::process::id(), started_at);
+        for db_path in &db_paths {
+            let conn = open_db(Path::new(db_path))?;
+            conn.execute(
+                "INSERT INTO copy_resume_sessions(session_id, mode, left_label, right_label, source_root, destination_root, started_at, planned_files) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    &session_id,
+                    &plan.mode,
+                    &plan.left_label,
+                    &plan.right_label,
+                    args.source_root.display().to_string(),
+                    args.destination_root.display().to_string(),
+                    started_at,
+                    planned_files as i64
+                ],
+            )?;
+        }
+        Ok(Some(Self { session_id, db_paths }))
+    }
+
+    fn mark_status(
+        &self,
+        rel_path: &str,
+        status: &str,
+        bytes_done: u64,
+        error: Option<&str>,
+        increment_attempt: bool,
+    ) -> Result<()> {
+        let updated_at = now_ns()?;
+        for db_path in &self.db_paths {
+            let conn = open_db(Path::new(db_path))?;
+            let attempts_expr = if increment_attempt {
+                "attempts + 1"
+            } else {
+                "attempts"
+            };
+            let sql = format!(
+                "INSERT INTO copy_resume_items(session_id, rel_path, status, attempts, bytes_done, last_error, updated_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(session_id, rel_path) DO UPDATE SET
+                    status = excluded.status,
+                    attempts = {attempts_expr},
+                    bytes_done = excluded.bytes_done,
+                    last_error = excluded.last_error,
+                    updated_at = excluded.updated_at"
+            );
+            conn.execute(
+                &sql,
+                params![
+                    &self.session_id,
+                    rel_path,
+                    status,
+                    if increment_attempt { 1i64 } else { 0i64 },
+                    bytes_done as i64,
+                    error,
+                    updated_at
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn finish(&self, copied_files: usize, failed_files: usize) -> Result<()> {
+        let finished_at = now_ns()?;
+        for db_path in &self.db_paths {
+            let conn = open_db(Path::new(db_path))?;
+            conn.execute(
+                "UPDATE copy_resume_sessions SET finished_at = ?2, copied_files = ?3, failed_files = ?4 WHERE session_id = ?1",
+                params![&self.session_id, finished_at, copied_files as i64, failed_files as i64],
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn load_resume_pending_items(conn: &Connection, session_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT rel_path FROM copy_resume_items WHERE session_id = ?1 AND status IN ('pending', 'copying', 'failed') ORDER BY rel_path",
+    )?;
+    let rows = stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 fn build_dossier_matches(
     left_signatures: &HashMap<String, FolderSignature>,
     right_signatures: &HashMap<String, FolderSignature>,
@@ -4242,6 +4349,7 @@ fn run_copy_plan(
     let started_at_ns = now_ns()?;
     let planned_total = items_to_copy.len();
     let planned_bytes = plan.summary.bytes_to_copy;
+    let resume = ResumeRecorder::start(plan, &args, planned_total)?;
     eprintln!(
         "{}",
         format_start_line(
@@ -4261,6 +4369,9 @@ fn run_copy_plan(
         Ok(())
     };
     for (index, item) in items_to_copy.iter().enumerate() {
+        if let Some(recorder) = resume.as_ref() {
+            recorder.mark_status(&item.rel_path, "copying", 0, None, true)?;
+        }
         let source_path = args.source_root.join(&item.rel_path);
         let destination_path = args.destination_root.join(&item.rel_path);
 
@@ -4280,6 +4391,15 @@ fn run_copy_plan(
                     reason: Some(format!("missing: {}", source_path.display())),
                 },
             )?;
+            if let Some(recorder) = resume.as_ref() {
+                recorder.mark_status(
+                    &item.rel_path,
+                    "failed",
+                    0,
+                    Some("missing source"),
+                    false,
+                )?;
+            }
             if args.stop_on_error {
                 bail!("missing source file: {}", source_path.display());
             } else {
@@ -4313,6 +4433,15 @@ fn run_copy_plan(
                         reason: Some(format!("destination metadata unavailable: {}", err)),
                     },
                 )?;
+                if let Some(recorder) = resume.as_ref() {
+                    recorder.mark_status(
+                        &item.rel_path,
+                        "failed",
+                        0,
+                        Some("destination metadata unavailable"),
+                        false,
+                    )?;
+                }
                 if args.stop_on_error {
                     bail!(
                         "failed reading destination metadata {}",
@@ -4444,6 +4573,15 @@ fn run_copy_plan(
                                     reason: None,
                                 },
                             )?;
+                            if let Some(recorder) = resume.as_ref() {
+                                recorder.mark_status(
+                                    &item.rel_path,
+                                    "skipped_existing",
+                                    0,
+                                    None,
+                                    false,
+                                )?;
+                            }
                             continue;
                         }
                         if !is_overwrite {
@@ -4464,6 +4602,15 @@ fn run_copy_plan(
                                     )),
                                 },
                             )?;
+                            if let Some(recorder) = resume.as_ref() {
+                                recorder.mark_status(
+                                    &item.rel_path,
+                                    "skipped_conflict",
+                                    0,
+                                    None,
+                                    false,
+                                )?;
+                            }
                             continue;
                         }
 
@@ -4511,6 +4658,15 @@ fn run_copy_plan(
                         reason: None,
                     },
                 )?;
+                if let Some(recorder) = resume.as_ref() {
+                    recorder.mark_status(
+                        &item.rel_path,
+                        if args.dry_run { "planned" } else { "done" },
+                        0,
+                        None,
+                        false,
+                    )?;
+                }
                 continue;
             }
 
@@ -4592,6 +4748,15 @@ fn run_copy_plan(
                                 reason: None,
                             },
                         )?;
+                        if let Some(recorder) = resume.as_ref() {
+                            recorder.mark_status(
+                                &item.rel_path,
+                                "skipped_existing",
+                                0,
+                                None,
+                                false,
+                            )?;
+                        }
                         continue;
                     }
 
@@ -4613,6 +4778,15 @@ fn run_copy_plan(
                                 )),
                             },
                         )?;
+                        if let Some(recorder) = resume.as_ref() {
+                            recorder.mark_status(
+                                &item.rel_path,
+                                "skipped_conflict",
+                                0,
+                                None,
+                                false,
+                            )?;
+                        }
                         continue;
                     }
 
@@ -4674,6 +4848,15 @@ fn run_copy_plan(
                     reason: None,
                 },
             )?;
+            if let Some(recorder) = resume.as_ref() {
+                recorder.mark_status(
+                    &item.rel_path,
+                    "planned",
+                    source_size,
+                    None,
+                    false,
+                )?;
+            }
             continue;
         }
 
@@ -4723,6 +4906,15 @@ fn run_copy_plan(
                         reason: None,
                     },
                 )?;
+                if let Some(recorder) = resume.as_ref() {
+                    recorder.mark_status(
+                        &item.rel_path,
+                        "done",
+                        bytes_written,
+                        None,
+                        false,
+                    )?;
+                }
             }
             Err(err) => {
                 failed += 1;
@@ -4730,6 +4922,7 @@ fn run_copy_plan(
                     return Err(err)
                         .with_context(|| format!("failed copying {}", source_path.display()));
                 }
+                let err_text = err.to_string();
                 write_event(
                     &mut log,
                     &CopyEvent {
@@ -4740,9 +4933,18 @@ fn run_copy_plan(
                         bytes: 0,
                         dry_run: false,
                         overwrite: args.overwrite,
-                        reason: Some(err.to_string()),
+                        reason: Some(err_text.clone()),
                     },
                 )?;
+                if let Some(recorder) = resume.as_ref() {
+                    recorder.mark_status(
+                        &item.rel_path,
+                        "failed",
+                        0,
+                        Some(&err_text),
+                        false,
+                    )?;
+                }
                 eprintln!(
                     "[err] copy failed: {} -> {}: {}",
                     source_path.display(),
@@ -4765,6 +4967,15 @@ fn run_copy_plan(
                         reason: Some("destination appeared during copy".to_string()),
                     },
                 )?;
+                if let Some(recorder) = resume.as_ref() {
+                    recorder.mark_status(
+                        &item.rel_path,
+                        "skipped_existing",
+                        0,
+                        Some("destination appeared during copy"),
+                        false,
+                    )?;
+                }
             }
         }
     }
@@ -4789,6 +5000,9 @@ fn run_copy_plan(
     };
     eprintln!("{}", format_summary_line(&summary, elapsed_ns));
     write_copy_summary_event(&mut log, &summary, elapsed_ns)?;
+    if let Some(recorder) = resume.as_ref() {
+        recorder.finish(copied, failed)?;
+    }
     Ok(summary)
 }
 
@@ -6866,6 +7080,69 @@ mod tests {
             tail: 200,
             failures_only: false,
         })?;
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn resume_recorder_persists_session_and_item_states() -> Result<()> {
+        let root = temp_dir("resume_recorder");
+        let db = root.join("resume.sqlite");
+        let src = root.join("src");
+        let dst = root.join("dst");
+        fs::create_dir_all(&src)?;
+        fs::create_dir_all(&dst)?;
+
+        let plan = CopyPlan {
+            mode: "copy-missing".to_string(),
+            left_label: "left".to_string(),
+            right_label: "right".to_string(),
+            left_db: Some(db.display().to_string()),
+            right_db: None,
+            generated_at_ns: 0,
+            summary: CopyPlanSummary {
+                files_to_copy: 1,
+                bytes_to_copy: 100,
+                left_files: 1,
+                right_files: 0,
+            },
+            items: vec![CopyPlanItem {
+                rel_path: "a.bin".to_string(),
+                file_type: "file".to_string(),
+                size: 100,
+                mtime_ns: 0,
+                fast_hash: None,
+            }],
+        };
+        let args = CopyRunArgs {
+            source_root: src,
+            destination_root: dst,
+            backup_dir: None,
+            overwrite: false,
+            dry_run: false,
+            stop_on_error: false,
+            log: None,
+            progress_every: 1000,
+            size_only: false,
+            hash: false,
+            copy_links_as_files: false,
+        };
+
+        let recorder = ResumeRecorder::start(&plan, &args, 1)?.expect("recorder");
+        recorder.mark_status("a.bin", "copying", 0, None, true)?;
+        recorder.mark_status("a.bin", "done", 100, None, false)?;
+        recorder.finish(1, 0)?;
+
+        let conn = open_readonly_db(&db)?;
+        let pending = load_resume_pending_items(&conn, &recorder.session_id)?;
+        assert!(pending.is_empty());
+        let status: String = conn.query_row(
+            "SELECT status FROM copy_resume_items WHERE session_id = ?1 AND rel_path = 'a.bin'",
+            params![&recorder.session_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(status, "done");
+
         fs::remove_dir_all(root).ok();
         Ok(())
     }
