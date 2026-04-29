@@ -40,9 +40,11 @@ Implemented and shipping on the active branch:
 - Persistent cache v2: cross-label file fingerprint profile cache in SQLite with size/mtime/hash
   invalidation, `status` visibility, and cached binary/text/archive signature fields for dossier
   matching.
+- Archive-recursive foundation: `extract-check` reports virtual archive paths/families/depth, and
+  dossier scoring consumes virtual archive shape tokens.
 
 In progress:
-- Archive-recursive indexing and semantic code/text signatures.
+- Archive-recursive indexing without extraction and semantic code/text signatures.
 - Extend cached signatures from deterministic metadata signals into deeper content-derived
   binary/text/archive descriptors.
 
@@ -129,6 +131,7 @@ folders and renumbered exploit buckets where paths drift but semantic content st
 - `BIN` / `TEXT`: binaryity class.
 - `ARCH:<family>` and `ARCHFAM:<family>`: archive family grouping.
 - `ARCHSIG:<payload>`: archive payload signature for related compressions (`tar` for both `tar.gz` and `tar.xz`).
+- `ARCHPAY`, `ARCHVIRT`, and `ARCHDEPTH`: cached payload/virtual-path archive signals used before extraction.
 
 Confidence tiers are interpreted as follows:
 
@@ -167,7 +170,9 @@ nightindex dossier \
 ```
 
 `extcheck`  
-Compare archive-like payload families and extraction potential between two trees. Prints JSON plus a short stderr summary of exact and stem matches.
+Compare archive-like payload families and extraction potential between two trees. Prints JSON plus
+a short stderr summary of exact and stem matches. Archive entries include virtual paths such as
+`qcom_payload/@tar/gz`, archive family, payload signature, and nested archive depth.
 
 ```bash
 nightindex extcheck \

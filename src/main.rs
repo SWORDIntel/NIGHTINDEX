@@ -693,6 +693,10 @@ struct ExtractCheckEntry {
     path: String,
     folder: String,
     stem: String,
+    virtual_path: String,
+    archive_family: Option<String>,
+    payload_signature: Option<String>,
+    archive_depth: usize,
     size: u64,
     mtime_ns: i64,
     fast_hash: Option<String>,
@@ -705,6 +709,10 @@ struct ExtractCheckMatch {
     left_folder: String,
     right_folder: String,
     stem: String,
+    virtual_path: String,
+    archive_family: Option<String>,
+    payload_signature: Option<String>,
+    archive_depth: usize,
     left_size: u64,
     right_size: u64,
     left_mtime_ns: i64,
@@ -1626,6 +1634,10 @@ fn extract_check_command(args: ExtractCheckArgs) -> Result<()> {
                     left_folder: left_entry.folder,
                     right_folder: right_entry.folder,
                     stem: left_entry.stem,
+                    virtual_path: left_entry.virtual_path,
+                    archive_family: left_entry.archive_family,
+                    payload_signature: left_entry.payload_signature,
+                    archive_depth: left_entry.archive_depth,
                     left_size: left_entry.size,
                     right_size: right_entry.size,
                     left_mtime_ns: left_entry.mtime_ns,
@@ -1703,11 +1715,21 @@ fn build_archive_entries(rows: &[FileRecord]) -> Result<Vec<ExtractCheckEntry>> 
 
         let folder = folder_path_from_row(&row.rel_path);
         let stem = build_archive_stem(&row.rel_path);
+        let archive_family = infer_archive_family(&row.rel_path);
+        let payload_signature = archive_family
+            .as_deref()
+            .and_then(|family| infer_archive_payload_signature(&row.rel_path, family));
+        let virtual_path = build_virtual_archive_path(&row.rel_path);
+        let archive_depth = archive_family.as_deref().map_or(0, archive_family_depth);
 
         entries.push(ExtractCheckEntry {
             path: row.rel_path.clone(),
             folder,
             stem,
+            virtual_path,
+            archive_family,
+            payload_signature,
+            archive_depth,
             size: row.size,
             mtime_ns: row.mtime_ns,
             fast_hash: row.fast_hash.clone(),
@@ -1750,6 +1772,30 @@ fn build_archive_stem(rel_path: &str) -> String {
         best_stem.truncate(best_stem.len() - 1);
     }
     best_stem
+}
+
+fn build_virtual_archive_path(rel_path: &str) -> String {
+    let normalized = rel_path.replace('\\', "/");
+    let stem = build_archive_stem(&normalized);
+    let family = infer_archive_family(&normalized).unwrap_or_else(|| "archive".to_string());
+    let family_path = family
+        .split(|ch| ch == '.' || ch == '+')
+        .filter(|part| !part.is_empty())
+        .map(normalize_archive_token)
+        .collect::<Vec<_>>()
+        .join("/");
+    if family_path.is_empty() {
+        format!("{stem}/")
+    } else {
+        format!("{stem}/@{family_path}")
+    }
+}
+
+fn archive_family_depth(archive_family: &str) -> usize {
+    archive_family
+        .split(|ch| ch == '.' || ch == '+')
+        .filter(|part| !part.is_empty())
+        .count()
 }
 
 fn build_unique_folders(entries: &[ExtractCheckEntry]) -> Vec<String> {
@@ -1873,6 +1919,16 @@ fn build_extract_check_csv(report: &ExtractCheckReport) -> String {
                 csv_escape(&report.right_label),
                 csv_escape(&entry.stem),
                 csv_escape(&format!("{}|{}", entry.left_path, entry.right_path))
+            ),
+        );
+        let _ = std::fmt::Write::write_fmt(
+            &mut csv,
+            format_args!(
+                "stem_match,{},{},virtual_path,{},{}\n",
+                csv_escape(&report.left_label),
+                csv_escape(&report.right_label),
+                csv_escape(&entry.virtual_path),
+                csv_escape(&entry.payload_signature.clone().unwrap_or_default())
             ),
         );
     }
@@ -3866,6 +3922,17 @@ fn build_folder_signatures_with_profiles(
                     DOSSIER_ARCHIVE_SIGNATURE_TOKEN_WEIGHT,
                 );
             }
+            let virtual_path = build_virtual_archive_path(&row.rel_path);
+            add_token(
+                signature,
+                format!("ARCHVIRT:{virtual_path}"),
+                DOSSIER_ARCHIVE_SIGNATURE_TOKEN_WEIGHT,
+            );
+            add_token(
+                signature,
+                format!("ARCHDEPTH:{}", archive_family_depth(archive_family)),
+                DOSSIER_ARCHIVE_SIGNATURE_TOKEN_WEIGHT * 0.5,
+            );
         }
         if let Some(hash) = &row.fast_hash {
             add_token(signature, format!("H:{hash}"), DOSSIER_HASH_TOKEN_WEIGHT);
@@ -4145,7 +4212,7 @@ fn dossier_token_family(token: &str) -> DossierTokenFamily {
         "ES" => DossierTokenFamily::ExtensionStem,
         "H" => DossierTokenFamily::Hash,
         "ARCH" | "ARCHFAM" => DossierTokenFamily::ArchiveFamily,
-        "ARCHSIG" | "ARCHPAY" => DossierTokenFamily::ArchiveSignature,
+        "ARCHSIG" | "ARCHPAY" | "ARCHVIRT" | "ARCHDEPTH" => DossierTokenFamily::ArchiveSignature,
         "LANG" | "TEXTSIG" => DossierTokenFamily::Language,
         "SIZE" | "SZB" => DossierTokenFamily::SizeClass,
         "BINSIG" => DossierTokenFamily::Binaryity,
@@ -9045,6 +9112,20 @@ mod tests {
             dossier_archive_signature("image.zip+txt"),
             Some("zip".to_string())
         );
+    }
+
+    #[test]
+    fn virtual_archive_paths_capture_nested_family_shape() {
+        assert_eq!(
+            build_virtual_archive_path("fw/qcom_payload_final.tar.gz"),
+            "qcom_payload_final/@tar/gz"
+        );
+        assert_eq!(
+            build_virtual_archive_path("snapshots/image.archive.img.raw"),
+            "image.archive/@img/img"
+        );
+        assert_eq!(archive_family_depth("tar.gz"), 2);
+        assert_eq!(archive_family_depth("zip+txt"), 2);
     }
 
     #[test]
