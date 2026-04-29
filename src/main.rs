@@ -316,6 +316,10 @@ struct PlanCopyMissingArgs {
 struct ResumePlanArgs {
     #[arg(long = "db")]
     db: PathBuf,
+    #[arg(long = "list-sessions")]
+    list_sessions: bool,
+    #[arg(long = "stats")]
+    stats: bool,
     #[arg(long = "session-id")]
     session_id: Option<String>,
     #[arg(long = "only-failed")]
@@ -2217,6 +2221,31 @@ struct ResumeSessionMeta {
     right_label: String,
 }
 
+#[derive(Debug, Serialize)]
+struct ResumeSessionListItem {
+    session_id: String,
+    mode: String,
+    left_label: String,
+    right_label: String,
+    started_at: i64,
+    finished_at: Option<i64>,
+    planned_files: usize,
+    copied_files: usize,
+    failed_files: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ResumeSessionStats {
+    session_id: String,
+    pending: usize,
+    copying: usize,
+    failed: usize,
+    done: usize,
+    skipped_existing: usize,
+    skipped_conflict: usize,
+    planned: usize,
+}
+
 fn load_resume_session_meta(
     conn: &Connection,
     session_id: Option<&str>,
@@ -2253,6 +2282,65 @@ fn load_resume_session_meta(
     )
     .optional()
     .map_err(Into::into)
+}
+
+fn list_resume_sessions(conn: &Connection) -> Result<Vec<ResumeSessionListItem>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id, mode, left_label, right_label, started_at, finished_at, planned_files, copied_files, failed_files
+         FROM copy_resume_sessions ORDER BY started_at DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ResumeSessionListItem {
+            session_id: row.get(0)?,
+            mode: row.get(1)?,
+            left_label: row.get(2)?,
+            right_label: row.get(3)?,
+            started_at: row.get(4)?,
+            finished_at: row.get(5)?,
+            planned_files: row.get::<_, i64>(6)?.max(0) as usize,
+            copied_files: row.get::<_, i64>(7)?.max(0) as usize,
+            failed_files: row.get::<_, i64>(8)?.max(0) as usize,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn load_resume_session_stats(conn: &Connection, session_id: &str) -> Result<ResumeSessionStats> {
+    let mut stats = ResumeSessionStats {
+        session_id: session_id.to_string(),
+        pending: 0,
+        copying: 0,
+        failed: 0,
+        done: 0,
+        skipped_existing: 0,
+        skipped_conflict: 0,
+        planned: 0,
+    };
+    let mut stmt = conn.prepare(
+        "SELECT status, COUNT(*) FROM copy_resume_items WHERE session_id = ?1 GROUP BY status",
+    )?;
+    let rows = stmt.query_map(params![session_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (status, count) = row?;
+        let count = count.max(0) as usize;
+        match status.as_str() {
+            "pending" => stats.pending = count,
+            "copying" => stats.copying = count,
+            "failed" => stats.failed = count,
+            "done" => stats.done = count,
+            "skipped_existing" => stats.skipped_existing = count,
+            "skipped_conflict" => stats.skipped_conflict = count,
+            "planned" => stats.planned = count,
+            _ => {}
+        }
+    }
+    Ok(stats)
 }
 
 fn build_resume_copy_plan(
@@ -3593,6 +3681,23 @@ fn plan_copy_missing_command(args: PlanCopyMissingArgs) -> Result<()> {
 }
 
 fn resume_plan_command(args: ResumePlanArgs) -> Result<()> {
+    let conn = open_db(&args.db)?;
+    if args.list_sessions {
+        let list = list_resume_sessions(&conn)?;
+        let json = serde_json::to_string_pretty(&list)?;
+        println!("{json}");
+        return Ok(());
+    }
+
+    if args.stats {
+        let session = load_resume_session_meta(&conn, args.session_id.as_deref())?
+            .ok_or_else(|| anyhow!("no resume session found"))?;
+        let stats = load_resume_session_stats(&conn, &session.session_id)?;
+        let json = serde_json::to_string_pretty(&stats)?;
+        println!("{json}");
+        return Ok(());
+    }
+
     let plan = build_resume_copy_plan(
         &args.db,
         args.session_id.as_deref(),
@@ -7476,6 +7581,8 @@ mod tests {
 
         resume_plan_command(ResumePlanArgs {
             db: db.clone(),
+            list_sessions: false,
+            stats: false,
             session_id: Some(recorder.session_id),
             only_failed: false,
             max_attempts: None,
@@ -7490,6 +7597,57 @@ mod tests {
             log: None,
             progress_every: 1000,
         })?;
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn resume_list_and_stats_output_paths_work() -> Result<()> {
+        let root = temp_dir("resume_list_stats");
+        let db = root.join("resume.sqlite");
+        let src = root.join("src");
+        let dst = root.join("dst");
+        fs::create_dir_all(&src)?;
+        fs::create_dir_all(&dst)?;
+        fs::write(src.join("a.bin"), b"a")?;
+
+        let plan = CopyPlan {
+            mode: "copy-missing".to_string(),
+            left_label: "left".to_string(),
+            right_label: "right".to_string(),
+            left_db: Some(db.display().to_string()),
+            right_db: None,
+            generated_at_ns: 0,
+            summary: CopyPlanSummary {
+                files_to_copy: 1,
+                bytes_to_copy: 1,
+                left_files: 1,
+                right_files: 0,
+            },
+            items: vec![],
+        };
+        let args = CopyRunArgs {
+            source_root: src,
+            destination_root: dst,
+            backup_dir: None,
+            overwrite: false,
+            dry_run: false,
+            stop_on_error: false,
+            log: None,
+            progress_every: 1000,
+            size_only: false,
+            hash: false,
+            copy_links_as_files: false,
+        };
+        let recorder = ResumeRecorder::start(&plan, &args, 1)?.expect("recorder");
+        recorder.mark_status("a.bin", "failed", 0, Some("x"), true)?;
+
+        let conn = open_db(&db)?;
+        let sessions = list_resume_sessions(&conn)?;
+        assert!(!sessions.is_empty());
+        let stats = load_resume_session_stats(&conn, &recorder.session_id)?;
+        assert_eq!(stats.failed, 1);
 
         fs::remove_dir_all(root).ok();
         Ok(())

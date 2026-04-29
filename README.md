@@ -175,6 +175,8 @@ Build a retry plan from resume-state rows stored during prior copy runs.
 ```bash
 nightindex resume \
   --db <scan-or-copy.sqlite> \
+  [--list-sessions] \
+  [--stats --session-id <session_id>] \
   [--session-id <session_id>] \
   [--only-failed] \
   [--max-attempts <N>] \
