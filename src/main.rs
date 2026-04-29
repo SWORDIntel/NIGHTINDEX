@@ -16,7 +16,7 @@ mod archive_compare;
 mod binary_diff;
 mod copy_exec;
 
-use archive_compare::{ArchiveMemberRow as RecursiveArchiveRow, compare_archive_rows};
+use archive_compare::{ArchiveMemberRow as RecursiveArchiveRow, compare_archive_rows_with_cap};
 use binary_diff::{BinaryDiffConfig, diff_files};
 use copy_exec::{CopyFinalizeOutcome, CopyStager};
 
@@ -444,6 +444,8 @@ struct ArchiveRecursiveCompareArgs {
     db: Option<PathBuf>,
     #[arg(long)]
     tag: Option<String>,
+    #[arg(long = "max-bucket-items", default_value_t = 5000)]
+    max_bucket_items: usize,
 }
 
 #[derive(Args)]
@@ -2630,7 +2632,8 @@ fn archive_recursive_compare_command(args: ArchiveRecursiveCompareArgs) -> Resul
         })
         .collect();
 
-    let compared = compare_archive_rows(left_cmp_rows, right_cmp_rows);
+    let compared =
+        compare_archive_rows_with_cap(left_cmp_rows, right_cmp_rows, args.max_bucket_items.max(1));
     let report = ArchiveRecursiveCompareReport {
         report_schema: ARCHIVE_RECURSIVE_COMPARE_REPORT_SCHEMA.to_string(),
         report_version: REPORT_VERSION_V1,
@@ -2641,10 +2644,10 @@ fn archive_recursive_compare_command(args: ArchiveRecursiveCompareArgs) -> Resul
         exact_overlap_score: compared.scores.exact_overlap_score,
         nested_overlap_score: compared.scores.nested_overlap_score,
         depth_weighted_overlap_score: compared.scores.depth_weighted_overlap_score,
-        exact_path_overlap_count: compared.buckets.exact_path_overlap.len(),
-        nested_path_overlap_count: compared.buckets.nested_path_overlap.len(),
-        path_payload_conflict_count: compared.buckets.path_payload_conflict.len(),
-        payload_family_only_overlap_count: compared.buckets.payload_family_only_overlap.len(),
+        exact_path_overlap_count: compared.buckets.exact_path_overlap_total,
+        nested_path_overlap_count: compared.buckets.nested_path_overlap_total,
+        path_payload_conflict_count: compared.buckets.path_payload_conflict_total,
+        payload_family_only_overlap_count: compared.buckets.payload_family_only_overlap_total,
     };
 
     let json = serde_json::to_string_pretty(&report)?;
@@ -13524,6 +13527,7 @@ bad::::line
             out_csv: None,
             db: None,
             tag: None,
+            max_bucket_items: 5000,
         })?;
 
         let raw = fs::read_to_string(out_json)?;

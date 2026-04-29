@@ -22,6 +22,10 @@ pub struct OverlapScores {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[cfg_attr(not(test), derive(Serialize, Deserialize))]
 pub struct ConflictBuckets {
+    pub exact_path_overlap_total: usize,
+    pub nested_path_overlap_total: usize,
+    pub path_payload_conflict_total: usize,
+    pub payload_family_only_overlap_total: usize,
     pub exact_path_overlap: Vec<String>,
     pub nested_path_overlap: Vec<PathPair>,
     pub path_payload_conflict: Vec<String>,
@@ -45,6 +49,18 @@ pub struct ArchiveCompareReport {
 }
 
 pub fn compare_archive_rows<L, R>(left: L, right: R) -> ArchiveCompareReport
+where
+    L: IntoIterator<Item = ArchiveMemberRow>,
+    R: IntoIterator<Item = ArchiveMemberRow>,
+{
+    compare_archive_rows_with_cap(left, right, usize::MAX)
+}
+
+pub fn compare_archive_rows_with_cap<L, R>(
+    left: L,
+    right: R,
+    max_bucket_items: usize,
+) -> ArchiveCompareReport
 where
     L: IntoIterator<Item = ArchiveMemberRow>,
     R: IntoIterator<Item = ArchiveMemberRow>,
@@ -81,6 +97,20 @@ where
         collect_path_payload_conflicts(&left_rows, &right_rows, &exact_paths);
     let payload_family_only_overlap =
         collect_payload_family_only_overlap(&left_rows, &right_rows, &exact_paths);
+    let cap = max_bucket_items;
+    let mut exact_path_overlap: Vec<String> = exact_paths.into_iter().collect();
+    let nested_path_overlap: Vec<PathPair> = nested_pairs.into_iter().collect();
+    let mut path_payload_conflict = path_payload_conflict;
+    let mut payload_family_only_overlap = payload_family_only_overlap;
+    let exact_path_overlap_total = exact_path_overlap.len();
+    let nested_path_overlap_total = nested_path_overlap.len();
+    let path_payload_conflict_total = path_payload_conflict.len();
+    let payload_family_only_overlap_total = payload_family_only_overlap.len();
+    exact_path_overlap.truncate(cap);
+    let mut nested_path_overlap = nested_path_overlap;
+    nested_path_overlap.truncate(cap);
+    path_payload_conflict.truncate(cap);
+    payload_family_only_overlap.truncate(cap);
 
     ArchiveCompareReport {
         left_count: left_rows.len(),
@@ -91,8 +121,12 @@ where
             depth_weighted_overlap_score: depth_weighted_score,
         },
         buckets: ConflictBuckets {
-            exact_path_overlap: exact_paths.into_iter().collect(),
-            nested_path_overlap: nested_pairs.into_iter().collect(),
+            exact_path_overlap_total,
+            nested_path_overlap_total,
+            path_payload_conflict_total,
+            payload_family_only_overlap_total,
+            exact_path_overlap,
+            nested_path_overlap,
             path_payload_conflict,
             payload_family_only_overlap,
         },
@@ -291,6 +325,8 @@ mod tests {
         assert_eq!(report.scores.exact_overlap_score, 1.0);
         assert_eq!(report.scores.nested_overlap_score, 1.0);
         assert_eq!(report.scores.depth_weighted_overlap_score, 1.0);
+        assert_eq!(report.buckets.exact_path_overlap_total, 2);
+        assert_eq!(report.buckets.nested_path_overlap_total, 0);
         assert_eq!(
             report.buckets.exact_path_overlap,
             vec!["a/b.txt".to_string(), "c/d.bin".to_string()]
@@ -361,5 +397,18 @@ mod tests {
             lhs_path: "x/y/z".to_string(),
             rhs_path: "x/y".to_string()
         }));
+    }
+
+    #[test]
+    fn capped_bucket_output_preserves_totals() {
+        let left = vec![
+            row("a/b/c", 3, "text"),
+            row("a/b/c/d", 4, "text"),
+            row("a/b/c/e", 4, "text"),
+        ];
+        let right = vec![row("a", 1, "text"), row("a/b", 2, "text")];
+        let report = compare_archive_rows_with_cap(left, right, 1);
+        assert!(report.buckets.nested_path_overlap_total >= 2);
+        assert_eq!(report.buckets.nested_path_overlap.len(), 1);
     }
 }
