@@ -29,11 +29,14 @@ Done:
   family, payload signature, and depth metadata; dossier uses archive virtual path/depth tokens.
 - Semantic text signatures are implemented in scan: lightweight import/function/key/section tokens
   are extracted for text-like files and persisted in `text_signature` as `TEXTSIG` dossier evidence.
+- Compare/dossier JSON reports now include explicit schema metadata
+  (`report_schema`, `report_version`) and stable cache metrics under
+  `cache_metrics.left_profile_cache` / `cache_metrics.right_profile_cache`.
 
 ## Next Highest-Value Work
 
 1. Extend persistent fingerprint cache.
-   Add content-derived binary/text/archive descriptors and report hit/miss counts in compare/dossier output.
+   Add content-derived binary/text/archive descriptors beyond current counters and keep report fields schema-stable.
 
 2. Archive recursive indexing.
    Extend virtual archive metadata into true nested member manifests without extracting everything first.
@@ -60,7 +63,7 @@ Done:
 
 Immediate next step after reboot:
 1. Extend `signature_cache` to store deeper `binary_signature`, `text_signature`, and
-   `archive_signature` records with cache hit/miss counters in dossier/compare output.
+   `archive_signature` records while preserving report compatibility expectations.
 
 Then:
 2. Add archive member indexing using normalized virtual paths.

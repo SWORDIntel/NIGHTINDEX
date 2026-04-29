@@ -100,6 +100,9 @@ nightindex scan --root <path> --label <name> --db <manifest.sqlite> \
 
 `compare-summary`  
 Quick aggregate diff metrics for two manifests.
+JSON output includes `report_schema: "nightindex.compare_summary"`, `report_version: 1`,
+and stable cache counters under `cache_metrics.left_profile_cache` /
+`cache_metrics.right_profile_cache` (`hits`, `misses`).
 
 ```bash
 nightindex compare-summary \
@@ -154,6 +157,11 @@ Confidence tiers are interpreted as follows:
 Compatibility expectation
 - If a database lacks `file_fingerprints` rows, `dossier` gracefully falls back to legacy scoring.
 - Output remains read-only JSON/CSV and does not mutate the source/destination databases.
+- Dossier JSON includes explicit report metadata fields:
+  `report_schema: "nightindex.dossier"` and `report_version: 1`.
+- Cache counters are surfaced in stable nested fields:
+  `cache_metrics.left_profile_cache` / `cache_metrics.right_profile_cache` (`hits`, `misses`).
+  Legacy top-level `left_profile_cache` / `right_profile_cache` fields are still emitted.
 
 ```bash
 nightindex dossier \
