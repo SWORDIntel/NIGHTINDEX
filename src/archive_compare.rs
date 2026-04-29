@@ -106,14 +106,30 @@ fn collect_nested_pairs(
 ) -> BTreeSet<PathPair> {
     let mut pairs = BTreeSet::new();
 
+    // O(n^2) pair scans do not scale for large archive-member sets.
+    // Use strict ancestor-prefix lookups instead: O(paths * depth * log n).
     for lhs in left_paths {
-        for rhs in right_paths {
-            if lhs == rhs || exact_paths.contains(lhs) {
-                continue;
-            }
-            if is_nested_match(lhs, rhs) {
+        if exact_paths.contains(lhs) {
+            continue;
+        }
+        for rhs_ancestor in strict_parent_prefixes(lhs) {
+            if right_paths.contains(rhs_ancestor) {
                 pairs.insert(PathPair {
                     lhs_path: lhs.clone(),
+                    rhs_path: rhs_ancestor.to_string(),
+                });
+            }
+        }
+    }
+
+    for rhs in right_paths {
+        if exact_paths.contains(rhs) {
+            continue;
+        }
+        for lhs_ancestor in strict_parent_prefixes(rhs) {
+            if left_paths.contains(lhs_ancestor) {
+                pairs.insert(PathPair {
+                    lhs_path: lhs_ancestor.to_string(),
                     rhs_path: rhs.clone(),
                 });
             }
@@ -123,20 +139,14 @@ fn collect_nested_pairs(
     pairs
 }
 
-fn is_nested_match(a: &str, b: &str) -> bool {
-    is_strict_prefix_path(a, b) || is_strict_prefix_path(b, a)
-}
-
-fn is_strict_prefix_path(parent: &str, child: &str) -> bool {
-    if parent.len() >= child.len() {
-        return false;
+fn strict_parent_prefixes(path: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    for (idx, ch) in path.char_indices() {
+        if ch == '/' && idx > 0 {
+            out.push(&path[..idx]);
+        }
     }
-
-    if !child.starts_with(parent) {
-        return false;
-    }
-
-    child.as_bytes().get(parent.len()).copied() == Some(b'/')
+    out
 }
 
 fn depth_weighted_overlap(
@@ -322,5 +332,34 @@ mod tests {
         );
         assert!(report.buckets.exact_path_overlap.is_empty());
         assert!(report.buckets.path_payload_conflict.is_empty());
+    }
+
+    #[test]
+    fn nested_pairs_are_detected_without_quadratic_scan_behavior() {
+        let left = vec![
+            row("root/a", 2, "text"),
+            row("root/a/deeper/item.bin", 4, "binary"),
+            row("x/y/z", 3, "text"),
+        ];
+        let right = vec![
+            row("root", 1, "text"),
+            row("x/y", 2, "text"),
+            row("other/path", 2, "text"),
+        ];
+
+        let report = compare_archive_rows(left, right);
+        let pairs = report.buckets.nested_path_overlap;
+        assert!(pairs.contains(&PathPair {
+            lhs_path: "root/a".to_string(),
+            rhs_path: "root".to_string()
+        }));
+        assert!(pairs.contains(&PathPair {
+            lhs_path: "root/a/deeper/item.bin".to_string(),
+            rhs_path: "root".to_string()
+        }));
+        assert!(pairs.contains(&PathPair {
+            lhs_path: "x/y/z".to_string(),
+            rhs_path: "x/y".to_string()
+        }));
     }
 }
