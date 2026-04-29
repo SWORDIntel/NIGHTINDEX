@@ -140,6 +140,21 @@ CREATE TABLE IF NOT EXISTS signature_cache (
 
 CREATE INDEX IF NOT EXISTS idx_signature_cache_kind_path
 ON signature_cache(kind, rel_path);
+
+CREATE TABLE IF NOT EXISTS analysis_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_kind TEXT NOT NULL,
+    tag TEXT,
+    left_ref TEXT,
+    right_ref TEXT,
+    score_primary REAL,
+    score_secondary REAL,
+    summary_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_analysis_reports_kind_created
+ON analysis_reports(report_kind, created_at);
 "#;
 
 const DEFAULT_NOISE_DIRS: &[&str] = &[
@@ -271,6 +286,8 @@ enum Commands {
     Logs(LogsArgs),
     #[command(about = "Summarize DB and recent copy/resume health")]
     Status(StatusArgs),
+    #[command(about = "Query persisted analysis report history")]
+    ReportHistory(ReportHistoryArgs),
     #[command(about = "Inspect cache coverage and signature density")]
     InspectCache(InspectCacheArgs),
     #[command(about = "Build merge materialization plan from dossier action CSV")]
@@ -423,6 +440,10 @@ struct ArchiveRecursiveCompareArgs {
     out_json: Option<PathBuf>,
     #[arg(long)]
     out_csv: Option<PathBuf>,
+    #[arg(long)]
+    db: Option<PathBuf>,
+    #[arg(long)]
+    tag: Option<String>,
 }
 
 #[derive(Args)]
@@ -437,6 +458,10 @@ struct BinaryDiffSummaryArgs {
     max_windows: usize,
     #[arg(long)]
     out_json: Option<PathBuf>,
+    #[arg(long)]
+    db: Option<PathBuf>,
+    #[arg(long)]
+    tag: Option<String>,
 }
 
 #[derive(Args)]
@@ -625,6 +650,16 @@ struct StatusArgs {
     db: PathBuf,
     #[arg(long = "window-minutes", default_value_t = 180)]
     window_minutes: i64,
+}
+
+#[derive(Args)]
+struct ReportHistoryArgs {
+    #[arg(long = "db")]
+    db: PathBuf,
+    #[arg(long = "kind")]
+    kind: Option<String>,
+    #[arg(long = "limit", default_value_t = 50)]
+    limit: usize,
 }
 
 #[derive(Args)]
@@ -1043,6 +1078,25 @@ struct BinaryDiffSummaryReport {
     right_size: u64,
     left_full_hash: String,
     right_full_hash: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ReportHistoryRow {
+    id: i64,
+    report_kind: String,
+    tag: Option<String>,
+    left_ref: Option<String>,
+    right_ref: Option<String>,
+    score_primary: Option<f64>,
+    score_secondary: Option<f64>,
+    created_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct ReportHistoryReport {
+    report_schema: String,
+    report_version: u32,
+    rows: Vec<ReportHistoryRow>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1467,6 +1521,7 @@ fn main() -> Result<()> {
         Commands::SyncCopyMissing(args) => sync_copy_missing_command(args),
         Commands::Logs(args) => logs_command(args),
         Commands::Status(args) => status_command(args),
+        Commands::ReportHistory(args) => report_history_command(args),
         Commands::InspectCache(args) => inspect_cache_command(args),
         Commands::MergePlan(args) => merge_plan_command(args),
         Commands::MergeApply(args) => merge_apply_command(args),
@@ -2603,6 +2658,18 @@ fn archive_recursive_compare_command(args: ArchiveRecursiveCompareArgs) -> Resul
         std::fs::write(&path, csv)
             .with_context(|| format!("failed to write {}", path.display()))?;
     }
+    if let Some(db_path) = args.db.as_deref() {
+        persist_analysis_report(
+            db_path,
+            "archive_recursive_compare",
+            args.tag.as_deref(),
+            Some(&args.left),
+            Some(&args.right),
+            Some(report.nested_overlap_score),
+            Some(report.depth_weighted_overlap_score),
+            &json,
+        )?;
+    }
     eprintln!(
         "[archive-recursive-compare] scores exact={:.3} nested={:.3} depth_weighted={:.3}",
         report.exact_overlap_score,
@@ -2652,6 +2719,18 @@ fn binary_diff_summary_command(args: BinaryDiffSummaryArgs) -> Result<()> {
     if let Some(path) = args.out_json {
         std::fs::write(&path, format!("{json}\n"))
             .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    if let Some(db_path) = args.db.as_deref() {
+        persist_analysis_report(
+            db_path,
+            "binary_diff_summary",
+            args.tag.as_deref(),
+            Some(&report.left_file),
+            Some(&report.right_file),
+            Some(report.similarity),
+            Some(report.histogram_similarity),
+            &json,
+        )?;
     }
     eprintln!(
         "[binary-diff-summary] similarity={:.3} aligned={:.3} shifted={:.3} windows={} matched={}",
@@ -3717,6 +3796,93 @@ fn status_command(args: StatusArgs) -> Result<()> {
         latest_bytes_per_second: latest_rate,
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn report_history_command(args: ReportHistoryArgs) -> Result<()> {
+    let conn = open_db(&args.db)?;
+    let limit = args.limit.max(1) as i64;
+    let mut rows = Vec::new();
+    if let Some(kind) = args.kind {
+        let mut stmt = conn.prepare(
+            "SELECT id, report_kind, tag, left_ref, right_ref, score_primary, score_secondary, created_at
+             FROM analysis_reports
+             WHERE report_kind = ?1
+             ORDER BY created_at DESC
+             LIMIT ?2",
+        )?;
+        let mapped = stmt.query_map(params![kind, limit], |row| {
+            Ok(ReportHistoryRow {
+                id: row.get(0)?,
+                report_kind: row.get(1)?,
+                tag: row.get(2)?,
+                left_ref: row.get(3)?,
+                right_ref: row.get(4)?,
+                score_primary: row.get(5)?,
+                score_secondary: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })?;
+        for row in mapped {
+            rows.push(row?);
+        }
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT id, report_kind, tag, left_ref, right_ref, score_primary, score_secondary, created_at
+             FROM analysis_reports
+             ORDER BY created_at DESC
+             LIMIT ?1",
+        )?;
+        let mapped = stmt.query_map(params![limit], |row| {
+            Ok(ReportHistoryRow {
+                id: row.get(0)?,
+                report_kind: row.get(1)?,
+                tag: row.get(2)?,
+                left_ref: row.get(3)?,
+                right_ref: row.get(4)?,
+                score_primary: row.get(5)?,
+                score_secondary: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })?;
+        for row in mapped {
+            rows.push(row?);
+        }
+    }
+    let report = ReportHistoryReport {
+        report_schema: "nightindex.report_history".to_string(),
+        report_version: REPORT_VERSION_V1,
+        rows,
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn persist_analysis_report(
+    db_path: &Path,
+    report_kind: &str,
+    tag: Option<&str>,
+    left_ref: Option<&str>,
+    right_ref: Option<&str>,
+    score_primary: Option<f64>,
+    score_secondary: Option<f64>,
+    summary_json: &str,
+) -> Result<()> {
+    let conn = open_db(db_path)?;
+    conn.execute(
+        "INSERT INTO analysis_reports(report_kind, tag, left_ref, right_ref, score_primary, score_secondary, summary_json, created_at)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            report_kind,
+            tag,
+            left_ref,
+            right_ref,
+            score_primary,
+            score_secondary,
+            summary_json,
+            now_ns()?
+        ],
+    )?;
     Ok(())
 }
 
@@ -13306,6 +13472,8 @@ bad::::line
             window_size: 256,
             max_windows: 8,
             out_json: Some(out_json.clone()),
+            db: None,
+            tag: None,
         })?;
 
         let raw = fs::read_to_string(out_json)?;
@@ -13354,11 +13522,36 @@ bad::::line
             right: "right".to_string(),
             out_json: Some(out_json.clone()),
             out_csv: None,
+            db: None,
+            tag: None,
         })?;
 
         let raw = fs::read_to_string(out_json)?;
         assert!(raw.contains("\"report_schema\": \"nightindex.archive_recursive_compare\""));
         assert!(raw.contains("\"nested_overlap_score\""));
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn report_history_command_lists_persisted_rows() -> Result<()> {
+        let root = temp_dir("report_history_lists");
+        let db = root.join("history.sqlite");
+        persist_analysis_report(
+            &db,
+            "binary_diff_summary",
+            Some("smoke"),
+            Some("left.bin"),
+            Some("right.bin"),
+            Some(0.9),
+            Some(0.8),
+            "{\"ok\":true}",
+        )?;
+        report_history_command(ReportHistoryArgs {
+            db,
+            kind: Some("binary_diff_summary".to_string()),
+            limit: 10,
+        })?;
         fs::remove_dir_all(root).ok();
         Ok(())
     }

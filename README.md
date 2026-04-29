@@ -245,6 +245,13 @@ ndex merge-apply --plan /tank/nightindex/archive-merge-plan.json --dry-run
 ndex merge-apply --plan /tank/nightindex/archive-merge-plan.json
 ```
 
+`report-history`  
+Query persisted analysis results recorded by `binary-diff-summary` and `archive-recursive-compare`.
+
+```bash
+nightindex report-history --db /tank/nightindex/nightindex.sqlite --kind binary_diff_summary --limit 50
+```
+
 `logs`  
 Summarize NDJSON copy logs produced by `--log` during execute/sync/compat copy runs.
 
