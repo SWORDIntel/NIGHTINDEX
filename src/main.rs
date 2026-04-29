@@ -706,7 +706,16 @@ struct DossierReport {
     min_confidence: DossierConfidenceTier,
     left_folder_count: usize,
     right_folder_count: usize,
+    confidence_counts: DossierConfidenceCounts,
     candidates: Vec<DossierMatch>,
+}
+
+#[derive(Debug, Serialize, Default, Clone)]
+struct DossierConfidenceCounts {
+    manual: usize,
+    possible: usize,
+    similar: usize,
+    identical: usize,
 }
 
 #[derive(
@@ -742,6 +751,17 @@ impl DossierConfidenceTier {
             Self::Similar => "review and likely apply",
             Self::Possible => "review before applying",
             Self::Manual => "manual inspection required",
+        }
+    }
+}
+
+impl DossierConfidenceCounts {
+    fn bump(&mut self, tier: DossierConfidenceTier) {
+        match tier {
+            DossierConfidenceTier::Manual => self.manual += 1,
+            DossierConfidenceTier::Possible => self.possible += 1,
+            DossierConfidenceTier::Similar => self.similar += 1,
+            DossierConfidenceTier::Identical => self.identical += 1,
         }
     }
 }
@@ -1562,6 +1582,10 @@ fn dossier_command(args: DossierArgs) -> Result<()> {
         .into_iter()
         .filter(|item| item.confidence_tier.should_emit(min_confidence))
         .collect();
+    let mut confidence_counts = DossierConfidenceCounts::default();
+    for item in &candidates {
+        confidence_counts.bump(item.confidence_tier);
+    }
 
     let report = DossierReport {
         left_db: args.left_db.display().to_string(),
@@ -1572,6 +1596,7 @@ fn dossier_command(args: DossierArgs) -> Result<()> {
         min_confidence,
         left_folder_count: left_signatures.len(),
         right_folder_count: right_signatures.len(),
+        confidence_counts: confidence_counts.clone(),
         candidates: candidates.clone(),
     };
 
@@ -1602,6 +1627,13 @@ fn dossier_command(args: DossierArgs) -> Result<()> {
         eprintln!(
             "[dossier] next action: {}",
             best.confidence_tier.next_action()
+        );
+        eprintln!(
+            "[dossier] tiers: identical={} similar={} possible={} manual={}",
+            confidence_counts.identical,
+            confidence_counts.similar,
+            confidence_counts.possible,
+            confidence_counts.manual
         );
     } else {
         eprintln!(
