@@ -233,6 +233,8 @@ enum Commands {
     Logs(LogsArgs),
     #[command(about = "Summarize DB and recent copy/resume health")]
     Status(StatusArgs),
+    #[command(about = "Inspect cache coverage and signature density")]
+    InspectCache(InspectCacheArgs),
     #[command(about = "Build merge materialization plan from dossier action CSV")]
     MergePlan(MergePlanArgs),
     #[command(about = "Apply a previously generated merge plan")]
@@ -499,6 +501,16 @@ struct StatusArgs {
     db: PathBuf,
     #[arg(long = "window-minutes", default_value_t = 180)]
     window_minutes: i64,
+}
+
+#[derive(Args)]
+struct InspectCacheArgs {
+    #[arg(long)]
+    db: PathBuf,
+    #[arg(long)]
+    label: Option<String>,
+    #[arg(long)]
+    out_json: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -1161,6 +1173,7 @@ fn main() -> Result<()> {
         Commands::SyncCopyMissing(args) => sync_copy_missing_command(args),
         Commands::Logs(args) => logs_command(args),
         Commands::Status(args) => status_command(args),
+        Commands::InspectCache(args) => inspect_cache_command(args),
         Commands::MergePlan(args) => merge_plan_command(args),
         Commands::MergeApply(args) => merge_apply_command(args),
         Commands::Rclone(args) => compat_copy_command(args, "rclone"),
@@ -2513,6 +2526,27 @@ struct StatusReport {
     latest_bytes_per_second: Option<f64>,
 }
 
+#[derive(Debug, Serialize)]
+struct InspectCacheLabelRow {
+    label: String,
+    files: usize,
+    profiles: usize,
+    profile_coverage_ratio: f64,
+    with_binary_signature: usize,
+    with_binary_descriptor: usize,
+    with_text_signature: usize,
+    with_archive_signature: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct InspectCacheReport {
+    report_schema: String,
+    report_version: u32,
+    signature_cache_rows: usize,
+    virtual_archive_member_rows: usize,
+    labels: Vec<InspectCacheLabelRow>,
+}
+
 fn status_command(args: StatusArgs) -> Result<()> {
     let conn = open_db(&args.db)?;
     let labels: i64 = conn.query_row("SELECT COUNT(DISTINCT label) FROM files", [], |row| {
@@ -2561,6 +2595,91 @@ fn status_command(args: StatusArgs) -> Result<()> {
         latest_bytes_per_second: latest_rate,
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn inspect_cache_command(args: InspectCacheArgs) -> Result<()> {
+    let conn = open_db(&args.db)?;
+    let signature_cache_rows: i64 =
+        conn.query_row("SELECT COUNT(*) FROM signature_cache", [], |row| row.get(0))?;
+    let virtual_archive_member_rows: i64 =
+        conn.query_row("SELECT COUNT(*) FROM virtual_archive_members", [], |row| {
+            row.get(0)
+        })?;
+
+    let labels = if let Some(label) = args.label.as_deref() {
+        vec![label.to_string()]
+    } else {
+        let mut stmt = conn.prepare("SELECT DISTINCT label FROM files ORDER BY label")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        out
+    };
+
+    let mut label_rows = Vec::new();
+    for label in labels {
+        let files: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE label = ?1",
+            params![&label],
+            |row| row.get(0),
+        )?;
+        let (profiles, with_binary_signature, with_binary_descriptor, with_text_signature, with_archive_signature): (i64, i64, i64, i64, i64) =
+            conn.query_row(
+                "SELECT
+                    COUNT(*),
+                    SUM(CASE WHEN binary_signature IS NOT NULL AND binary_signature <> '' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN binary_descriptor IS NOT NULL AND binary_descriptor <> '' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN text_signature IS NOT NULL AND text_signature <> '' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN archive_signature IS NOT NULL AND archive_signature <> '' THEN 1 ELSE 0 END)
+                 FROM file_fingerprints
+                 WHERE label = ?1",
+                params![&label],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                        row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                        row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                        row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    ))
+                },
+            )?;
+
+        let files_usize = files.max(0) as usize;
+        let profiles_usize = profiles.max(0) as usize;
+        let profile_coverage_ratio = if files_usize == 0 {
+            0.0
+        } else {
+            (profiles_usize as f64) / (files_usize as f64)
+        };
+        label_rows.push(InspectCacheLabelRow {
+            label,
+            files: files_usize,
+            profiles: profiles_usize,
+            profile_coverage_ratio,
+            with_binary_signature: with_binary_signature.max(0) as usize,
+            with_binary_descriptor: with_binary_descriptor.max(0) as usize,
+            with_text_signature: with_text_signature.max(0) as usize,
+            with_archive_signature: with_archive_signature.max(0) as usize,
+        });
+    }
+
+    let report = InspectCacheReport {
+        report_schema: "nightindex.inspect_cache".to_string(),
+        report_version: 1,
+        signature_cache_rows: signature_cache_rows.max(0) as usize,
+        virtual_archive_member_rows: virtual_archive_member_rows.max(0) as usize,
+        labels: label_rows,
+    };
+    let json = serde_json::to_string_pretty(&report)?;
+    println!("{json}");
+    if let Some(path) = args.out_json {
+        std::fs::write(&path, format!("{json}\n"))
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -10814,5 +10933,43 @@ def collect_results(path):
         assert!(signature.starts_with("python:collector"));
         assert!(signature.contains("i:os+pathlib") || signature.contains("i:pathlib+os"));
         assert!(signature.contains("f:collect_results"));
+    }
+
+    #[test]
+    fn inspect_cache_command_emits_label_metrics() -> Result<()> {
+        let root = temp_dir("inspect_cache_cmd");
+        let source = root.join("src");
+        fs::create_dir_all(&source)?;
+        fs::write(
+            source.join("a.py"),
+            "import os\n\ndef run(path):\n    return os.path.abspath(path)\n",
+        )?;
+        fs::write(source.join("b.bin"), vec![0u8; 1024])?;
+        let db = root.join("manifest.sqlite");
+
+        scan_command(ScanArgs {
+            db: db.clone(),
+            label: "left".to_string(),
+            root: source,
+            exclude_prefixes: vec![],
+            exclude_if_present: vec![],
+            policy: None,
+            hash: true,
+        })?;
+
+        let out_json = root.join("inspect.json");
+        inspect_cache_command(InspectCacheArgs {
+            db: db.clone(),
+            label: Some("left".to_string()),
+            out_json: Some(out_json.clone()),
+        })?;
+
+        let raw = fs::read_to_string(&out_json)?;
+        assert!(raw.contains("\"report_schema\": \"nightindex.inspect_cache\""));
+        assert!(raw.contains("\"label\": \"left\""));
+        assert!(raw.contains("\"with_text_signature\""));
+        assert!(raw.contains("\"with_binary_signature\""));
+        fs::remove_dir_all(root).ok();
+        Ok(())
     }
 }

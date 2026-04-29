@@ -203,6 +203,16 @@ nightindex logs \
   [--failures-only]
 ```
 
+`inspect-cache`  
+Read-only per-label cache and signature-density report.
+
+```bash
+nightindex inspect-cache \
+  --db <manifest.sqlite> \
+  [--label <label>] \
+  [--out-json <file>]
+```
+
 `resume` (alias for `resume-plan`)  
 Build a retry plan from resume-state rows stored during prior copy runs.
 
