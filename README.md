@@ -178,6 +178,7 @@ nightindex resume \
   [--list-sessions] \
   [--stats --session-id <session_id>] \
   [--prune-completed --session-id <session_id> [--dry-run-prune] [--vacuum]] \
+  [--jsonl-out /tmp/resume-items.jsonl] \
   [--session-id <session_id>] \
   [--only-failed] \
   [--max-attempts <N>] \

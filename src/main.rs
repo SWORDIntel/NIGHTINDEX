@@ -332,6 +332,8 @@ struct ResumePlanArgs {
     only_failed: bool,
     #[arg(long = "max-attempts")]
     max_attempts: Option<u64>,
+    #[arg(long = "jsonl-out")]
+    jsonl_out: Option<PathBuf>,
     #[arg(long = "out-json")]
     out_json: Option<PathBuf>,
     #[arg(long)]
@@ -2259,6 +2261,17 @@ struct ResumePruneResult {
     dry_run: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct ResumeItemExportRow {
+    session_id: String,
+    rel_path: String,
+    status: String,
+    attempts: usize,
+    bytes_done: u64,
+    last_error: Option<String>,
+    updated_at: i64,
+}
+
 fn load_resume_session_meta(
     conn: &Connection,
     session_id: Option<&str>,
@@ -2354,6 +2367,46 @@ fn load_resume_session_stats(conn: &Connection, session_id: &str) -> Result<Resu
         }
     }
     Ok(stats)
+}
+
+fn load_resume_items_for_export(
+    conn: &Connection,
+    session_id: &str,
+    only_failed: bool,
+    max_attempts: Option<u64>,
+) -> Result<Vec<ResumeItemExportRow>> {
+    let status_sql = if only_failed {
+        "status = 'failed'"
+    } else {
+        "status IN ('pending', 'copying', 'failed', 'done', 'skipped_existing', 'skipped_conflict', 'planned')"
+    };
+    let mut sql = format!(
+        "SELECT rel_path, status, attempts, bytes_done, last_error, updated_at
+         FROM copy_resume_items
+         WHERE session_id = ?1 AND {}",
+        status_sql
+    );
+    if let Some(max_attempts) = max_attempts {
+        sql.push_str(&format!(" AND attempts <= {}", max_attempts));
+    }
+    sql.push_str(" ORDER BY rel_path");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![session_id], |row| {
+        Ok(ResumeItemExportRow {
+            session_id: session_id.to_string(),
+            rel_path: row.get(0)?,
+            status: row.get(1)?,
+            attempts: row.get::<_, i64>(2)?.max(0) as usize,
+            bytes_done: row.get::<_, i64>(3)?.max(0) as u64,
+            last_error: row.get(4)?,
+            updated_at: row.get(5)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 fn prune_resume_completed_rows(
@@ -3737,6 +3790,30 @@ fn plan_copy_missing_command(args: PlanCopyMissingArgs) -> Result<()> {
 
 fn resume_plan_command(args: ResumePlanArgs) -> Result<()> {
     let conn = open_db(&args.db)?;
+    if let Some(path) = args.jsonl_out.as_ref() {
+        let session = load_resume_session_meta(&conn, args.session_id.as_deref())?
+            .ok_or_else(|| anyhow!("no resume session found"))?;
+        let rows =
+            load_resume_items_for_export(&conn, &session.session_id, args.only_failed, args.max_attempts)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        for row in rows {
+            let payload = serde_json::to_vec(&row)?;
+            file.write_all(&payload)?;
+            file.write_all(b"\n")?;
+        }
+        eprintln!("[resume] wrote jsonl export: {}", path.display());
+        return Ok(());
+    }
+
     if args.prune_completed {
         let result = prune_resume_completed_rows(&conn, args.session_id.as_deref(), args.dry_run_prune)?;
         if args.vacuum && !args.dry_run_prune {
@@ -7653,6 +7730,7 @@ mod tests {
             session_id: Some(recorder.session_id),
             only_failed: false,
             max_attempts: None,
+            jsonl_out: None,
             out_json: None,
             execute: true,
             from: Some(src),
@@ -7664,6 +7742,80 @@ mod tests {
             log: None,
             progress_every: 1000,
         })?;
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn resume_jsonl_export_writes_filtered_rows() -> Result<()> {
+        let root = temp_dir("resume_jsonl_export");
+        let db = root.join("resume.sqlite");
+        let src = root.join("src");
+        let dst = root.join("dst");
+        fs::create_dir_all(&src)?;
+        fs::create_dir_all(&dst)?;
+        let plan = CopyPlan {
+            mode: "copy-missing".to_string(),
+            left_label: "left".to_string(),
+            right_label: "right".to_string(),
+            left_db: Some(db.display().to_string()),
+            right_db: None,
+            generated_at_ns: 0,
+            summary: CopyPlanSummary {
+                files_to_copy: 2,
+                bytes_to_copy: 2,
+                left_files: 2,
+                right_files: 0,
+            },
+            items: vec![],
+        };
+        let args = CopyRunArgs {
+            source_root: src,
+            destination_root: dst,
+            backup_dir: None,
+            overwrite: false,
+            dry_run: false,
+            stop_on_error: false,
+            log: None,
+            progress_every: 1000,
+            size_only: false,
+            hash: false,
+            copy_links_as_files: false,
+        };
+        let recorder = ResumeRecorder::start(&plan, &args, 2)?.expect("recorder");
+        recorder.mark_status("a.bin", "failed", 0, Some("x"), true)?;
+        recorder.mark_status("b.bin", "done", 2, None, true)?;
+
+        let out = root.join("resume.jsonl");
+        resume_plan_command(ResumePlanArgs {
+            db: db.clone(),
+            list_sessions: false,
+            stats: false,
+            prune_completed: false,
+            dry_run_prune: false,
+            vacuum: false,
+            session_id: Some(recorder.session_id),
+            only_failed: true,
+            max_attempts: None,
+            jsonl_out: Some(out.clone()),
+            out_json: None,
+            execute: false,
+            from: None,
+            to: None,
+            overwrite: false,
+            dry_run: false,
+            stop_on_error: false,
+            policy: None,
+            log: None,
+            progress_every: 1000,
+        })?;
+
+        let raw = fs::read_to_string(out)?;
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("\"status\":\"failed\""));
+        assert!(lines[0].contains("\"rel_path\":\"a.bin\""));
 
         fs::remove_dir_all(root).ok();
         Ok(())
