@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -101,6 +101,24 @@ CREATE TABLE IF NOT EXISTS file_fingerprints (
 CREATE INDEX IF NOT EXISTS idx_file_fingerprints_label_rel_path
 ON file_fingerprints(label, rel_path);
 
+CREATE TABLE IF NOT EXISTS virtual_archive_members (
+    label TEXT NOT NULL,
+    rel_path TEXT NOT NULL,
+    virtual_path TEXT NOT NULL,
+    virtual_member TEXT NOT NULL,
+    archive_family TEXT,
+    payload_signature TEXT,
+    archive_depth INTEGER NOT NULL,
+    size INTEGER NOT NULL,
+    mtime_ns INTEGER NOT NULL,
+    fast_hash TEXT,
+    scanned_at INTEGER NOT NULL,
+    PRIMARY KEY (label, rel_path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_virtual_archive_members_label_virtual_member
+ON virtual_archive_members(label, virtual_member);
+
 CREATE TABLE IF NOT EXISTS signature_cache (
     cache_key TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
@@ -136,6 +154,9 @@ const DEFAULT_NOISE_DIRS: &[&str] = &[
     "tmp",
     "temp",
 ];
+const COMPARE_SUMMARY_REPORT_SCHEMA: &str = "nightindex.compare_summary";
+const DOSSIER_REPORT_SCHEMA: &str = "nightindex.dossier";
+const REPORT_VERSION_V1: u32 = 1;
 
 const ARCHIVE_EXTENSIONS: &[&str] = &[
     ".tar.gz", ".tar.xz", ".tar.bz2", ".zip+txt", ".img.raw", ".zip", ".7z", ".tar", ".rar",
@@ -666,6 +687,8 @@ struct FileFingerprintProfile {
 
 #[derive(Debug, Serialize)]
 struct CompareSummary {
+    report_schema: String,
+    report_version: u32,
     left_label: String,
     right_label: String,
     left_files: usize,
@@ -674,6 +697,7 @@ struct CompareSummary {
     same_path_changed: usize,
     left_only: usize,
     right_only: usize,
+    cache_metrics: ReportCacheMetrics,
 }
 
 #[derive(Debug, Serialize)]
@@ -921,6 +945,8 @@ struct DossierMatch {
 
 #[derive(Debug, Serialize)]
 struct DossierReport {
+    report_schema: String,
+    report_version: u32,
     left_db: String,
     right_db: String,
     left_label: String,
@@ -932,10 +958,17 @@ struct DossierReport {
     right_folder_count: usize,
     archive_signal_candidates: usize,
     archive_signal_ratio: f64,
+    cache_metrics: ReportCacheMetrics,
     left_profile_cache: CacheUsageCounters,
     right_profile_cache: CacheUsageCounters,
     confidence_counts: DossierConfidenceCounts,
     candidates: Vec<DossierMatch>,
+}
+
+#[derive(Debug, Serialize, Default, Clone, Copy, PartialEq, Eq)]
+struct ReportCacheMetrics {
+    left_profile_cache: CacheUsageCounters,
+    right_profile_cache: CacheUsageCounters,
 }
 
 #[derive(Debug, Serialize, Default, Clone, Copy, PartialEq, Eq)]
@@ -1026,6 +1059,9 @@ impl std::fmt::Display for DossierConfidenceTier {
 const DOSSIER_CONFIDENCE_IDENTICAL_RATIO: f64 = 0.80;
 const DOSSIER_CONFIDENCE_SIMILAR_RATIO: f64 = 0.35;
 const DOSSIER_CONFIDENCE_POSSIBLE_RATIO: f64 = 0.15;
+const BINARY_DESCRIPTOR_MAX_SAMPLE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const BINARY_DESCRIPTOR_SAMPLE_POINTS: usize = 4;
+const BINARY_DESCRIPTOR_SAMPLE_CHUNK_BYTES: usize = 256;
 
 fn dossier_confidence_tier(match_record: &DossierMatch) -> DossierConfidenceTier {
     if match_record.overlap_ratio >= DOSSIER_CONFIDENCE_IDENTICAL_RATIO
@@ -1374,6 +1410,17 @@ fn scan_command(args: ScanArgs) -> Result<()> {
             fingerprint_recomputed += 1;
             let mut profile =
                 build_file_fingerprint_profile(&rel_path, &file_type, size, fast_hash.as_deref());
+            if profile.is_binary {
+                let sampled_signature = infer_binary_sample_signature_from_file(entry.path(), size);
+                profile.binary_descriptor = Some(infer_binary_descriptor(
+                    &rel_path,
+                    Some(&profile.ext),
+                    profile.archive_family.as_deref(),
+                    &profile.size_class,
+                    fast_hash.as_deref(),
+                    sampled_signature.as_deref(),
+                ));
+            }
             if let Some(text_signature) =
                 infer_semantic_text_signature_from_file(entry.path(), &profile)?
             {
@@ -1468,6 +1515,16 @@ fn scan_command(args: ScanArgs) -> Result<()> {
             ],
         )?;
 
+        persist_virtual_archive_member(
+            &conn,
+            &args.label,
+            &rel_path,
+            size,
+            mtime_ns,
+            fast_hash.as_deref(),
+            scanned_at,
+        )?;
+
         files_seen += 1;
         if files_seen % 500 == 0 {
             println!(
@@ -1484,6 +1541,11 @@ fn scan_command(args: ScanArgs) -> Result<()> {
             );
         }
     }
+
+    conn.execute(
+        "DELETE FROM virtual_archive_members WHERE label = ?1 AND scanned_at < ?2",
+        params![&args.label, scanned_at],
+    )?;
 
     println!(
         "[scan] summary: files={} symlinks={} hashed={} reused={} fp_reused={} fp_cache_hits={} fp_cache_misses={} fp_recomputed={} excluded={} errors={}",
@@ -1514,9 +1576,20 @@ fn compare_summary_command(args: CompareSummaryArgs) -> Result<()> {
 
     let left_rows = load_label(&left_conn, &args.left)?;
     let right_rows = load_label(&right_conn, &args.right)?;
+    let left_profiles = load_file_fingerprint_profiles(&left_conn, &args.left)?;
+    let right_profiles = load_file_fingerprint_profiles(&right_conn, &args.right)?;
+    let cache_metrics = ReportCacheMetrics {
+        left_profile_cache: profile_cache_usage(&left_rows, &left_profiles),
+        right_profile_cache: profile_cache_usage(&right_rows, &right_profiles),
+    };
 
-    let (summary, _, _) =
-        build_compare_and_copy_summary(&left_rows, &right_rows, &args.left, &args.right)?;
+    let (summary, _, _) = build_compare_and_copy_summary(
+        &left_rows,
+        &right_rows,
+        &args.left,
+        &args.right,
+        cache_metrics,
+    )?;
 
     let json = serde_json::to_string_pretty(&summary)?;
     println!("{json}");
@@ -1539,8 +1612,13 @@ fn brief_command(args: BriefArgs) -> Result<()> {
     let left_rows = load_label(&left_conn, &args.left)?;
     let right_rows = load_label(&right_conn, &args.right)?;
 
-    let (summary, files_to_copy, bytes_to_copy) =
-        build_compare_and_copy_summary(&left_rows, &right_rows, &args.left, &args.right)?;
+    let (summary, files_to_copy, bytes_to_copy) = build_compare_and_copy_summary(
+        &left_rows,
+        &right_rows,
+        &args.left,
+        &args.right,
+        ReportCacheMetrics::default(),
+    )?;
 
     let left_sample = latest_copy_run_sample(&left_conn, &args.left, &args.right)?;
     let right_sample = latest_copy_run_sample(&right_conn, &args.left, &args.right)?;
@@ -1608,8 +1686,14 @@ fn extract_check_command(args: ExtractCheckArgs) -> Result<()> {
     let left_rows = load_label(&left_conn, &args.left)?;
     let right_rows = load_label(&right_conn, &args.right)?;
 
-    let left_archives = build_archive_entries(&left_rows)?;
-    let right_archives = build_archive_entries(&right_rows)?;
+    let mut left_archives = load_virtual_archive_entries(&left_conn, &args.left)?;
+    if left_archives.is_empty() {
+        left_archives = build_archive_entries(&left_rows)?;
+    }
+    let mut right_archives = load_virtual_archive_entries(&right_conn, &args.right)?;
+    if right_archives.is_empty() {
+        right_archives = build_archive_entries(&right_rows)?;
+    }
 
     let mut left_map: HashMap<String, ExtractCheckEntry> =
         HashMap::with_capacity(left_archives.len());
@@ -1772,6 +1856,106 @@ fn build_archive_entries(rows: &[FileRecord]) -> Result<Vec<ExtractCheckEntry>> 
         });
     }
     Ok(entries)
+}
+
+fn persist_virtual_archive_member(
+    conn: &Connection,
+    label: &str,
+    rel_path: &str,
+    size: u64,
+    mtime_ns: i64,
+    fast_hash: Option<&str>,
+    scanned_at: i64,
+) -> Result<()> {
+    if !is_archive_path(rel_path) {
+        conn.execute(
+            "DELETE FROM virtual_archive_members WHERE label = ?1 AND rel_path = ?2",
+            params![label, rel_path],
+        )?;
+        return Ok(());
+    }
+
+    let archive_family = infer_archive_family(rel_path);
+    let payload_signature = archive_family
+        .as_deref()
+        .and_then(|family| infer_archive_payload_signature(rel_path, family));
+    let virtual_path = build_virtual_archive_path(rel_path);
+    let virtual_member = build_virtual_archive_member_path(rel_path);
+    let archive_depth = archive_family.as_deref().map_or(0, archive_family_depth);
+
+    conn.execute(
+        r#"
+        INSERT INTO virtual_archive_members(
+            label,
+            rel_path,
+            virtual_path,
+            virtual_member,
+            archive_family,
+            payload_signature,
+            archive_depth,
+            size,
+            mtime_ns,
+            fast_hash,
+            scanned_at
+        )
+        VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        ON CONFLICT(label, rel_path) DO UPDATE SET
+            virtual_path = excluded.virtual_path,
+            virtual_member = excluded.virtual_member,
+            archive_family = excluded.archive_family,
+            payload_signature = excluded.payload_signature,
+            archive_depth = excluded.archive_depth,
+            size = excluded.size,
+            mtime_ns = excluded.mtime_ns,
+            fast_hash = excluded.fast_hash,
+            scanned_at = excluded.scanned_at
+        "#,
+        params![
+            label,
+            rel_path,
+            virtual_path,
+            virtual_member,
+            archive_family,
+            payload_signature,
+            archive_depth as i64,
+            size,
+            mtime_ns,
+            fast_hash,
+            scanned_at
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_virtual_archive_entries(conn: &Connection, label: &str) -> Result<Vec<ExtractCheckEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT rel_path, virtual_path, virtual_member, archive_family, payload_signature, archive_depth, size, mtime_ns, fast_hash
+         FROM virtual_archive_members
+         WHERE label = ?1
+         ORDER BY rel_path",
+    )?;
+    let rows = stmt.query_map(params![label], |row| {
+        let path: String = row.get(0)?;
+        Ok(ExtractCheckEntry {
+            folder: folder_path_from_row(&path),
+            stem: build_archive_stem(&path),
+            path,
+            virtual_path: row.get(1)?,
+            virtual_member: row.get(2)?,
+            archive_family: row.get(3)?,
+            payload_signature: row.get(4)?,
+            archive_depth: row.get::<_, i64>(5)? as usize,
+            size: row.get(6)?,
+            mtime_ns: row.get(7)?,
+            fast_hash: row.get(8)?,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 fn is_archive_path(path: &str) -> bool {
@@ -2078,6 +2262,8 @@ fn dossier_command(args: DossierArgs) -> Result<()> {
     };
 
     let report = DossierReport {
+        report_schema: DOSSIER_REPORT_SCHEMA.to_string(),
+        report_version: REPORT_VERSION_V1,
         left_db: args.left_db.display().to_string(),
         right_db: args.right_db.display().to_string(),
         left_label: args.left,
@@ -2089,6 +2275,10 @@ fn dossier_command(args: DossierArgs) -> Result<()> {
         right_folder_count: right_signatures.len(),
         archive_signal_candidates,
         archive_signal_ratio,
+        cache_metrics: ReportCacheMetrics {
+            left_profile_cache,
+            right_profile_cache,
+        },
         left_profile_cache,
         right_profile_cache,
         confidence_counts: confidence_counts.clone(),
@@ -2299,6 +2489,7 @@ struct StatusReport {
     resume_sessions: usize,
     recent_copy_runs: usize,
     signature_cache_rows: usize,
+    virtual_archive_member_rows: usize,
     latest_bytes_per_second: Option<f64>,
 }
 
@@ -2319,6 +2510,10 @@ fn status_command(args: StatusArgs) -> Result<()> {
     )?;
     let signature_cache_rows: i64 =
         conn.query_row("SELECT COUNT(*) FROM signature_cache", [], |row| row.get(0))?;
+    let virtual_archive_member_rows: i64 =
+        conn.query_row("SELECT COUNT(*) FROM virtual_archive_members", [], |row| {
+            row.get(0)
+        })?;
     let latest_rate: Option<f64> = conn
         .query_row(
             "SELECT copied_bytes, duration_ns FROM copy_runs WHERE copied_bytes > 0 AND duration_ns > 0 ORDER BY copied_at DESC LIMIT 1",
@@ -2340,6 +2535,7 @@ fn status_command(args: StatusArgs) -> Result<()> {
         resume_sessions: sessions.max(0) as usize,
         recent_copy_runs: recent_runs.max(0) as usize,
         signature_cache_rows: signature_cache_rows.max(0) as usize,
+        virtual_archive_member_rows: virtual_archive_member_rows.max(0) as usize,
         latest_bytes_per_second: latest_rate,
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2683,6 +2879,7 @@ fn build_compare_and_copy_summary(
     right_rows: &[FileRecord],
     left: &str,
     right: &str,
+    cache_metrics: ReportCacheMetrics,
 ) -> Result<(CompareSummary, usize, u64)> {
     let mut left_map: HashMap<String, FileRecord> = HashMap::with_capacity(left_rows.len());
     let mut right_map: HashMap<String, FileRecord> = HashMap::with_capacity(right_rows.len());
@@ -2726,6 +2923,8 @@ fn build_compare_and_copy_summary(
         .count();
 
     let summary = CompareSummary {
+        report_schema: COMPARE_SUMMARY_REPORT_SCHEMA.to_string(),
+        report_version: REPORT_VERSION_V1,
         left_label: left.to_string(),
         right_label: right.to_string(),
         left_files: left_map.len(),
@@ -2734,6 +2933,7 @@ fn build_compare_and_copy_summary(
         same_path_changed,
         left_only,
         right_only,
+        cache_metrics,
     };
 
     Ok((summary, files_to_copy, bytes_to_copy))
@@ -3726,6 +3926,7 @@ fn build_file_fingerprint_profile(
             archive_family.as_deref(),
             &size_class,
             fast_hash,
+            None,
         ))
     } else {
         None
@@ -4242,6 +4443,7 @@ fn infer_binary_descriptor(
     archive_family: Option<&str>,
     size_class: &str,
     fast_hash: Option<&str>,
+    sampled_signature: Option<&str>,
 ) -> String {
     let family = archive_family
         .and_then(archive_payload_root_from_family)
@@ -4265,7 +4467,55 @@ fn infer_binary_descriptor(
         .map(|value| value.chars().take(10).collect::<String>())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "nohash".to_string());
+    if let Some(sampled_signature) = sampled_signature.filter(|value| !value.is_empty()) {
+        return format!("{family}:{size_class}:{parent_tail}:{hash_hint}:s{sampled_signature}");
+    }
     format!("{family}:{size_class}:{parent_tail}:{hash_hint}")
+}
+
+fn infer_binary_sample_signature_from_file(path: &Path, size: u64) -> Option<String> {
+    if size == 0 || size > BINARY_DESCRIPTOR_MAX_SAMPLE_FILE_BYTES {
+        return None;
+    }
+    let mut file = File::open(path).ok()?;
+    let chunk_len = size.min(BINARY_DESCRIPTOR_SAMPLE_CHUNK_BYTES as u64) as usize;
+    let mut offsets = vec![0u64];
+    if size > 1 {
+        offsets.push(size / 3);
+        offsets.push((2 * size) / 3);
+        offsets.push(size.saturating_sub(chunk_len as u64));
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+    if offsets.len() > BINARY_DESCRIPTOR_SAMPLE_POINTS {
+        offsets.truncate(BINARY_DESCRIPTOR_SAMPLE_POINTS);
+    }
+
+    let mut state: u64 = 0xcbf29ce484222325;
+    let mut total_read = 0usize;
+    for offset in offsets {
+        if file.seek(SeekFrom::Start(offset)).is_err() {
+            return None;
+        }
+        let mut buf = vec![0u8; chunk_len];
+        let read = file.read(&mut buf).ok()?;
+        if read == 0 {
+            continue;
+        }
+        total_read += read;
+        for value in offset.to_le_bytes() {
+            state ^= value as u64;
+            state = state.wrapping_mul(0x100000001b3);
+        }
+        for value in &buf[..read] {
+            state ^= *value as u64;
+            state = state.wrapping_mul(0x100000001b3);
+        }
+    }
+    if total_read == 0 {
+        return None;
+    }
+    Some(format!("{state:016x}"))
 }
 
 fn infer_text_signature(rel_path: &str, language: &str, normalized_name: &str) -> String {
@@ -9609,6 +9859,77 @@ mod tests {
     }
 
     #[test]
+    fn scan_populates_virtual_archive_member_manifest_and_query() -> Result<()> {
+        let root = temp_dir("virtual_archive_manifest_scan");
+        let source_root = root.join("source");
+        fs::create_dir_all(source_root.join("fw"))?;
+        fs::create_dir_all(source_root.join("docs"))?;
+        fs::write(source_root.join("fw/payload.tar.gz"), b"abc")?;
+        fs::write(source_root.join("docs/readme.txt"), b"plain")?;
+
+        let db = root.join("scan.sqlite");
+        scan_command(ScanArgs {
+            db: db.clone(),
+            label: "left".to_string(),
+            root: source_root,
+            exclude_prefixes: Vec::new(),
+            exclude_if_present: Vec::new(),
+            policy: None,
+            hash: false,
+        })?;
+
+        let conn = open_readonly_db(&db)?;
+        let archives = load_virtual_archive_entries(&conn, "left")?;
+        assert_eq!(archives.len(), 1);
+        assert_eq!(archives[0].path, "fw/payload.tar.gz");
+        assert_eq!(archives[0].virtual_path, "payload/@tar/gz");
+        assert_eq!(archives[0].virtual_member, "payload/@tar/gz");
+        assert_eq!(archives[0].archive_family, Some("tar.gz".to_string()));
+        assert_eq!(archives[0].archive_depth, 2);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn scan_updates_virtual_archive_manifest_when_archive_disappears() -> Result<()> {
+        let root = temp_dir("virtual_archive_manifest_update");
+        let source_root = root.join("source");
+        fs::create_dir_all(source_root.join("fw"))?;
+        fs::write(source_root.join("fw/payload.tar.gz"), b"abc")?;
+
+        let db = root.join("scan.sqlite");
+        scan_command(ScanArgs {
+            db: db.clone(),
+            label: "left".to_string(),
+            root: source_root.clone(),
+            exclude_prefixes: Vec::new(),
+            exclude_if_present: Vec::new(),
+            policy: None,
+            hash: false,
+        })?;
+
+        fs::remove_file(source_root.join("fw/payload.tar.gz"))?;
+        fs::write(source_root.join("fw/payload.txt"), b"abc")?;
+        scan_command(ScanArgs {
+            db: db.clone(),
+            label: "left".to_string(),
+            root: source_root,
+            exclude_prefixes: Vec::new(),
+            exclude_if_present: Vec::new(),
+            policy: None,
+            hash: false,
+        })?;
+
+        let conn = open_readonly_db(&db)?;
+        let archives = load_virtual_archive_entries(&conn, "left")?;
+        assert!(archives.is_empty());
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
     fn dossier_matching_uses_archive_signature_for_compressed_payload_variants() {
         let left_rows = vec![FileRecord {
             rel_path: "left/source-a.tar.gz".to_string(),
@@ -10049,6 +10370,93 @@ mod tests {
     }
 
     #[test]
+    fn compare_summary_serialization_includes_schema_and_cache_metrics() {
+        let summary = CompareSummary {
+            report_schema: COMPARE_SUMMARY_REPORT_SCHEMA.to_string(),
+            report_version: REPORT_VERSION_V1,
+            left_label: "left".to_string(),
+            right_label: "right".to_string(),
+            left_files: 10,
+            right_files: 12,
+            same_path_same_meta: 6,
+            same_path_changed: 2,
+            left_only: 2,
+            right_only: 4,
+            cache_metrics: ReportCacheMetrics {
+                left_profile_cache: CacheUsageCounters { hits: 7, misses: 3 },
+                right_profile_cache: CacheUsageCounters { hits: 9, misses: 3 },
+            },
+        };
+
+        let value = serde_json::to_value(&summary).expect("serialize compare summary");
+        assert_eq!(
+            value.get("report_schema").and_then(|v| v.as_str()),
+            Some(COMPARE_SUMMARY_REPORT_SCHEMA)
+        );
+        assert_eq!(
+            value.get("report_version").and_then(|v| v.as_u64()),
+            Some(REPORT_VERSION_V1 as u64)
+        );
+        assert_eq!(
+            value.pointer("/cache_metrics/left_profile_cache/hits")
+                .and_then(|v| v.as_u64()),
+            Some(7)
+        );
+        assert_eq!(
+            value.pointer("/cache_metrics/right_profile_cache/misses")
+                .and_then(|v| v.as_u64()),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn dossier_report_serialization_includes_schema_and_cache_metrics() {
+        let report = DossierReport {
+            report_schema: DOSSIER_REPORT_SCHEMA.to_string(),
+            report_version: REPORT_VERSION_V1,
+            left_db: "left.sqlite".to_string(),
+            right_db: "right.sqlite".to_string(),
+            left_label: "left".to_string(),
+            right_label: "right".to_string(),
+            top_k: 15,
+            min_confidence: DossierConfidenceTier::Manual,
+            only_action: None,
+            left_folder_count: 2,
+            right_folder_count: 2,
+            archive_signal_candidates: 1,
+            archive_signal_ratio: 0.5,
+            cache_metrics: ReportCacheMetrics {
+                left_profile_cache: CacheUsageCounters { hits: 5, misses: 1 },
+                right_profile_cache: CacheUsageCounters { hits: 4, misses: 2 },
+            },
+            left_profile_cache: CacheUsageCounters { hits: 5, misses: 1 },
+            right_profile_cache: CacheUsageCounters { hits: 4, misses: 2 },
+            confidence_counts: DossierConfidenceCounts::default(),
+            candidates: Vec::new(),
+        };
+
+        let value = serde_json::to_value(&report).expect("serialize dossier report");
+        assert_eq!(
+            value.get("report_schema").and_then(|v| v.as_str()),
+            Some(DOSSIER_REPORT_SCHEMA)
+        );
+        assert_eq!(
+            value.get("report_version").and_then(|v| v.as_u64()),
+            Some(REPORT_VERSION_V1 as u64)
+        );
+        assert_eq!(
+            value.pointer("/cache_metrics/left_profile_cache/hits")
+                .and_then(|v| v.as_u64()),
+            Some(5)
+        );
+        assert_eq!(
+            value.pointer("/cache_metrics/right_profile_cache/misses")
+                .and_then(|v| v.as_u64()),
+            Some(2)
+        );
+    }
+
+    #[test]
     fn dossier_matching_respects_policy_filters_and_renamed_folders() {
         let policy = ExcludePolicy {
             directory_prefixes: vec!["noise".to_string()],
@@ -10301,6 +10709,7 @@ mod tests {
             None,
             "1m",
             Some("abcdef1234567890"),
+            None,
         );
         let b = infer_binary_descriptor(
             "firmware/bin/agent.sys",
@@ -10308,6 +10717,7 @@ mod tests {
             None,
             "1m",
             Some("abcdef1234567890"),
+            None,
         );
         let c = infer_binary_descriptor(
             "firmware/bin/agent.sys",
@@ -10315,10 +10725,40 @@ mod tests {
             None,
             "1m",
             Some("123456abcdef7890"),
+            None,
         );
         assert_eq!(a, "sys:1m:bin:abcdef1234");
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn binary_sample_signature_is_deterministic() -> Result<()> {
+        let root = temp_dir("binary_sample_deterministic");
+        fs::create_dir_all(&root)?;
+        let path = root.join("blob.bin");
+        let payload = (0..8192).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        fs::write(&path, payload)?;
+        let size = fs::metadata(&path)?.len();
+        let first = infer_binary_sample_signature_from_file(&path, size);
+        let second = infer_binary_sample_signature_from_file(&path, size);
+        assert!(first.is_some());
+        assert_eq!(first, second);
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn binary_sample_signature_respects_budget_limit() -> Result<()> {
+        let root = temp_dir("binary_sample_budget");
+        fs::create_dir_all(&root)?;
+        let path = root.join("huge.bin");
+        let oversized = BINARY_DESCRIPTOR_MAX_SAMPLE_FILE_BYTES + 1;
+        let file = File::create(&path)?;
+        file.set_len(oversized)?;
+        assert!(infer_binary_sample_signature_from_file(&path, oversized).is_none());
+        fs::remove_dir_all(root).ok();
+        Ok(())
     }
 
     #[test]
