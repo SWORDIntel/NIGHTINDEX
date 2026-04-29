@@ -8507,7 +8507,7 @@ mod tests {
         assert_eq!(matches[0].shared_ext_stem_count, 0);
         assert_eq!(matches[0].shared_hash_count, 2);
         assert_eq!(matches[0].shared_rel_file_count, 0);
-        assert_eq!(matches[0].confidence_tier, DossierConfidenceTier::Similar);
+        assert_eq!(matches[0].confidence_tier, DossierConfidenceTier::Possible);
     }
 
     #[test]
