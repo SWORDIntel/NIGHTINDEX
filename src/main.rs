@@ -175,6 +175,8 @@ enum Commands {
     ExtractCheck(ExtractCheckArgs),
     #[command(about = "Create a plan for missing file copy", alias = "plan")]
     PlanCopyMissing(PlanCopyMissingArgs),
+    #[command(about = "Build retry plan from resume state", alias = "resume")]
+    ResumePlan(ResumePlanArgs),
     ExecuteCopyMissing(ExecuteCopyMissingArgs),
     #[command(about = "Execute a previously generated copy plan", alias = "execute")]
     ExecutePlan(ExecutePlanArgs),
@@ -307,6 +309,16 @@ struct PlanCopyMissingArgs {
     #[arg(long)]
     policy: Option<PathBuf>,
     #[arg(long)]
+    out_json: PathBuf,
+}
+
+#[derive(Args)]
+struct ResumePlanArgs {
+    #[arg(long = "db")]
+    db: PathBuf,
+    #[arg(long = "session-id")]
+    session_id: Option<String>,
+    #[arg(long = "out-json")]
     out_json: PathBuf,
 }
 
@@ -928,6 +940,7 @@ fn main() -> Result<()> {
         Commands::Dossier(args) => dossier_command(args),
         Commands::ExtractCheck(args) => extract_check_command(args),
         Commands::PlanCopyMissing(args) => plan_copy_missing_command(args),
+        Commands::ResumePlan(args) => resume_plan_command(args),
         Commands::ExecuteCopyMissing(args) => execute_copy_missing_command(args),
         Commands::ExecutePlan(args) => execute_plan_command(args),
         Commands::SyncCopyMissing(args) => sync_copy_missing_command(args),
@@ -2156,6 +2169,104 @@ fn load_resume_pending_items(conn: &Connection, session_id: &str) -> Result<Vec<
         out.push(row?);
     }
     Ok(out)
+}
+
+#[derive(Debug)]
+struct ResumeSessionMeta {
+    session_id: String,
+    mode: String,
+    left_label: String,
+    right_label: String,
+}
+
+fn load_resume_session_meta(
+    conn: &Connection,
+    session_id: Option<&str>,
+) -> Result<Option<ResumeSessionMeta>> {
+    if let Some(session_id) = session_id {
+        return conn
+            .query_row(
+                "SELECT session_id, mode, left_label, right_label FROM copy_resume_sessions WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    Ok(ResumeSessionMeta {
+                        session_id: row.get(0)?,
+                        mode: row.get(1)?,
+                        left_label: row.get(2)?,
+                        right_label: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into);
+    }
+
+    conn.query_row(
+        "SELECT session_id, mode, left_label, right_label FROM copy_resume_sessions ORDER BY started_at DESC LIMIT 1",
+        [],
+        |row| {
+            Ok(ResumeSessionMeta {
+                session_id: row.get(0)?,
+                mode: row.get(1)?,
+                left_label: row.get(2)?,
+                right_label: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn build_resume_copy_plan(db: &Path, session_id: Option<&str>) -> Result<CopyPlan> {
+    let conn = open_db(db)?;
+    let Some(meta) = load_resume_session_meta(&conn, session_id)? else {
+        bail!("no resume session found");
+    };
+    let pending = load_resume_pending_items(&conn, &meta.session_id)?;
+    let mut items = Vec::new();
+    let mut bytes_to_copy = 0u64;
+    for rel_path in pending {
+        let from_files = conn
+            .query_row(
+                "SELECT file_type, size, mtime_ns, fast_hash FROM files WHERE label = ?1 AND rel_path = ?2",
+                params![&meta.left_label, &rel_path],
+                |row| {
+                    Ok(CopyPlanItem {
+                        rel_path: rel_path.clone(),
+                        file_type: row.get(0)?,
+                        size: row.get::<_, u64>(1)?,
+                        mtime_ns: row.get::<_, i64>(2)?,
+                        fast_hash: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        let item = from_files.unwrap_or_else(|| CopyPlanItem {
+            rel_path: rel_path.clone(),
+            file_type: "file".to_string(),
+            size: 0,
+            mtime_ns: 0,
+            fast_hash: None,
+        });
+        bytes_to_copy = bytes_to_copy.saturating_add(item.size);
+        items.push(item);
+    }
+
+    Ok(CopyPlan {
+        mode: meta.mode,
+        left_label: meta.left_label,
+        right_label: meta.right_label,
+        left_db: Some(db.display().to_string()),
+        right_db: None,
+        generated_at_ns: now_ns()?,
+        summary: CopyPlanSummary {
+            files_to_copy: items.len(),
+            bytes_to_copy,
+            left_files: items.len(),
+            right_files: 0,
+        },
+        items,
+    })
 }
 
 fn build_dossier_matches(
@@ -3427,6 +3538,19 @@ fn plan_copy_missing_command(args: PlanCopyMissingArgs) -> Result<()> {
         Some(&policy),
     )?;
 
+    if let Some(parent) = args.out_json.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(&plan)?;
+    std::fs::write(&args.out_json, format!("{json}\n"))
+        .with_context(|| format!("failed to write {}", args.out_json.display()))?;
+    println!("{json}");
+    Ok(())
+}
+
+fn resume_plan_command(args: ResumePlanArgs) -> Result<()> {
+    let plan = build_resume_copy_plan(&args.db, args.session_id.as_deref())?;
     if let Some(parent) = args.out_json.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -7142,6 +7266,68 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(status, "done");
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn build_resume_copy_plan_uses_latest_session() -> Result<()> {
+        let root = temp_dir("resume_plan");
+        let db = root.join("resume.sqlite");
+        let src = root.join("src");
+        let dst = root.join("dst");
+        fs::create_dir_all(&src)?;
+        fs::create_dir_all(&dst)?;
+        fs::write(src.join("a.bin"), b"abc")?;
+
+        let plan = CopyPlan {
+            mode: "copy-missing".to_string(),
+            left_label: "left".to_string(),
+            right_label: "right".to_string(),
+            left_db: Some(db.display().to_string()),
+            right_db: None,
+            generated_at_ns: 0,
+            summary: CopyPlanSummary {
+                files_to_copy: 1,
+                bytes_to_copy: 3,
+                left_files: 1,
+                right_files: 0,
+            },
+            items: vec![CopyPlanItem {
+                rel_path: "a.bin".to_string(),
+                file_type: "file".to_string(),
+                size: 3,
+                mtime_ns: 0,
+                fast_hash: None,
+            }],
+        };
+        let args = CopyRunArgs {
+            source_root: src.clone(),
+            destination_root: dst.clone(),
+            backup_dir: None,
+            overwrite: false,
+            dry_run: true,
+            stop_on_error: false,
+            log: None,
+            progress_every: 1000,
+            size_only: false,
+            hash: false,
+            copy_links_as_files: false,
+        };
+
+        let recorder = ResumeRecorder::start(&plan, &args, 1)?.expect("recorder");
+        let conn = open_db(&db)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO files(label, rel_path, file_type, size, mtime_ns, fast_hash, scanned_at) VALUES('left','a.bin','file',3,0,NULL,0)",
+            params![],
+        )?;
+        recorder.mark_status("a.bin", "failed", 0, Some("x"), true)?;
+        let resume_plan = build_resume_copy_plan(&db, Some(&recorder.session_id))?;
+        assert_eq!(resume_plan.items.len(), 1);
+        assert_eq!(resume_plan.items[0].rel_path, "a.bin");
+        assert_eq!(resume_plan.left_label, "left");
+        assert_eq!(resume_plan.right_label, "right");
 
         fs::remove_dir_all(root).ok();
         Ok(())

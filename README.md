@@ -169,6 +169,16 @@ nightindex logs \
   [--failures-only]
 ```
 
+`resume` (alias for `resume-plan`)  
+Build a retry plan from resume-state rows stored during prior copy runs.
+
+```bash
+nightindex resume \
+  --db <scan-or-copy.sqlite> \
+  [--session-id <session_id>] \
+  --out-json /tmp/resume-plan.json
+```
+
 `plan-copy-missing` (alias: `plan`)  
 Generate a deterministic copy plan for missing or changed files.
 
