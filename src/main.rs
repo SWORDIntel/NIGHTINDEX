@@ -188,6 +188,10 @@ enum Commands {
     SyncCopyMissing(SyncCopyMissingArgs),
     #[command(about = "Summarize NDJSON copy logs")]
     Logs(LogsArgs),
+    #[command(about = "Build merge materialization plan from dossier action CSV")]
+    MergePlan(MergePlanArgs),
+    #[command(about = "Apply a previously generated merge plan")]
+    MergeApply(MergeApplyArgs),
     #[command(
         name = "rclone",
         about = "Compatibility frontend for rclone-like command style",
@@ -438,6 +442,83 @@ struct LogsArgs {
     tail: usize,
     #[arg(long = "failures-only")]
     failures_only: bool,
+}
+
+#[derive(Args)]
+struct MergePlanArgs {
+    #[arg(long = "actions-csv")]
+    actions_csv: PathBuf,
+    #[arg(long = "imports-root")]
+    imports_root: PathBuf,
+    #[arg(long = "canonical-root")]
+    canonical_root: PathBuf,
+    #[arg(long = "policy", default_value_t = MergePolicy::Manual)]
+    policy: MergePolicy,
+    #[arg(long = "out-json")]
+    out_json: PathBuf,
+}
+
+#[derive(Args)]
+struct MergeApplyArgs {
+    #[arg(long)]
+    plan: PathBuf,
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+#[value(rename_all = "kebab-case")]
+enum MergePolicy {
+    PreferNewer,
+    PreferLarger,
+    KeepBoth,
+    Manual,
+}
+
+impl std::fmt::Display for MergePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::PreferNewer => "prefer-newer",
+            Self::PreferLarger => "prefer-larger",
+            Self::KeepBoth => "keep-both",
+            Self::Manual => "manual",
+        };
+        f.write_str(value)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MergePlan {
+    schema_version: u32,
+    generated_at_ns: i64,
+    policy: MergePolicy,
+    imports_root: String,
+    canonical_root: String,
+    items: Vec<MergePlanItem>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MergePlanItem {
+    left_folder: String,
+    right_folder: String,
+    source: String,
+    destination: String,
+    decision: String,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MergeActionCsvRow {
+    left_folder: String,
+    rank: usize,
+    right_folder: String,
+    confidence_tier: String,
+    next_action: String,
+    overlap_ratio: f64,
+    shared_hash_count: usize,
+    shared_normalized_file_name_count: usize,
+    shared_rel_file_count: usize,
 }
 
 #[derive(Args, Clone)]
@@ -979,6 +1060,8 @@ fn main() -> Result<()> {
         Commands::ExecutePlan(args) => execute_plan_command(args),
         Commands::SyncCopyMissing(args) => sync_copy_missing_command(args),
         Commands::Logs(args) => logs_command(args),
+        Commands::MergePlan(args) => merge_plan_command(args),
+        Commands::MergeApply(args) => merge_apply_command(args),
         Commands::Rclone(args) => compat_copy_command(args, "rclone"),
         Commands::Rsync(args) => compat_copy_command(args, "rsync"),
     }
@@ -1884,6 +1967,170 @@ fn logs_command(args: LogsArgs) -> Result<()> {
         failures
     );
 
+    Ok(())
+}
+
+fn parse_simple_csv_line(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        if ch == '"' {
+            if in_quotes && i + 1 < bytes.len() && bytes[i + 1] as char == '"' {
+                cur.push('"');
+                i += 2;
+                continue;
+            }
+            in_quotes = !in_quotes;
+            i += 1;
+            continue;
+        }
+        if ch == ',' && !in_quotes {
+            out.push(cur.clone());
+            cur.clear();
+            i += 1;
+            continue;
+        }
+        cur.push(ch);
+        i += 1;
+    }
+    out.push(cur);
+    out
+}
+
+fn parse_merge_actions_csv(path: &Path) -> Result<Vec<MergeActionCsvRow>> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let mut rows = Vec::new();
+    for (idx, line) in raw.lines().enumerate() {
+        if idx == 0 || line.trim().is_empty() {
+            continue;
+        }
+        let cols = parse_simple_csv_line(line);
+        if cols.len() < 9 {
+            continue;
+        }
+        rows.push(MergeActionCsvRow {
+            left_folder: cols[0].clone(),
+            rank: cols[1].parse().unwrap_or(0),
+            right_folder: cols[2].clone(),
+            confidence_tier: cols[3].clone(),
+            next_action: cols[4].clone(),
+            overlap_ratio: cols[5].parse().unwrap_or(0.0),
+            shared_hash_count: cols[6].parse().unwrap_or(0),
+            shared_normalized_file_name_count: cols[7].parse().unwrap_or(0),
+            shared_rel_file_count: cols[8].parse().unwrap_or(0),
+        });
+    }
+    Ok(rows)
+}
+
+fn merge_decision_for(row: &MergeActionCsvRow, policy: MergePolicy) -> (&'static str, String) {
+    if row.next_action.contains("manual") {
+        return ("manual", "dossier suggested manual review".to_string());
+    }
+    match policy {
+        MergePolicy::PreferNewer => ("apply", "prefer-newer policy".to_string()),
+        MergePolicy::PreferLarger => ("apply", "prefer-larger policy".to_string()),
+        MergePolicy::KeepBoth => ("keep_both", "keep-both policy".to_string()),
+        MergePolicy::Manual => ("manual", "manual policy".to_string()),
+    }
+}
+
+fn merge_plan_command(args: MergePlanArgs) -> Result<()> {
+    let rows = parse_merge_actions_csv(&args.actions_csv)?;
+    let mut items = Vec::new();
+    for row in rows {
+        if row.rank != 1 {
+            continue;
+        }
+        let source = args.imports_root.join(&row.left_folder);
+        let destination = args.canonical_root.join(&row.right_folder);
+        let (decision, reason) = merge_decision_for(&row, args.policy);
+        items.push(MergePlanItem {
+            left_folder: row.left_folder,
+            right_folder: row.right_folder,
+            source: source.display().to_string(),
+            destination: destination.display().to_string(),
+            decision: decision.to_string(),
+            reason,
+        });
+    }
+    items.sort_by(|a, b| a.left_folder.cmp(&b.left_folder).then(a.right_folder.cmp(&b.right_folder)));
+    let plan = MergePlan {
+        schema_version: 1,
+        generated_at_ns: now_ns()?,
+        policy: args.policy,
+        imports_root: args.imports_root.display().to_string(),
+        canonical_root: args.canonical_root.display().to_string(),
+        items,
+    };
+    if let Some(parent) = args.out_json.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(&plan)?;
+    std::fs::write(&args.out_json, format!("{json}\n"))
+        .with_context(|| format!("failed to write {}", args.out_json.display()))?;
+    println!("{json}");
+    Ok(())
+}
+
+fn merge_apply_command(args: MergeApplyArgs) -> Result<()> {
+    let raw = std::fs::read_to_string(&args.plan)
+        .with_context(|| format!("failed to read {}", args.plan.display()))?;
+    let plan: MergePlan = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", args.plan.display()))?;
+    let mut applied = 0usize;
+    let mut manual = 0usize;
+    let mut kept_both = 0usize;
+    for item in &plan.items {
+        match item.decision.as_str() {
+            "manual" => {
+                manual += 1;
+                continue;
+            }
+            "keep_both" => {
+                kept_both += 1;
+                if args.dry_run {
+                    continue;
+                }
+                let source = Path::new(&item.source);
+                let mut dest = PathBuf::from(&item.destination);
+                dest.set_extension("from_import");
+                if source.is_file() {
+                    if let Some(parent) = dest.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::copy(source, &dest)?;
+                    applied += 1;
+                }
+            }
+            _ => {
+                if args.dry_run {
+                    continue;
+                }
+                let source = Path::new(&item.source);
+                let dest = Path::new(&item.destination);
+                if source.is_file() {
+                    if let Some(parent) = dest.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::copy(source, dest)?;
+                    applied += 1;
+                } else if source.is_dir() {
+                    fs::create_dir_all(dest)?;
+                }
+            }
+        }
+    }
+    println!(
+        "{{\"applied\":{},\"manual\":{},\"kept_both\":{},\"dry_run\":{}}}",
+        applied, manual, kept_both, args.dry_run
+    );
     Ok(())
 }
 
@@ -7994,6 +8241,41 @@ mod tests {
         let stats = load_resume_session_stats(&conn, &recorder.session_id)?;
         assert_eq!(stats.done, 1);
         assert_eq!(stats.failed, 1);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn merge_plan_and_apply_dry_run_work() -> Result<()> {
+        let root = temp_dir("merge_plan_apply");
+        let imports = root.join("imports");
+        let canonical = root.join("canonical");
+        fs::create_dir_all(imports.join("A"))?;
+        fs::create_dir_all(canonical.join("010001"))?;
+        fs::write(imports.join("A/poc.bin"), b"abc")?;
+
+        let actions = root.join("actions.csv");
+        fs::write(
+            &actions,
+            concat!(
+                "left_folder,rank,right_folder,confidence_tier,next_action,overlap_ratio,shared_hash_count,shared_normalized_file_name_count,shared_rel_file_count\n",
+                "A,1,010001,similar,review and likely apply,0.77,3,2,2\n",
+            ),
+        )?;
+        let plan_path = root.join("merge-plan.json");
+        merge_plan_command(MergePlanArgs {
+            actions_csv: actions,
+            imports_root: imports.clone(),
+            canonical_root: canonical.clone(),
+            policy: MergePolicy::PreferNewer,
+            out_json: plan_path.clone(),
+        })?;
+        assert!(plan_path.exists());
+        merge_apply_command(MergeApplyArgs {
+            plan: plan_path,
+            dry_run: true,
+        })?;
 
         fs::remove_dir_all(root).ok();
         Ok(())

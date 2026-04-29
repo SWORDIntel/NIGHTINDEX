@@ -246,6 +246,22 @@ nightindex rclone \
   <source> <destination>
 ```
 
+`merge-plan` and `merge-apply`  
+Materialize merge actions from dossier action CSV into an executable merge plan.
+
+```bash
+nightindex merge-plan \
+  --actions-csv /tank/nightindex/probable_renamed_actions.csv \
+  --imports-root /tank/btrfs-recovery/BUGBOUNTY/_imports \
+  --canonical-root /tank/btrfs-recovery/BUGBOUNTY \
+  --policy prefer-newer \
+  --out-json /tmp/merge-plan.json
+
+nightindex merge-apply \
+  --plan /tmp/merge-plan.json \
+  [--dry-run]
+```
+
 Common mapped options:
 
 - `-n`, `--dry-run` → dry-run mode  
