@@ -12,8 +12,12 @@ use serde::{Deserialize, Serialize};
 use serde_yaml;
 use walkdir::WalkDir;
 
+mod archive_compare;
+mod binary_diff;
 mod copy_exec;
 
+use archive_compare::{ArchiveMemberRow as RecursiveArchiveRow, compare_archive_rows};
+use binary_diff::{BinaryDiffConfig, diff_files};
 use copy_exec::{CopyFinalizeOutcome, CopyStager};
 
 use copy_exec::{
@@ -161,6 +165,8 @@ const COMPARE_SUMMARY_REPORT_SCHEMA: &str = "nightindex.compare_summary";
 const DOSSIER_REPORT_SCHEMA: &str = "nightindex.dossier";
 const ARCHIVE_MEMBER_DIFF_REPORT_SCHEMA: &str = "nightindex.archive_member_diff";
 const ARCHIVE_MEMBER_PLAN_REPORT_SCHEMA: &str = "nightindex.archive_member_plan";
+const ARCHIVE_RECURSIVE_COMPARE_REPORT_SCHEMA: &str = "nightindex.archive_recursive_compare";
+const BINARY_DIFF_SUMMARY_REPORT_SCHEMA: &str = "nightindex.binary_diff_summary";
 const ARCHIVE_MEMBER_PLAN_ROW_SCHEMA: &str = "nightindex.archive_member_plan.row";
 const REPORT_VERSION_V1: u32 = 1;
 
@@ -236,6 +242,13 @@ enum Commands {
         alias = "amplan"
     )]
     ArchiveMemberPlan(ArchiveMemberPlanArgs),
+    #[command(about = "Read-only recursive archive overlap metrics", alias = "arcmp")]
+    ArchiveRecursiveCompare(ArchiveRecursiveCompareArgs),
+    #[command(
+        about = "Bounded binary similarity and digest summary",
+        alias = "bdiff"
+    )]
+    BinaryDiffSummary(BinaryDiffSummaryArgs),
     #[command(
         about = "Convert archive-member plan rows into a merge-apply plan",
         alias = "am2merge"
@@ -394,6 +407,36 @@ struct ArchiveMemberPlanArgs {
     out_json: Option<PathBuf>,
     #[arg(long)]
     out_csv: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct ArchiveRecursiveCompareArgs {
+    #[arg(long = "left-db")]
+    left_db: PathBuf,
+    #[arg(long = "right-db")]
+    right_db: PathBuf,
+    #[arg(long)]
+    left: String,
+    #[arg(long)]
+    right: String,
+    #[arg(long)]
+    out_json: Option<PathBuf>,
+    #[arg(long)]
+    out_csv: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct BinaryDiffSummaryArgs {
+    #[arg(long = "left-file")]
+    left_file: PathBuf,
+    #[arg(long = "right-file")]
+    right_file: PathBuf,
+    #[arg(long = "window-size", default_value_t = 4096)]
+    window_size: usize,
+    #[arg(long = "max-windows", default_value_t = 24)]
+    max_windows: usize,
+    #[arg(long)]
+    out_json: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -960,6 +1003,42 @@ struct ArchiveMemberPlanReport {
     rows: Vec<ArchiveMemberPlanRow>,
 }
 
+#[derive(Debug, Serialize)]
+struct ArchiveRecursiveCompareReport {
+    report_schema: String,
+    report_version: u32,
+    left_label: String,
+    right_label: String,
+    left_members: usize,
+    right_members: usize,
+    exact_overlap_score: f64,
+    nested_overlap_score: f64,
+    depth_weighted_overlap_score: f64,
+    exact_path_overlap_count: usize,
+    nested_path_overlap_count: usize,
+    path_payload_conflict_count: usize,
+    payload_family_only_overlap_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct BinaryDiffSummaryReport {
+    report_schema: String,
+    report_version: u32,
+    left_file: String,
+    right_file: String,
+    similarity: f64,
+    aligned_similarity: f64,
+    shifted_alignment_similarity: f64,
+    content_similarity: f64,
+    histogram_similarity: f64,
+    windows_compared: usize,
+    matching_aligned_windows: usize,
+    left_size: u64,
+    right_size: u64,
+    left_full_hash: String,
+    right_full_hash: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct CopyPlan {
     mode: String,
@@ -1373,6 +1452,8 @@ fn main() -> Result<()> {
         Commands::ArchiveMemberDiff(args) => archive_member_diff_command(args),
         Commands::ArchiveMemberPlan(args) => archive_member_plan_command(args),
         Commands::ArchiveMemberMergePlan(args) => archive_member_merge_plan_command(args),
+        Commands::ArchiveRecursiveCompare(args) => archive_recursive_compare_command(args),
+        Commands::BinaryDiffSummary(args) => binary_diff_summary_command(args),
         Commands::PlanCopyMissing(args) => plan_copy_missing_command(args),
         Commands::ResumePlan(args) => resume_plan_command(args),
         Commands::ExecuteCopyMissing(args) => execute_copy_missing_command(args),
@@ -2463,6 +2544,120 @@ fn archive_member_plan_command(args: ArchiveMemberPlanArgs) -> Result<()> {
     Ok(())
 }
 
+fn archive_recursive_compare_command(args: ArchiveRecursiveCompareArgs) -> Result<()> {
+    let left_conn = open_readonly_db(&args.left_db)?;
+    let right_conn = open_readonly_db(&args.right_db)?;
+    let left_rows = load_virtual_archive_entries(&left_conn, &args.left)?;
+    let right_rows = load_virtual_archive_entries(&right_conn, &args.right)?;
+    let left_members = left_rows.len();
+    let right_members = right_rows.len();
+
+    let left_cmp_rows: Vec<RecursiveArchiveRow> = left_rows
+        .into_iter()
+        .map(|row| RecursiveArchiveRow {
+            path: row.virtual_member,
+            depth: row.archive_depth,
+            payload_family: row.archive_family.unwrap_or_else(|| "unknown".to_string()),
+        })
+        .collect();
+    let right_cmp_rows: Vec<RecursiveArchiveRow> = right_rows
+        .into_iter()
+        .map(|row| RecursiveArchiveRow {
+            path: row.virtual_member,
+            depth: row.archive_depth,
+            payload_family: row.archive_family.unwrap_or_else(|| "unknown".to_string()),
+        })
+        .collect();
+
+    let compared = compare_archive_rows(left_cmp_rows, right_cmp_rows);
+    let report = ArchiveRecursiveCompareReport {
+        report_schema: ARCHIVE_RECURSIVE_COMPARE_REPORT_SCHEMA.to_string(),
+        report_version: REPORT_VERSION_V1,
+        left_label: args.left.clone(),
+        right_label: args.right.clone(),
+        left_members,
+        right_members,
+        exact_overlap_score: compared.scores.exact_overlap_score,
+        nested_overlap_score: compared.scores.nested_overlap_score,
+        depth_weighted_overlap_score: compared.scores.depth_weighted_overlap_score,
+        exact_path_overlap_count: compared.buckets.exact_path_overlap.len(),
+        nested_path_overlap_count: compared.buckets.nested_path_overlap.len(),
+        path_payload_conflict_count: compared.buckets.path_payload_conflict.len(),
+        payload_family_only_overlap_count: compared.buckets.payload_family_only_overlap.len(),
+    };
+
+    let json = serde_json::to_string_pretty(&report)?;
+    println!("{json}");
+    if let Some(path) = args.out_json {
+        std::fs::write(&path, format!("{json}\n"))
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    if let Some(path) = args.out_csv {
+        let csv = build_archive_recursive_compare_csv(&report);
+        std::fs::write(&path, csv)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    eprintln!(
+        "[archive-recursive-compare] scores exact={:.3} nested={:.3} depth_weighted={:.3}",
+        report.exact_overlap_score,
+        report.nested_overlap_score,
+        report.depth_weighted_overlap_score
+    );
+    Ok(())
+}
+
+fn binary_diff_summary_command(args: BinaryDiffSummaryArgs) -> Result<()> {
+    let result = diff_files(
+        &args.left_file,
+        &args.right_file,
+        BinaryDiffConfig {
+            window_size: args.window_size.max(256),
+            max_windows: args.max_windows.max(1),
+        },
+    )
+    .with_context(|| {
+        format!(
+            "failed to diff '{}' and '{}'",
+            args.left_file.display(),
+            args.right_file.display()
+        )
+    })?;
+
+    let report = BinaryDiffSummaryReport {
+        report_schema: BINARY_DIFF_SUMMARY_REPORT_SCHEMA.to_string(),
+        report_version: REPORT_VERSION_V1,
+        left_file: args.left_file.display().to_string(),
+        right_file: args.right_file.display().to_string(),
+        similarity: result.similarity,
+        aligned_similarity: result.aligned_similarity,
+        shifted_alignment_similarity: result.shifted_alignment_similarity,
+        content_similarity: result.content_similarity,
+        histogram_similarity: result.histogram_similarity,
+        windows_compared: result.windows_compared,
+        matching_aligned_windows: result.matching_aligned_windows,
+        left_size: result.left.size,
+        right_size: result.right.size,
+        left_full_hash: result.left.full_hash,
+        right_full_hash: result.right.full_hash,
+    };
+
+    let json = serde_json::to_string_pretty(&report)?;
+    println!("{json}");
+    if let Some(path) = args.out_json {
+        std::fs::write(&path, format!("{json}\n"))
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    eprintln!(
+        "[binary-diff-summary] similarity={:.3} aligned={:.3} shifted={:.3} windows={} matched={}",
+        report.similarity,
+        report.aligned_similarity,
+        report.shifted_alignment_similarity,
+        report.windows_compared,
+        report.matching_aligned_windows
+    );
+    Ok(())
+}
+
 fn archive_member_merge_plan_command(args: ArchiveMemberMergePlanArgs) -> Result<()> {
     let raw = std::fs::read_to_string(&args.archive_member_plan_json)
         .with_context(|| format!("failed to read {}", args.archive_member_plan_json.display()))?;
@@ -3108,6 +3303,31 @@ fn build_archive_member_plan_csv(report: &ArchiveMemberPlanReport) -> String {
             ),
         );
     }
+    csv
+}
+
+fn build_archive_recursive_compare_csv(report: &ArchiveRecursiveCompareReport) -> String {
+    let mut csv = String::new();
+    csv.push_str("report_schema,report_version,left_label,right_label,left_members,right_members,exact_overlap_score,nested_overlap_score,depth_weighted_overlap_score,exact_path_overlap_count,nested_path_overlap_count,path_payload_conflict_count,payload_family_only_overlap_count\n");
+    let _ = std::fmt::Write::write_fmt(
+        &mut csv,
+        format_args!(
+            "{},{},{},{},{},{},{:.6},{:.6},{:.6},{},{},{},{}\n",
+            csv_escape(&report.report_schema),
+            report.report_version,
+            csv_escape(&report.left_label),
+            csv_escape(&report.right_label),
+            report.left_members,
+            report.right_members,
+            report.exact_overlap_score,
+            report.nested_overlap_score,
+            report.depth_weighted_overlap_score,
+            report.exact_path_overlap_count,
+            report.nested_path_overlap_count,
+            report.path_payload_conflict_count,
+            report.payload_family_only_overlap_count
+        ),
+    );
     csv
 }
 
@@ -12908,6 +13128,78 @@ bad::::line
         assert!(csv.contains("schema_version,policy,imports_root"));
         assert!(csv.contains("apply"));
 
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn binary_diff_summary_command_emits_schema() -> Result<()> {
+        let root = temp_dir("binary_diff_summary_cmd");
+        let left = root.join("left.bin");
+        let right = root.join("right.bin");
+        fs::write(&left, b"ABCDEFGHIJ")?;
+        fs::write(&right, b"ABCDZZZZIJ")?;
+        let out_json = root.join("binary-diff.json");
+
+        binary_diff_summary_command(BinaryDiffSummaryArgs {
+            left_file: left,
+            right_file: right,
+            window_size: 256,
+            max_windows: 8,
+            out_json: Some(out_json.clone()),
+        })?;
+
+        let raw = fs::read_to_string(out_json)?;
+        assert!(raw.contains("\"report_schema\": \"nightindex.binary_diff_summary\""));
+        assert!(raw.contains("\"similarity\""));
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn archive_recursive_compare_command_emits_schema() -> Result<()> {
+        let root = temp_dir("archive_recursive_compare_cmd");
+        let left_root = root.join("left");
+        let right_root = root.join("right");
+        fs::create_dir_all(&left_root)?;
+        fs::create_dir_all(&right_root)?;
+        fs::write(left_root.join("a.tar.gz"), b"x")?;
+        fs::write(right_root.join("a.tar.gz"), b"x")?;
+
+        let left_db = root.join("left.sqlite");
+        let right_db = root.join("right.sqlite");
+        scan_command(ScanArgs {
+            db: left_db.clone(),
+            label: "left".to_string(),
+            root: left_root,
+            exclude_prefixes: vec![],
+            exclude_if_present: vec![],
+            policy: None,
+            hash: true,
+        })?;
+        scan_command(ScanArgs {
+            db: right_db.clone(),
+            label: "right".to_string(),
+            root: right_root,
+            exclude_prefixes: vec![],
+            exclude_if_present: vec![],
+            policy: None,
+            hash: true,
+        })?;
+
+        let out_json = root.join("archive-recursive.json");
+        archive_recursive_compare_command(ArchiveRecursiveCompareArgs {
+            left_db,
+            right_db,
+            left: "left".to_string(),
+            right: "right".to_string(),
+            out_json: Some(out_json.clone()),
+            out_csv: None,
+        })?;
+
+        let raw = fs::read_to_string(out_json)?;
+        assert!(raw.contains("\"report_schema\": \"nightindex.archive_recursive_compare\""));
+        assert!(raw.contains("\"nested_overlap_score\""));
         fs::remove_dir_all(root).ok();
         Ok(())
     }

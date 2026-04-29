@@ -493,6 +493,31 @@ Each execute/sync run prints one final summary JSON object with:
 
 ## Roadmap (next phases)
 
+- Upcoming command surfaces (operator planning, not yet wired):
+  - `binary-diff-summary`: fast binary descriptor/delta summary output for rename/noise-heavy payload sets.
+  - `archive-recursive-compare`: recursive cross-archive compare with nested payload reporting.
+  - `merge-apply` policy tuning knobs: `prefer-newer`, `prefer-larger`, `keep-both`, `manual`, with
+    non-destructive conflict labeling retained in run summaries.
+
+Operator-facing prep examples (for runbooks/checklists while wiring lands):
+
+```bash
+# Binary-diff summaries (planned): reserve report path and parse as read-only summary data.
+# nightindex binary-diff-summary --left-db <left.sqlite> --right-db <right.sqlite> ...
+
+# Archive-recursive compare v2 metrics (planned): track totals by depth/family for regressions.
+# nightindex archive-recursive-compare --left-db <left.sqlite> --right-db <right.sqlite> ...
+
+# Merge execution policy tuning (available now on merge-plan/merge-apply pipelines):
+nightindex merge-plan \
+  --actions-csv /tank/nightindex/actions.csv \
+  --imports-root /tank/recovery/_imports \
+  --canonical-root /tank/recovery \
+  --policy prefer-newer \
+  --out-json /tmp/merge-plan.json
+nightindex merge-apply --plan /tmp/merge-plan.json --dry-run
+```
+
 - Binary diffing: add fast, content-derived binary descriptors and delta-oriented comparison signals to improve same-family file decisions where names/hashes drift.
 - Archive-recursive compare: extend archive-aware matching from member-level diff into recursive cross-archive compare/reporting for nested payload trees.
 - Persistent fingerprint DB expansion: broaden cached fingerprint schema and reuse coverage (binary/text/archive signals, richer invalidation/stats) for faster re-scans and stronger dossier/merge confidence.
