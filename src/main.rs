@@ -702,6 +702,8 @@ struct CompareSummary {
 
 #[derive(Debug, Serialize)]
 struct BriefSummary {
+    report_schema: String,
+    report_version: u32,
     left_label: String,
     right_label: String,
     left_files: usize,
@@ -752,6 +754,8 @@ struct ExtractCheckMatch {
 
 #[derive(Debug, Serialize)]
 struct ExtractCheckReport {
+    report_schema: String,
+    report_version: u32,
     left_label: String,
     right_label: String,
     left_archive_count: usize,
@@ -1649,6 +1653,8 @@ fn brief_command(args: BriefArgs) -> Result<()> {
         estimate_copy_eta(prior_sample.as_ref(), bytes_to_copy);
 
     let brief = BriefSummary {
+        report_schema: "nightindex.brief".to_string(),
+        report_version: 1,
         left_label: summary.left_label,
         right_label: summary.right_label,
         left_files: summary.left_files,
@@ -1796,6 +1802,8 @@ fn extract_check_command(args: ExtractCheckArgs) -> Result<()> {
     let right_only_folders = build_unique_folders(&unmatched_right_only);
 
     let report = ExtractCheckReport {
+        report_schema: "nightindex.extract_check".to_string(),
+        report_version: 1,
         left_label: args.left,
         right_label: args.right,
         left_archive_count: left_map.len(),
@@ -2495,6 +2503,8 @@ fn logs_command(args: LogsArgs) -> Result<()> {
 
 #[derive(Debug, Serialize)]
 struct StatusReport {
+    report_schema: String,
+    report_version: u32,
     labels: usize,
     resume_sessions: usize,
     recent_copy_runs: usize,
@@ -2541,6 +2551,8 @@ fn status_command(args: StatusArgs) -> Result<()> {
         .optional()?
         .flatten();
     let report = StatusReport {
+        report_schema: "nightindex.status".to_string(),
+        report_version: 1,
         labels: labels.max(0) as usize,
         resume_sessions: sessions.max(0) as usize,
         recent_copy_runs: recent_runs.max(0) as usize,
