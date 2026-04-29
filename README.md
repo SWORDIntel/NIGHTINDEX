@@ -177,6 +177,7 @@ nightindex resume \
   --db <scan-or-copy.sqlite> \
   [--list-sessions] \
   [--stats --session-id <session_id>] \
+  [--prune-completed --session-id <session_id>] \
   [--session-id <session_id>] \
   [--only-failed] \
   [--max-attempts <N>] \

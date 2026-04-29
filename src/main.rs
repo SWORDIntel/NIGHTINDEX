@@ -320,6 +320,8 @@ struct ResumePlanArgs {
     list_sessions: bool,
     #[arg(long = "stats")]
     stats: bool,
+    #[arg(long = "prune-completed")]
+    prune_completed: bool,
     #[arg(long = "session-id")]
     session_id: Option<String>,
     #[arg(long = "only-failed")]
@@ -2246,6 +2248,12 @@ struct ResumeSessionStats {
     planned: usize,
 }
 
+#[derive(Debug, Serialize)]
+struct ResumePruneResult {
+    scope: String,
+    deleted_rows: usize,
+}
+
 fn load_resume_session_meta(
     conn: &Connection,
     session_id: Option<&str>,
@@ -2341,6 +2349,32 @@ fn load_resume_session_stats(conn: &Connection, session_id: &str) -> Result<Resu
         }
     }
     Ok(stats)
+}
+
+fn prune_resume_completed_rows(
+    conn: &Connection,
+    session_id: Option<&str>,
+) -> Result<ResumePruneResult> {
+    let (scope, deleted_rows) = if let Some(session_id) = session_id {
+        let changed = conn.execute(
+            "DELETE FROM copy_resume_items
+             WHERE session_id = ?1
+               AND status IN ('done', 'skipped_existing', 'skipped_conflict')",
+            params![session_id],
+        )?;
+        (format!("session:{session_id}"), changed)
+    } else {
+        let changed = conn.execute(
+            "DELETE FROM copy_resume_items
+             WHERE status IN ('done', 'skipped_existing', 'skipped_conflict')",
+            [],
+        )?;
+        ("all".to_string(), changed)
+    };
+    Ok(ResumePruneResult {
+        scope,
+        deleted_rows,
+    })
 }
 
 fn build_resume_copy_plan(
@@ -3682,6 +3716,12 @@ fn plan_copy_missing_command(args: PlanCopyMissingArgs) -> Result<()> {
 
 fn resume_plan_command(args: ResumePlanArgs) -> Result<()> {
     let conn = open_db(&args.db)?;
+    if args.prune_completed {
+        let result = prune_resume_completed_rows(&conn, args.session_id.as_deref())?;
+        let json = serde_json::to_string_pretty(&result)?;
+        println!("{json}");
+        return Ok(());
+    }
     if args.list_sessions {
         let list = list_resume_sessions(&conn)?;
         let json = serde_json::to_string_pretty(&list)?;
@@ -7583,6 +7623,7 @@ mod tests {
             db: db.clone(),
             list_sessions: false,
             stats: false,
+            prune_completed: false,
             session_id: Some(recorder.session_id),
             only_failed: false,
             max_attempts: None,
@@ -7648,6 +7689,60 @@ mod tests {
         assert!(!sessions.is_empty());
         let stats = load_resume_session_stats(&conn, &recorder.session_id)?;
         assert_eq!(stats.failed, 1);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn resume_prune_completed_removes_done_and_skipped_rows() -> Result<()> {
+        let root = temp_dir("resume_prune");
+        let db = root.join("resume.sqlite");
+        let src = root.join("src");
+        let dst = root.join("dst");
+        fs::create_dir_all(&src)?;
+        fs::create_dir_all(&dst)?;
+
+        let plan = CopyPlan {
+            mode: "copy-missing".to_string(),
+            left_label: "left".to_string(),
+            right_label: "right".to_string(),
+            left_db: Some(db.display().to_string()),
+            right_db: None,
+            generated_at_ns: 0,
+            summary: CopyPlanSummary {
+                files_to_copy: 3,
+                bytes_to_copy: 3,
+                left_files: 3,
+                right_files: 0,
+            },
+            items: vec![],
+        };
+        let args = CopyRunArgs {
+            source_root: src,
+            destination_root: dst,
+            backup_dir: None,
+            overwrite: false,
+            dry_run: false,
+            stop_on_error: false,
+            log: None,
+            progress_every: 1000,
+            size_only: false,
+            hash: false,
+            copy_links_as_files: false,
+        };
+        let recorder = ResumeRecorder::start(&plan, &args, 3)?.expect("recorder");
+        recorder.mark_status("a.bin", "done", 1, None, true)?;
+        recorder.mark_status("b.bin", "skipped_existing", 0, None, true)?;
+        recorder.mark_status("c.bin", "failed", 0, Some("x"), true)?;
+
+        let conn = open_db(&db)?;
+        let result = prune_resume_completed_rows(&conn, Some(&recorder.session_id))?;
+        assert_eq!(result.deleted_rows, 2);
+        let stats = load_resume_session_stats(&conn, &recorder.session_id)?;
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.done, 0);
+        assert_eq!(stats.skipped_existing, 0);
 
         fs::remove_dir_all(root).ok();
         Ok(())
