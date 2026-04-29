@@ -1061,6 +1061,9 @@ struct ArchiveRecursiveCompareReport {
     nested_path_overlap_count: usize,
     path_payload_conflict_count: usize,
     payload_family_only_overlap_count: usize,
+    max_bucket_items: usize,
+    bucket_output_truncated: bool,
+    quality_band: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2634,6 +2637,22 @@ fn archive_recursive_compare_command(args: ArchiveRecursiveCompareArgs) -> Resul
 
     let compared =
         compare_archive_rows_with_cap(left_cmp_rows, right_cmp_rows, args.max_bucket_items.max(1));
+    let bucket_output_truncated = compared.buckets.exact_path_overlap.len()
+        < compared.buckets.exact_path_overlap_total
+        || compared.buckets.nested_path_overlap.len() < compared.buckets.nested_path_overlap_total
+        || compared.buckets.path_payload_conflict.len()
+            < compared.buckets.path_payload_conflict_total
+        || compared.buckets.payload_family_only_overlap.len()
+            < compared.buckets.payload_family_only_overlap_total;
+    let quality_band = if compared.scores.nested_overlap_score >= 0.85
+        && compared.scores.depth_weighted_overlap_score >= 0.8
+    {
+        "high"
+    } else if compared.scores.nested_overlap_score >= 0.6 {
+        "medium"
+    } else {
+        "low"
+    };
     let report = ArchiveRecursiveCompareReport {
         report_schema: ARCHIVE_RECURSIVE_COMPARE_REPORT_SCHEMA.to_string(),
         report_version: REPORT_VERSION_V1,
@@ -2648,6 +2667,9 @@ fn archive_recursive_compare_command(args: ArchiveRecursiveCompareArgs) -> Resul
         nested_path_overlap_count: compared.buckets.nested_path_overlap_total,
         path_payload_conflict_count: compared.buckets.path_payload_conflict_total,
         payload_family_only_overlap_count: compared.buckets.payload_family_only_overlap_total,
+        max_bucket_items: args.max_bucket_items.max(1),
+        bucket_output_truncated,
+        quality_band: quality_band.to_string(),
     };
 
     let json = serde_json::to_string_pretty(&report)?;
@@ -2674,10 +2696,12 @@ fn archive_recursive_compare_command(args: ArchiveRecursiveCompareArgs) -> Resul
         )?;
     }
     eprintln!(
-        "[archive-recursive-compare] scores exact={:.3} nested={:.3} depth_weighted={:.3}",
+        "[archive-recursive-compare] scores exact={:.3} nested={:.3} depth_weighted={:.3} quality={} truncated={}",
         report.exact_overlap_score,
         report.nested_overlap_score,
-        report.depth_weighted_overlap_score
+        report.depth_weighted_overlap_score,
+        report.quality_band,
+        report.bucket_output_truncated
     );
     Ok(())
 }
@@ -3396,11 +3420,11 @@ fn build_archive_member_plan_csv(report: &ArchiveMemberPlanReport) -> String {
 
 fn build_archive_recursive_compare_csv(report: &ArchiveRecursiveCompareReport) -> String {
     let mut csv = String::new();
-    csv.push_str("report_schema,report_version,left_label,right_label,left_members,right_members,exact_overlap_score,nested_overlap_score,depth_weighted_overlap_score,exact_path_overlap_count,nested_path_overlap_count,path_payload_conflict_count,payload_family_only_overlap_count\n");
+    csv.push_str("report_schema,report_version,left_label,right_label,left_members,right_members,exact_overlap_score,nested_overlap_score,depth_weighted_overlap_score,exact_path_overlap_count,nested_path_overlap_count,path_payload_conflict_count,payload_family_only_overlap_count,max_bucket_items,bucket_output_truncated,quality_band\n");
     let _ = std::fmt::Write::write_fmt(
         &mut csv,
         format_args!(
-            "{},{},{},{},{},{},{:.6},{:.6},{:.6},{},{},{},{}\n",
+            "{},{},{},{},{},{},{:.6},{:.6},{:.6},{},{},{},{},{},{},{}\n",
             csv_escape(&report.report_schema),
             report.report_version,
             csv_escape(&report.left_label),
@@ -3413,7 +3437,10 @@ fn build_archive_recursive_compare_csv(report: &ArchiveRecursiveCompareReport) -
             report.exact_path_overlap_count,
             report.nested_path_overlap_count,
             report.path_payload_conflict_count,
-            report.payload_family_only_overlap_count
+            report.payload_family_only_overlap_count,
+            report.max_bucket_items,
+            report.bucket_output_truncated,
+            csv_escape(&report.quality_band)
         ),
     );
     csv
