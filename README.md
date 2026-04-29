@@ -27,6 +27,21 @@ Alias map:
 - `execute-copy-missing` also has the `execute` alias.
 - `extract-check` also has the `extcheck` alias.
 
+## Progress Snapshot (2026-04-29)
+
+Implemented and shipping on the active branch:
+- Resume workflow: `resume`/`resume-plan`, direct execute, session listing/stats, filtered retries,
+  prune/vacuum maintenance, JSONL export.
+- Dossier workflow: confidence tiers, action filtering, archive-signal coverage metrics.
+- Compatibility workflow: `ndex rsync ...` and `ndex rclone ...` frontends with mapped flag support.
+- Ops visibility: `status` command for DB/run health summary, richer `logs` error-class summaries.
+- Merge workflow baseline: `merge-plan` + `merge-apply` command set.
+
+In progress:
+- `merge-apply` hardening for recursive directory materialization, deterministic `keep-both` target
+  naming, and richer apply summary counters.
+- Persistent compare-signature caching for faster repeated deep compares.
+
 ## Recommended recovery use-case
 
 Example for your scenario: copy from NVMe backup source to `/tank/btrfs-recovery/BUGBOUNTY`, while

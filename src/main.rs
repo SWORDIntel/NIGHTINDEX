@@ -2212,6 +2212,10 @@ fn merge_apply_command(args: MergeApplyArgs) -> Result<()> {
     let mut applied = 0usize;
     let mut manual = 0usize;
     let mut kept_both = 0usize;
+    let mut skipped_existing = 0usize;
+    let mut conflicts = 0usize;
+    let mut failed = 0usize;
+    let mut renamed_targets = 0usize;
     for item in &plan.items {
         match item.decision.as_str() {
             "manual" => {
@@ -2220,42 +2224,181 @@ fn merge_apply_command(args: MergeApplyArgs) -> Result<()> {
             }
             "keep_both" => {
                 kept_both += 1;
-                if args.dry_run {
+                let source = Path::new(&item.source);
+                let destination = Path::new(&item.destination);
+                if !source.exists() {
+                    failed += 1;
                     continue;
                 }
-                let source = Path::new(&item.source);
-                let mut dest = PathBuf::from(&item.destination);
-                dest.set_extension("from_import");
                 if source.is_file() {
-                    if let Some(parent) = dest.parent() {
+                    let target = unique_keep_both_path(destination);
+                    renamed_targets += 1;
+                    if args.dry_run {
+                        applied += 1;
+                        continue;
+                    }
+                    if let Some(parent) = target.parent() {
                         fs::create_dir_all(parent)?;
                     }
-                    fs::copy(source, &dest)?;
+                    fs::copy(source, &target)?;
                     applied += 1;
+                } else if source.is_dir() {
+                    let target = unique_keep_both_path(destination);
+                    renamed_targets += 1;
+                    if args.dry_run {
+                        applied += 1;
+                        continue;
+                    }
+                    copy_directory_tree(source, &target, false, &mut skipped_existing, &mut conflicts)?;
+                    applied += 1;
+                } else {
+                    failed += 1;
                 }
             }
             _ => {
-                if args.dry_run {
-                    continue;
-                }
                 let source = Path::new(&item.source);
                 let dest = Path::new(&item.destination);
+                if !source.exists() {
+                    failed += 1;
+                    continue;
+                }
                 if source.is_file() {
+                    if destination_entry_same(source, dest)? {
+                        skipped_existing += 1;
+                        continue;
+                    }
+                    if args.dry_run {
+                        applied += 1;
+                        continue;
+                    }
                     if let Some(parent) = dest.parent() {
                         fs::create_dir_all(parent)?;
+                    }
+                    if dest.exists() {
+                        remove_destination_entry(dest)?;
                     }
                     fs::copy(source, dest)?;
                     applied += 1;
                 } else if source.is_dir() {
-                    fs::create_dir_all(dest)?;
+                    if args.dry_run {
+                        applied += 1;
+                        continue;
+                    }
+                    copy_directory_tree(source, dest, true, &mut skipped_existing, &mut conflicts)?;
+                    applied += 1;
+                } else {
+                    failed += 1;
                 }
             }
         }
     }
     println!(
-        "{{\"applied\":{},\"manual\":{},\"kept_both\":{},\"dry_run\":{}}}",
-        applied, manual, kept_both, args.dry_run
+        "{{\"applied\":{},\"manual\":{},\"kept_both\":{},\"skipped_existing\":{},\"conflicts\":{},\"failed\":{},\"renamed_targets\":{},\"dry_run\":{},\"policy\":\"{}\"}}",
+        applied, manual, kept_both, skipped_existing, conflicts, failed, renamed_targets, args.dry_run, plan.policy
     );
+    Ok(())
+}
+
+fn unique_keep_both_path(base: &Path) -> PathBuf {
+    let mut candidate = PathBuf::from(format!("{}.from_import", base.display()));
+    if !candidate.exists() {
+        return candidate;
+    }
+    for idx in 1..=9_999usize {
+        candidate = PathBuf::from(format!("{}.from_import.{idx}", base.display()));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    PathBuf::from(format!("{}.from_import.fallback", base.display()))
+}
+
+fn destination_entry_same(source: &Path, destination: &Path) -> Result<bool> {
+    if !destination.exists() {
+        return Ok(false);
+    }
+    let source_meta = fs::symlink_metadata(source)
+        .with_context(|| format!("failed to stat {}", source.display()))?;
+    let dest_meta = fs::symlink_metadata(destination)
+        .with_context(|| format!("failed to stat {}", destination.display()))?;
+    if source_meta.is_file() && dest_meta.is_file() {
+        if source_meta.len() != dest_meta.len() {
+            return Ok(false);
+        }
+        let source_hash = blake3_file(source)?;
+        let dest_hash = blake3_file(destination)?;
+        return Ok(source_hash == dest_hash);
+    }
+    Ok(false)
+}
+
+fn remove_destination_entry(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to stat {}", path.display()))?;
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))?;
+    } else if metadata.is_dir() {
+        fs::remove_dir_all(path).with_context(|| format!("failed to remove {}", path.display()))?;
+    } else {
+        fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn copy_directory_tree(
+    source_root: &Path,
+    destination_root: &Path,
+    overwrite: bool,
+    skipped_existing: &mut usize,
+    conflicts: &mut usize,
+) -> Result<()> {
+    fs::create_dir_all(destination_root)
+        .with_context(|| format!("failed to create {}", destination_root.display()))?;
+    for entry in WalkDir::new(source_root).into_iter().filter_map(Result::ok) {
+        let path = entry.path();
+        let rel = match path.strip_prefix(source_root) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let destination = destination_root.join(rel);
+        let file_type = entry.file_type();
+        if file_type.is_dir() {
+            fs::create_dir_all(&destination)
+                .with_context(|| format!("failed to create {}", destination.display()))?;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        if destination_entry_same(path, &destination)? {
+            *skipped_existing += 1;
+            continue;
+        }
+        if destination.exists() && !overwrite {
+            *conflicts += 1;
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        if destination.exists() {
+            remove_destination_entry(&destination)?;
+        }
+        fs::copy(path, &destination).with_context(|| {
+            format!(
+                "failed to copy {} -> {}",
+                path.display(),
+                destination.display()
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -8404,6 +8547,58 @@ mod tests {
             dry_run: true,
         })?;
 
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn merge_apply_materializes_directory_and_keep_both_variant() -> Result<()> {
+        let root = temp_dir("merge_apply_materialize");
+        let imports = root.join("imports");
+        let canonical = root.join("canonical");
+        fs::create_dir_all(imports.join("A/sub"))?;
+        fs::create_dir_all(canonical.join("010001/sub"))?;
+        fs::write(imports.join("A/sub/poc.bin"), b"abc")?;
+        fs::write(canonical.join("010001/sub/poc.bin"), b"old")?;
+
+        let actions = root.join("actions.csv");
+        fs::write(
+            &actions,
+            concat!(
+                "left_folder,rank,right_folder,confidence_tier,next_action,overlap_ratio,shared_hash_count,shared_normalized_file_name_count,shared_rel_file_count\n",
+                "A,1,010001,similar,review and likely apply,0.77,3,2,2\n",
+            ),
+        )?;
+        let apply_plan = root.join("apply-plan.json");
+        merge_plan_command(MergePlanArgs {
+            actions_csv: actions.clone(),
+            imports_root: imports.clone(),
+            canonical_root: canonical.clone(),
+            policy: MergePolicy::PreferNewer,
+            out_json: apply_plan.clone(),
+        })?;
+        merge_apply_command(MergeApplyArgs {
+            plan: apply_plan,
+            dry_run: false,
+        })?;
+        assert_eq!(fs::read(canonical.join("010001/sub/poc.bin"))?, b"abc");
+
+        let keep_both_plan = root.join("keep-both-plan.json");
+        merge_plan_command(MergePlanArgs {
+            actions_csv: actions,
+            imports_root: imports.clone(),
+            canonical_root: canonical.clone(),
+            policy: MergePolicy::KeepBoth,
+            out_json: keep_both_plan.clone(),
+        })?;
+        merge_apply_command(MergeApplyArgs {
+            plan: keep_both_plan,
+            dry_run: false,
+        })?;
+
+        let keep_both_path = canonical.join("010001.from_import/sub/poc.bin");
+        assert!(keep_both_path.exists());
+        assert_eq!(fs::read(keep_both_path)?, b"abc");
         fs::remove_dir_all(root).ok();
         Ok(())
     }
