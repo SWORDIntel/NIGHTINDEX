@@ -369,8 +369,16 @@ nightindex merge-plan \
 
 nightindex merge-apply \
   --plan /tmp/merge-plan.json \
-  [--dry-run]
+  [--dry-run] \
+  [--only-decision apply|keep_both|manual] \
+  [--max-items N] \
+  [--apply-manual]
 ```
+
+`merge-apply` tuning knobs:
+- `--only-decision <apply|keep_both|manual>`: run only selected decision class from the plan.
+- `--max-items <N>`: cap processed items for bounded batch runs.
+- `--apply-manual`: execute manual items as apply semantics (use with dry-run first).
 
 Common mapped options:
 

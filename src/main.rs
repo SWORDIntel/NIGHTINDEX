@@ -657,6 +657,12 @@ struct MergeApplyArgs {
     plan: PathBuf,
     #[arg(long)]
     dry_run: bool,
+    #[arg(long = "only-decision")]
+    only_decision: Option<String>,
+    #[arg(long = "max-items")]
+    max_items: Option<usize>,
+    #[arg(long = "apply-manual")]
+    apply_manual: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
@@ -3965,9 +3971,78 @@ fn merge_apply_command(args: MergeApplyArgs) -> Result<()> {
     let mut conflicts = 0usize;
     let mut failed = 0usize;
     let mut renamed_targets = 0usize;
+    let mut skipped_by_filter = 0usize;
+    let mut skipped_by_limit = 0usize;
+    let mut selected_items = 0usize;
+    let only_decision = args.only_decision.as_deref().map(str::trim);
+    if let Some(decision) = only_decision {
+        if decision != "apply" && decision != "keep_both" && decision != "manual" {
+            bail!(
+                "invalid --only-decision '{}': expected apply|keep_both|manual",
+                decision
+            );
+        }
+    }
+
     for item in &plan.items {
+        if let Some(decision) = only_decision
+            && item.decision != decision
+        {
+            skipped_by_filter += 1;
+            continue;
+        }
+        if let Some(max_items) = args.max_items
+            && selected_items >= max_items
+        {
+            skipped_by_limit += 1;
+            continue;
+        }
+        selected_items += 1;
+
         match item.decision.as_str() {
             "manual" => {
+                if args.apply_manual {
+                    let source = Path::new(&item.source);
+                    let dest = Path::new(&item.destination);
+                    if !source.exists() {
+                        failed += 1;
+                        continue;
+                    }
+                    if source.is_file() {
+                        if destination_entry_same(source, dest)? {
+                            skipped_existing += 1;
+                            continue;
+                        }
+                        if args.dry_run {
+                            applied += 1;
+                            continue;
+                        }
+                        if let Some(parent) = dest.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        if dest.exists() {
+                            remove_destination_entry(dest)?;
+                        }
+                        fs::copy(source, dest)?;
+                        applied += 1;
+                    } else if source.is_dir() {
+                        if args.dry_run {
+                            applied += 1;
+                            continue;
+                        }
+                        copy_directory_tree(
+                            source,
+                            dest,
+                            true,
+                            &mut skipped_existing,
+                            &mut conflicts,
+                        )?;
+                        applied += 1;
+                    } else {
+                        failed += 1;
+                    }
+                    continue;
+                }
                 manual += 1;
                 continue;
             }
@@ -4048,7 +4123,7 @@ fn merge_apply_command(args: MergeApplyArgs) -> Result<()> {
         }
     }
     println!(
-        "{{\"applied\":{},\"manual\":{},\"kept_both\":{},\"skipped_existing\":{},\"conflicts\":{},\"failed\":{},\"renamed_targets\":{},\"dry_run\":{},\"policy\":\"{}\",\"planned_items\":{},\"plan_apply_items\":{},\"plan_keep_both_items\":{},\"plan_manual_items\":{},\"conflicts_label\":\"destination_exists_skip_without_overwrite\",\"conflicts_non_destructive\":true}}",
+        "{{\"applied\":{},\"manual\":{},\"kept_both\":{},\"skipped_existing\":{},\"conflicts\":{},\"failed\":{},\"renamed_targets\":{},\"skipped_by_filter\":{},\"skipped_by_limit\":{},\"selected_items\":{},\"dry_run\":{},\"policy\":\"{}\",\"planned_items\":{},\"plan_apply_items\":{},\"plan_keep_both_items\":{},\"plan_manual_items\":{},\"conflicts_label\":\"destination_exists_skip_without_overwrite\",\"conflicts_non_destructive\":true}}",
         applied,
         manual,
         kept_both,
@@ -4056,6 +4131,9 @@ fn merge_apply_command(args: MergeApplyArgs) -> Result<()> {
         conflicts,
         failed,
         renamed_targets,
+        skipped_by_filter,
+        skipped_by_limit,
+        selected_items,
         args.dry_run,
         plan.policy,
         plan.summary.total_items,
@@ -11179,6 +11257,9 @@ mod tests {
         merge_apply_command(MergeApplyArgs {
             plan: plan_path,
             dry_run: true,
+            only_decision: None,
+            max_items: None,
+            apply_manual: false,
         })?;
 
         fs::remove_dir_all(root).ok();
@@ -11217,6 +11298,9 @@ mod tests {
         merge_apply_command(MergeApplyArgs {
             plan: apply_plan,
             dry_run: false,
+            only_decision: None,
+            max_items: None,
+            apply_manual: false,
         })?;
         assert_eq!(fs::read(canonical.join("010001/sub/poc.bin"))?, b"abc");
 
@@ -11234,6 +11318,9 @@ mod tests {
         merge_apply_command(MergeApplyArgs {
             plan: keep_both_plan,
             dry_run: false,
+            only_decision: None,
+            max_items: None,
+            apply_manual: false,
         })?;
 
         let keep_both_path = canonical.join("010001.from_import/sub/poc.bin");
@@ -11276,8 +11363,80 @@ mod tests {
         merge_apply_command(MergeApplyArgs {
             plan,
             dry_run: false,
+            only_decision: None,
+            max_items: None,
+            apply_manual: false,
         })?;
         assert_eq!(fs::read(canonical.join("010001/poc.bin"))?, b"abc");
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn merge_apply_supports_filters_and_manual_override() -> Result<()> {
+        let root = temp_dir("merge_apply_filters");
+        let imports = root.join("imports");
+        let canonical = root.join("canonical");
+        fs::create_dir_all(imports.join("A"))?;
+        fs::create_dir_all(imports.join("B"))?;
+        fs::create_dir_all(canonical.join("010001"))?;
+        fs::create_dir_all(canonical.join("010002"))?;
+        fs::write(imports.join("A/poc.bin"), b"abc")?;
+        fs::write(imports.join("B/poc.bin"), b"xyz")?;
+
+        let plan = root.join("plan.json");
+        fs::write(
+            &plan,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "schema_version": 1,
+                    "generated_at_ns": now_ns()?,
+                    "policy": "manual",
+                    "imports_root": imports.display().to_string(),
+                    "canonical_root": canonical.display().to_string(),
+                    "summary": {"total_items": 2, "apply_items": 0, "keep_both_items": 0, "manual_items": 2},
+                    "items": [
+                        {
+                            "left_folder": "A",
+                            "right_folder": "010001",
+                            "source": imports.join("A/poc.bin").display().to_string(),
+                            "destination": canonical.join("010001/poc.bin").display().to_string(),
+                            "decision": "manual",
+                            "reason": "review"
+                        },
+                        {
+                            "left_folder": "B",
+                            "right_folder": "010002",
+                            "source": imports.join("B/poc.bin").display().to_string(),
+                            "destination": canonical.join("010002/poc.bin").display().to_string(),
+                            "decision": "manual",
+                            "reason": "review"
+                        }
+                    ]
+                })
+            ),
+        )?;
+
+        merge_apply_command(MergeApplyArgs {
+            plan: plan.clone(),
+            dry_run: false,
+            only_decision: Some("manual".to_string()),
+            max_items: Some(1),
+            apply_manual: true,
+        })?;
+        assert!(
+            canonical.join("010001/poc.bin").exists() || canonical.join("010002/poc.bin").exists()
+        );
+
+        let err = merge_apply_command(MergeApplyArgs {
+            plan,
+            dry_run: true,
+            only_decision: Some("invalid".to_string()),
+            max_items: None,
+            apply_manual: false,
+        });
+        assert!(err.is_err());
         fs::remove_dir_all(root).ok();
         Ok(())
     }
