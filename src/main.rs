@@ -233,6 +233,11 @@ enum Commands {
         alias = "amplan"
     )]
     ArchiveMemberPlan(ArchiveMemberPlanArgs),
+    #[command(
+        about = "Convert archive-member plan rows into a merge-apply plan",
+        alias = "am2merge"
+    )]
+    ArchiveMemberMergePlan(ArchiveMemberMergePlanArgs),
     #[command(about = "Create a plan for missing file copy", alias = "plan")]
     PlanCopyMissing(PlanCopyMissingArgs),
     #[command(about = "Build retry plan from resume state", alias = "resume")]
@@ -377,6 +382,22 @@ struct ArchiveMemberPlanArgs {
     #[arg(long)]
     out_json: Option<PathBuf>,
     #[arg(long)]
+    out_csv: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct ArchiveMemberMergePlanArgs {
+    #[arg(long = "archive-member-plan-json")]
+    archive_member_plan_json: PathBuf,
+    #[arg(long = "imports-root")]
+    imports_root: PathBuf,
+    #[arg(long = "canonical-root")]
+    canonical_root: PathBuf,
+    #[arg(long = "policy", default_value_t = MergePolicy::Manual)]
+    policy: MergePolicy,
+    #[arg(long = "out-json")]
+    out_json: PathBuf,
+    #[arg(long = "out-csv")]
     out_csv: Option<PathBuf>,
 }
 
@@ -860,7 +881,7 @@ struct ArchiveMemberDiffReport {
     right_only: Vec<ArchiveMemberDiffEntry>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct ArchiveMemberPlanRow {
     row_schema: String,
     row_version: u32,
@@ -877,7 +898,7 @@ struct ArchiveMemberPlanRow {
     signal: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ArchiveMemberPlanReport {
     report_schema: String,
     report_version: u32,
@@ -1300,6 +1321,7 @@ fn main() -> Result<()> {
         Commands::ExtractCheck(args) => extract_check_command(args),
         Commands::ArchiveMemberDiff(args) => archive_member_diff_command(args),
         Commands::ArchiveMemberPlan(args) => archive_member_plan_command(args),
+        Commands::ArchiveMemberMergePlan(args) => archive_member_merge_plan_command(args),
         Commands::PlanCopyMissing(args) => plan_copy_missing_command(args),
         Commands::ResumePlan(args) => resume_plan_command(args),
         Commands::ExecuteCopyMissing(args) => execute_copy_missing_command(args),
@@ -2230,6 +2252,93 @@ fn archive_member_plan_command(args: ArchiveMemberPlanArgs) -> Result<()> {
     Ok(())
 }
 
+fn archive_member_merge_plan_command(args: ArchiveMemberMergePlanArgs) -> Result<()> {
+    let raw = std::fs::read_to_string(&args.archive_member_plan_json)
+        .with_context(|| format!("failed to read {}", args.archive_member_plan_json.display()))?;
+    let report: ArchiveMemberPlanReport = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "failed to parse {}",
+            args.archive_member_plan_json.display()
+        )
+    })?;
+
+    let mut items = Vec::new();
+    for row in &report.rows {
+        let source = match row.action_class.as_str() {
+            "copy_left_only" if row.side == "left" => args.imports_root.join(&row.rel_path),
+            "copy_right_only" if row.side == "right" => args.canonical_root.join(&row.rel_path),
+            _ => args.imports_root.join(&row.rel_path),
+        };
+        let destination = match row.action_class.as_str() {
+            "copy_left_only" if row.side == "left" => args.canonical_root.join(&row.rel_path),
+            "copy_right_only" if row.side == "right" => args.imports_root.join(&row.rel_path),
+            _ => args.canonical_root.join(&row.rel_path),
+        };
+
+        let (decision, reason) = match row.action_class.as_str() {
+            "copy_left_only" if row.side == "left" => (
+                "apply".to_string(),
+                format!("archive-member-plan signal: {}", row.signal),
+            ),
+            "copy_right_only" if row.side == "right" => (
+                "manual".to_string(),
+                "right-only entry already lives on canonical side".to_string(),
+            ),
+            "review_payload_family_match" => (
+                "manual".to_string(),
+                format!("payload family collision: {}", row.virtual_member),
+            ),
+            _ => (
+                "manual".to_string(),
+                format!("manual review: {}", row.signal),
+            ),
+        };
+
+        items.push(MergePlanItem {
+            left_folder: row.virtual_member.clone(),
+            right_folder: row.rel_path.clone(),
+            source: source.display().to_string(),
+            destination: destination.display().to_string(),
+            decision,
+            reason,
+        });
+    }
+
+    items.sort_by(|a, b| {
+        a.left_folder
+            .cmp(&b.left_folder)
+            .then(a.right_folder.cmp(&b.right_folder))
+    });
+    let plan = MergePlan {
+        schema_version: 1,
+        generated_at_ns: now_ns()?,
+        policy: args.policy,
+        imports_root: args.imports_root.display().to_string(),
+        canonical_root: args.canonical_root.display().to_string(),
+        items,
+    };
+
+    if let Some(parent) = args.out_json.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(&plan)?;
+    std::fs::write(&args.out_json, format!("{json}\n"))
+        .with_context(|| format!("failed to write {}", args.out_json.display()))?;
+    if let Some(path) = args.out_csv {
+        let csv = build_merge_plan_csv(&plan);
+        std::fs::write(&path, csv)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    println!("{json}");
+    eprintln!(
+        "[archive-member-merge-plan] items: {} from rows: {}",
+        plan.items.len(),
+        report.rows.len()
+    );
+    Ok(())
+}
+
 fn build_archive_entries(rows: &[FileRecord]) -> Result<Vec<ExtractCheckEntry>> {
     let mut entries = Vec::new();
     for row in rows {
@@ -2708,6 +2817,32 @@ fn build_archive_member_plan_csv(report: &ArchiveMemberPlanReport) -> String {
                 row.mtime_ns,
                 csv_escape(row.fast_hash.as_deref().unwrap_or("")),
                 csv_escape(&row.signal)
+            ),
+        );
+    }
+    csv
+}
+
+fn build_merge_plan_csv(plan: &MergePlan) -> String {
+    let mut csv = String::new();
+    csv.push_str(
+        "schema_version,policy,imports_root,canonical_root,left_folder,right_folder,source,destination,decision,reason\n",
+    );
+    for item in &plan.items {
+        let _ = std::fmt::Write::write_fmt(
+            &mut csv,
+            format_args!(
+                "{},{},{},{},{},{},{},{},{},{}\n",
+                plan.schema_version,
+                csv_escape(&plan.policy.to_string()),
+                csv_escape(&plan.imports_root),
+                csv_escape(&plan.canonical_root),
+                csv_escape(&item.left_folder),
+                csv_escape(&item.right_folder),
+                csv_escape(&item.source),
+                csv_escape(&item.destination),
+                csv_escape(&item.decision),
+                csv_escape(&item.reason)
             ),
         );
     }
@@ -11950,6 +12085,78 @@ bad::::line
         assert!(csv.contains(
             "nightindex.archive_member_plan,1,left,right,nightindex.archive_member_plan.row,1,copy_left_only,left,v/only-left.tar.gz,left/only-left.tar.gz,tar.gz,sig-left,2,123,55,hash-left,left_only"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn archive_member_merge_plan_maps_rows_to_merge_items() -> Result<()> {
+        let root = temp_dir("archive_member_merge_plan");
+        let plan_in = root.join("archive-member-plan.json");
+        let out_json = root.join("merge-plan.json");
+        let out_csv = root.join("merge-plan.csv");
+        let report = ArchiveMemberPlanReport {
+            report_schema: ARCHIVE_MEMBER_PLAN_REPORT_SCHEMA.to_string(),
+            report_version: REPORT_VERSION_V1,
+            left_label: "left".to_string(),
+            right_label: "right".to_string(),
+            source_report_schema: ARCHIVE_MEMBER_DIFF_REPORT_SCHEMA.to_string(),
+            source_report_version: REPORT_VERSION_V1,
+            rows: vec![
+                ArchiveMemberPlanRow {
+                    row_schema: ARCHIVE_MEMBER_PLAN_ROW_SCHEMA.to_string(),
+                    row_version: REPORT_VERSION_V1,
+                    action_class: "copy_left_only".to_string(),
+                    side: "left".to_string(),
+                    virtual_member: "vm/left.tar.gz".to_string(),
+                    rel_path: "01_EXPLOITS/left.tar.gz".to_string(),
+                    archive_family: Some("tar.gz".to_string()),
+                    payload_signature: Some("sig-left".to_string()),
+                    archive_depth: 2,
+                    size: 100,
+                    mtime_ns: 1,
+                    fast_hash: Some("h1".to_string()),
+                    signal: "left_only".to_string(),
+                },
+                ArchiveMemberPlanRow {
+                    row_schema: ARCHIVE_MEMBER_PLAN_ROW_SCHEMA.to_string(),
+                    row_version: REPORT_VERSION_V1,
+                    action_class: "review_payload_family_match".to_string(),
+                    side: "right".to_string(),
+                    virtual_member: "vm/right.tar.gz".to_string(),
+                    rel_path: "01_EXPLOITS/right.tar.gz".to_string(),
+                    archive_family: Some("tar.gz".to_string()),
+                    payload_signature: Some("sig-right".to_string()),
+                    archive_depth: 2,
+                    size: 200,
+                    mtime_ns: 2,
+                    fast_hash: Some("h2".to_string()),
+                    signal: "payload_family_match".to_string(),
+                },
+            ],
+        };
+        fs::write(
+            &plan_in,
+            format!("{}\n", serde_json::to_string_pretty(&report)?),
+        )?;
+
+        archive_member_merge_plan_command(ArchiveMemberMergePlanArgs {
+            archive_member_plan_json: plan_in,
+            imports_root: root.join("imports"),
+            canonical_root: root.join("canonical"),
+            policy: MergePolicy::PreferNewer,
+            out_json: out_json.clone(),
+            out_csv: Some(out_csv.clone()),
+        })?;
+
+        let raw = fs::read_to_string(&out_json)?;
+        assert!(raw.contains("\"policy\": \"prefer-newer\""));
+        assert!(raw.contains("\"decision\": \"apply\""));
+        assert!(raw.contains("\"decision\": \"manual\""));
+        let csv = fs::read_to_string(&out_csv)?;
+        assert!(csv.contains("schema_version,policy,imports_root"));
+        assert!(csv.contains("apply"));
+
+        fs::remove_dir_all(root).ok();
         Ok(())
     }
 }
