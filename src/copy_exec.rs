@@ -97,6 +97,14 @@ impl CopyProgressSnapshot {
         let remaining = self.planned_bytes.saturating_sub(self.copied_bytes);
         Some(((remaining as f64) / rate * 1_000_000_000.0).round() as i64)
     }
+
+    fn remaining_files(&self) -> usize {
+        self.planned_files.saturating_sub(self.completed_files)
+    }
+
+    fn remaining_bytes(&self) -> u64 {
+        self.planned_bytes.saturating_sub(self.copied_bytes)
+    }
 }
 
 pub fn format_progress_line(snapshot: &CopyProgressSnapshot) -> String {
@@ -108,11 +116,15 @@ pub fn format_progress_line(snapshot: &CopyProgressSnapshot) -> String {
         .eta_ns()
         .map(human_duration_ns)
         .unwrap_or_else(|| "n/a".to_string());
+    let elapsed = human_duration_ns(snapshot.elapsed_ns);
     format!(
-        "[copy progress] {}/{} files | copied={} | rate={}/s | eta={} | skipped={} conflict={} missing={} failed={}",
+        "[copy progress] files={}/{} remain_files={} copied={} remain={} elapsed={} rate={}/s eta={} skipped={} conflict={} missing={} failed={}",
         snapshot.completed_files,
         snapshot.planned_files,
+        snapshot.remaining_files(),
         human_bytes(snapshot.copied_bytes),
+        human_bytes(snapshot.remaining_bytes()),
+        elapsed,
         rate,
         eta,
         snapshot.skipped_existing,
@@ -156,6 +168,7 @@ pub fn write_copy_progress_event(
             "planned_files": snapshot.planned_files,
             "planned_bytes": snapshot.planned_bytes,
             "completed_files": snapshot.completed_files,
+            "remaining_files": snapshot.remaining_files(),
             "copied_files": snapshot.copied_files,
             "skipped_existing": snapshot.skipped_existing,
             "skipped_conflict": snapshot.skipped_conflict,
@@ -163,6 +176,7 @@ pub fn write_copy_progress_event(
             "missing_source": snapshot.missing_source,
             "failed_files": snapshot.failed_files,
             "copied_bytes": snapshot.copied_bytes,
+            "remaining_bytes": snapshot.remaining_bytes(),
             "elapsed_ns": snapshot.elapsed_ns,
             "bytes_per_second": snapshot.rate_bps(),
             "eta_ns": snapshot.eta_ns(),
@@ -331,6 +345,8 @@ impl Drop for CopyStage {
 mod tests {
     use super::*;
     use std::fs;
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
     use std::path::PathBuf;
 
     fn temp_dir(prefix: &str) -> PathBuf {
@@ -409,6 +425,73 @@ mod tests {
         assert_eq!(outcome, CopyFinalizeOutcome::Committed);
         assert_eq!(fs::read(&destination)?, b"replacement");
         assert!(!temp_dir.exists());
+        fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn progress_line_uses_stable_key_value_fields() {
+        let snapshot = CopyProgressSnapshot {
+            planned_files: 10,
+            planned_bytes: 1_000,
+            completed_files: 4,
+            copied_files: 4,
+            skipped_existing: 1,
+            skipped_conflict: 0,
+            overwritten_files: 0,
+            missing_source: 1,
+            failed_files: 0,
+            copied_bytes: 400,
+            elapsed_ns: 2_000_000_000,
+        };
+
+        let line = format_progress_line(&snapshot);
+        assert!(line.contains("[copy progress]"));
+        assert!(line.contains("files=4/10"));
+        assert!(line.contains("remain_files=6"));
+        assert!(line.contains("copied=400.00 B"));
+        assert!(line.contains("remain=600.00 B"));
+        assert!(line.contains("elapsed=00m 02s"));
+        assert!(line.contains("rate=200.00 B/s"));
+        assert!(line.contains("eta=00m 03s"));
+        assert!(line.contains("skipped=1"));
+        assert!(line.contains("conflict=0"));
+        assert!(line.contains("missing=1"));
+        assert!(line.contains("failed=0"));
+    }
+
+    #[test]
+    fn copy_progress_event_includes_remaining_counters() -> Result<()> {
+        let root = temp_dir("progress-event");
+        let log_path = root.join("progress.jsonl");
+        let mut log = Some(File::create(&log_path)?);
+        let snapshot = CopyProgressSnapshot {
+            planned_files: 12,
+            planned_bytes: 12_000,
+            completed_files: 7,
+            copied_files: 6,
+            skipped_existing: 1,
+            skipped_conflict: 0,
+            overwritten_files: 0,
+            missing_source: 0,
+            failed_files: 0,
+            copied_bytes: 6_000,
+            elapsed_ns: 3_000_000_000,
+        };
+
+        write_copy_progress_event(&mut log, &snapshot)?;
+        drop(log);
+
+        let file = File::open(&log_path)?;
+        let mut lines = BufReader::new(file).lines();
+        let line = lines.next().expect("line exists")?;
+        let event: serde_json::Value = serde_json::from_str(&line)?;
+        assert_eq!(event["event"], "copy_progress");
+        assert_eq!(event["remaining_files"], 5);
+        assert_eq!(event["remaining_bytes"], 6_000);
+        assert_eq!(event["eta_ns"], 3_000_000_000_i64);
+        assert!(event["bytes_per_second"].as_f64().expect("rate") > 0.0);
+
         fs::remove_dir_all(&root).ok();
         Ok(())
     }

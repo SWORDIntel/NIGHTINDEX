@@ -205,6 +205,46 @@ nightindex archive-member-diff \
   [--out-json <file>] [--out-csv <file>]
 ```
 
+`archive-member-merge-plan` (alias: `am2merge`)  
+Bridge archive-member matches into merge actions/plan inputs for `merge-plan` and `merge-apply`.
+
+```bash
+nightindex archive-member-merge-plan \
+  --left-db <left.sqlite> \
+  --right-db <right.sqlite> \
+  --left <left_label> \
+  --right <right_label> \
+  --out-actions-csv /tmp/archive-actions.csv \
+  [--confidence <manual|possible|similar|identical>] \
+  [--one-per-left]
+```
+
+Practical examples:
+
+```bash
+# 1) Generate archive-driven action candidates (review first)
+ndex am2merge \
+  --left-db /tank/nightindex/src.sqlite \
+  --right-db /tank/nightindex/dst.sqlite \
+  --left src \
+  --right dst \
+  --confidence similar \
+  --one-per-left \
+  --out-actions-csv /tank/nightindex/archive-actions.csv
+
+# 2) Convert actions to an executable merge plan
+ndex merge-plan \
+  --actions-csv /tank/nightindex/archive-actions.csv \
+  --imports-root /tank/recovery/_imports \
+  --canonical-root /tank/recovery \
+  --policy prefer-newer \
+  --out-json /tank/nightindex/archive-merge-plan.json
+
+# 3) Apply with dry-run, then execute
+ndex merge-apply --plan /tank/nightindex/archive-merge-plan.json --dry-run
+ndex merge-apply --plan /tank/nightindex/archive-merge-plan.json
+```
+
 `logs`  
 Summarize NDJSON copy logs produced by `--log` during execute/sync/compat copy runs.
 
@@ -436,3 +476,9 @@ Each execute/sync run prints one final summary JSON object with:
 - `missing_source`
 - `failed_files`
 - `copied_bytes`
+
+## Roadmap (next phases)
+
+- Binary diffing: add fast, content-derived binary descriptors and delta-oriented comparison signals to improve same-family file decisions where names/hashes drift.
+- Archive-recursive compare: extend archive-aware matching from member-level diff into recursive cross-archive compare/reporting for nested payload trees.
+- Persistent fingerprint DB expansion: broaden cached fingerprint schema and reuse coverage (binary/text/archive signals, richer invalidation/stats) for faster re-scans and stronger dossier/merge confidence.

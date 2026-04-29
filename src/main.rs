@@ -203,7 +203,7 @@ const DESCRIPTOR_MAX_KEY_TOKEN_LEN: usize = 32;
     version = env!("CARGO_PKG_VERSION"),
     about = "Indexed recovery copy for hostile file trees",
     long_about = "Use `nightindex` for explicit commands or `ndex` as the shorter alias.",
-    after_help = "Command names:\n- `nightindex` (full command name)\n- `ndex` (binary alias)\n\nRecovery aliases:\n- `nightindex dossier` (alias: `intel`)\n- `nightindex plan-copy-missing` (alias: `plan`)\n- `nightindex sync-copy-missing` (alias: `sync`)\n- `nightindex execute-copy-missing` (alias: `execute`)\n- `nightindex extract-check` (alias: `extcheck`)",
+    after_help = "Command names:\n- `nightindex` (full command name)\n- `ndex` (binary alias)\n\nRecovery aliases:\n- `nightindex dossier` (alias: `intel`)\n- `nightindex plan-copy-missing` (alias: `plan`)\n- `nightindex sync-copy-missing` (alias: `sync`)\n- `nightindex execute-copy-missing` (alias: `execute`)\n- `nightindex extract-check` (alias: `extcheck`)\n\nCompatibility frontends:\n- `nightindex copy` / `ndex copy` (direct mode)\n- `nightindex rsync`\n- `nightindex rclone`",
 )]
 struct Cli {
     #[command(subcommand)]
@@ -261,6 +261,12 @@ enum Commands {
     MergePlan(MergePlanArgs),
     #[command(about = "Apply a previously generated merge plan")]
     MergeApply(MergeApplyArgs),
+    #[command(
+        name = "copy",
+        about = "Compatibility frontend for direct copy command style",
+        trailing_var_arg = true
+    )]
+    Copy(CompatCopyArgs),
     #[command(
         name = "rclone",
         about = "Compatibility frontend for rclone-like command style",
@@ -1332,6 +1338,7 @@ fn main() -> Result<()> {
         Commands::InspectCache(args) => inspect_cache_command(args),
         Commands::MergePlan(args) => merge_plan_command(args),
         Commands::MergeApply(args) => merge_apply_command(args),
+        Commands::Copy(args) => compat_copy_command(args, "copy"),
         Commands::Rclone(args) => compat_copy_command(args, "rclone"),
         Commands::Rsync(args) => compat_copy_command(args, "rsync"),
     }
@@ -6315,6 +6322,7 @@ fn sync_copy_missing_command(args: SyncCopyMissingArgs) -> Result<()> {
 }
 
 fn compat_copy_command(args: CompatCopyArgs, command: &str) -> Result<()> {
+    eprintln!("[nightindex {command}] compatibility copy mode");
     let runtime = parse_compat_copy_flags(&args, command)?;
     if !runtime.accepted_link_flags.is_empty() {
         let dereference_links = runtime
@@ -11624,6 +11632,28 @@ mod tests {
                 assert_eq!(runtime.destination, PathBuf::from("dst"));
             }
             _ => panic!("rsync compatibility command did not parse"),
+        }
+
+        let cli = Cli::parse_from(["nightindex", "copy", "--dry-run", "src", "dst"]);
+        match cli.command {
+            Commands::Copy(args) => {
+                let runtime = parse_compat_copy_flags(&args, "copy").expect("compat parse");
+                assert!(runtime.dry_run);
+                assert_eq!(runtime.source, PathBuf::from("src"));
+                assert_eq!(runtime.destination, PathBuf::from("dst"));
+            }
+            _ => panic!("copy compatibility command did not parse"),
+        }
+
+        let cli = Cli::parse_from(["ndex", "copy", "--verbose", "src", "dst"]);
+        match cli.command {
+            Commands::Copy(args) => {
+                let runtime = parse_compat_copy_flags(&args, "copy").expect("compat parse");
+                assert_eq!(runtime.verbosity, 1);
+                assert_eq!(runtime.source, PathBuf::from("src"));
+                assert_eq!(runtime.destination, PathBuf::from("dst"));
+            }
+            _ => panic!("ndex copy compatibility command did not parse"),
         }
     }
 
