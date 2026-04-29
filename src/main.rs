@@ -188,6 +188,8 @@ enum Commands {
     SyncCopyMissing(SyncCopyMissingArgs),
     #[command(about = "Summarize NDJSON copy logs")]
     Logs(LogsArgs),
+    #[command(about = "Summarize DB and recent copy/resume health")]
+    Status(StatusArgs),
     #[command(about = "Build merge materialization plan from dossier action CSV")]
     MergePlan(MergePlanArgs),
     #[command(about = "Apply a previously generated merge plan")]
@@ -442,6 +444,18 @@ struct LogsArgs {
     tail: usize,
     #[arg(long = "failures-only")]
     failures_only: bool,
+    #[arg(long = "top-errors", default_value_t = 5)]
+    top_errors: usize,
+    #[arg(long = "retry-jsonl-out")]
+    retry_jsonl_out: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct StatusArgs {
+    #[arg(long = "db")]
+    db: PathBuf,
+    #[arg(long = "window-minutes", default_value_t = 180)]
+    window_minutes: i64,
 }
 
 #[derive(Args)]
@@ -1062,6 +1076,7 @@ fn main() -> Result<()> {
         Commands::ExecutePlan(args) => execute_plan_command(args),
         Commands::SyncCopyMissing(args) => sync_copy_missing_command(args),
         Commands::Logs(args) => logs_command(args),
+        Commands::Status(args) => status_command(args),
         Commands::MergePlan(args) => merge_plan_command(args),
         Commands::MergeApply(args) => merge_apply_command(args),
         Commands::Rclone(args) => compat_copy_command(args, "rclone"),
@@ -1921,6 +1936,8 @@ fn logs_command(args: LogsArgs) -> Result<()> {
     let mut failed_files = 0u64;
     let mut failures = 0usize;
     let mut events_seen = 0usize;
+    let mut error_classes: HashMap<String, usize> = HashMap::new();
+    let mut retry_rows: Vec<serde_json::Value> = Vec::new();
 
     for line in &lines {
         let parsed: serde_json::Value = match serde_json::from_str(line) {
@@ -1933,6 +1950,22 @@ fn logs_command(args: LogsArgs) -> Result<()> {
             let action = parsed.get("action").and_then(|v| v.as_str()).unwrap_or_default();
             if action == "fail" {
                 failures += 1;
+                let reason = parsed
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let class = reason
+                    .split(':')
+                    .next()
+                    .unwrap_or(reason)
+                    .trim()
+                    .to_ascii_lowercase();
+                *error_classes.entry(class).or_insert(0) += 1;
+                retry_rows.push(serde_json::json!({
+                    "rel_path": parsed.get("rel_path").and_then(|v| v.as_str()).unwrap_or_default(),
+                    "reason": reason,
+                    "bytes": parsed.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0),
+                }));
                 if args.failures_only {
                     println!("{}", line);
                 }
@@ -1983,7 +2016,82 @@ fn logs_command(args: LogsArgs) -> Result<()> {
         failed_files,
         failures
     );
+    if !error_classes.is_empty() {
+        let mut ranked: Vec<(String, usize)> = error_classes.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let topn = args.top_errors.min(ranked.len());
+        for (class, count) in ranked.into_iter().take(topn) {
+            println!("[logs errors] class={} count={}", class, count);
+        }
+    }
+    if let Some(path) = args.retry_jsonl_out.as_ref() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        for row in &retry_rows {
+            let payload = serde_json::to_vec(row)?;
+            file.write_all(&payload)?;
+            file.write_all(b"\n")?;
+        }
+        eprintln!("[logs] wrote retry candidates: {}", path.display());
+    }
 
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct StatusReport {
+    labels: usize,
+    resume_sessions: usize,
+    recent_copy_runs: usize,
+    latest_bytes_per_second: Option<f64>,
+}
+
+fn status_command(args: StatusArgs) -> Result<()> {
+    let conn = open_db(&args.db)?;
+    let labels: i64 = conn.query_row("SELECT COUNT(DISTINCT label) FROM files", [], |row| {
+        row.get(0)
+    })?;
+    let sessions: i64 = conn.query_row("SELECT COUNT(*) FROM copy_resume_sessions", [], |row| {
+        row.get(0)
+    })?;
+    let now = now_ns()?;
+    let since = now - args.window_minutes.max(1) * 60 * 1_000_000_000;
+    let recent_runs: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM copy_runs WHERE copied_at >= ?1",
+        params![since],
+        |row| row.get(0),
+    )?;
+    let latest_rate: Option<f64> = conn
+        .query_row(
+            "SELECT copied_bytes, duration_ns FROM copy_runs WHERE copied_bytes > 0 AND duration_ns > 0 ORDER BY copied_at DESC LIMIT 1",
+            [],
+            |row| {
+                let bytes: i64 = row.get(0)?;
+                let dur: i64 = row.get(1)?;
+                if bytes <= 0 || dur <= 0 {
+                    Ok(None)
+                } else {
+                    Ok(Some((bytes as f64) / (dur as f64 / 1_000_000_000.0)))
+                }
+            },
+        )
+        .optional()?
+        .flatten();
+    let report = StatusReport {
+        labels: labels.max(0) as usize,
+        resume_sessions: sessions.max(0) as usize,
+        recent_copy_runs: recent_runs.max(0) as usize,
+        latest_bytes_per_second: latest_rate,
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
@@ -7821,6 +7929,8 @@ mod tests {
             file: path,
             tail: 200,
             failures_only: false,
+            top_errors: 5,
+            retry_jsonl_out: None,
         })?;
         fs::remove_dir_all(root).ok();
         Ok(())
