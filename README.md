@@ -138,8 +138,10 @@ nightindex dossier \
   --left <left_label> \
   --right <right_label> \
   --top-k 15 \
+  [--confidence <manual|possible|similar|identical>] \
   --out-json <file> \
   --out-csv <file> \
+  [--out-actions-csv <file>] \
   [--policy <policy>]
 ```
 

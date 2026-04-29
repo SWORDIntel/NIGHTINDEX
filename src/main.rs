@@ -222,6 +222,8 @@ struct DossierArgs {
     out_json: Option<PathBuf>,
     #[arg(long)]
     out_csv: Option<PathBuf>,
+    #[arg(long = "out-actions-csv")]
+    out_actions_csv: Option<PathBuf>,
     #[arg(long)]
     policy: Option<PathBuf>,
 }
@@ -1612,6 +1614,11 @@ fn dossier_command(args: DossierArgs) -> Result<()> {
         std::fs::write(&path, csv)
             .with_context(|| format!("failed to write {}", path.display()))?;
     }
+    if let Some(path) = args.out_actions_csv {
+        let csv = build_dossier_actions_csv(&candidates);
+        std::fs::write(&path, csv)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
     if let Some(best) = candidates.first() {
         eprintln!(
             "[dossier] summary: {} candidates across {} left folders and {} right folders; best {} -> {} ({:.3}, {} shared files, {})",
@@ -2173,6 +2180,40 @@ fn build_dossier_csv(matches: &[DossierMatch]) -> String {
                 item.shared_language_count,
                 item.shared_size_class_count,
                 item.confidence_tier.as_str()
+            ),
+        );
+    }
+    csv
+}
+
+fn build_dossier_actions_csv(matches: &[DossierMatch]) -> String {
+    let mut csv = String::new();
+    csv.push_str(
+        "left_folder,rank,right_folder,confidence_tier,next_action,overlap_ratio,shared_hash_count,shared_normalized_file_name_count,shared_rel_file_count\n",
+    );
+
+    let mut last_left = "";
+    let mut rank_for_left = 0usize;
+    for item in matches {
+        if item.left_folder != last_left {
+            last_left = &item.left_folder;
+            rank_for_left = 1;
+        } else {
+            rank_for_left += 1;
+        }
+        let _ = std::fmt::Write::write_fmt(
+            &mut csv,
+            format_args!(
+                "{},{},{},{},{},{:.6},{},{},{}\n",
+                csv_escape(&item.left_folder),
+                rank_for_left,
+                csv_escape(&item.right_folder),
+                item.confidence_tier.as_str(),
+                item.confidence_tier.next_action(),
+                item.overlap_ratio,
+                item.shared_hash_count,
+                item.shared_normalized_file_name_count,
+                item.shared_rel_file_count
             ),
         );
     }
@@ -6423,6 +6464,65 @@ mod tests {
         ));
         assert!(csv.contains(
             "alpha,beta,1.2500,2.0000,2.5000,0.357000,1,2,1,1,1,1,1,0,1,2,0,0,0,possible"
+        ));
+    }
+
+    #[test]
+    fn build_dossier_actions_csv_emits_ranked_actions() {
+        let rows = vec![
+            DossierMatch {
+                left_folder: "alpha".to_string(),
+                right_folder: "beta".to_string(),
+                overlap_weight: 1.25,
+                left_weight: 2.0,
+                right_weight: 2.5,
+                overlap_ratio: 0.357,
+                shared_rel_file_count: 1,
+                shared_exact_file_name_count: 2,
+                shared_normalized_file_name_count: 1,
+                shared_file_stem_count: 1,
+                shared_file_ext_count: 1,
+                shared_ext_stem_count: 1,
+                shared_hash_count: 1,
+                shared_folder_token_count: 0,
+                shared_normalized_parent_folder_count: 1,
+                shared_binaryity_count: 2,
+                shared_archive_family_count: 0,
+                shared_language_count: 0,
+                shared_size_class_count: 0,
+                confidence_tier: DossierConfidenceTier::Possible,
+            },
+            DossierMatch {
+                left_folder: "alpha".to_string(),
+                right_folder: "gamma".to_string(),
+                overlap_weight: 0.75,
+                left_weight: 2.0,
+                right_weight: 2.5,
+                overlap_ratio: 0.157,
+                shared_rel_file_count: 0,
+                shared_exact_file_name_count: 0,
+                shared_normalized_file_name_count: 0,
+                shared_file_stem_count: 1,
+                shared_file_ext_count: 1,
+                shared_ext_stem_count: 0,
+                shared_hash_count: 0,
+                shared_folder_token_count: 1,
+                shared_normalized_parent_folder_count: 0,
+                shared_binaryity_count: 1,
+                shared_archive_family_count: 0,
+                shared_language_count: 0,
+                shared_size_class_count: 1,
+                confidence_tier: DossierConfidenceTier::Manual,
+            },
+        ];
+
+        let csv = build_dossier_actions_csv(&rows);
+        assert!(csv.starts_with(
+            "left_folder,rank,right_folder,confidence_tier,next_action,overlap_ratio,shared_hash_count,shared_normalized_file_name_count,shared_rel_file_count\n"
+        ));
+        assert!(csv.contains("alpha,1,beta,possible,review before applying,0.357000,1,1,1"));
+        assert!(csv.contains(
+            "alpha,2,gamma,manual,manual inspection required,0.157000,0,0,0"
         ));
     }
 
