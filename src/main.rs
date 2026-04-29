@@ -216,6 +216,11 @@ enum Commands {
     Dossier(DossierArgs),
     #[command(about = "Compare archive-like payload families", alias = "extcheck")]
     ExtractCheck(ExtractCheckArgs),
+    #[command(
+        about = "Diff persisted virtual archive-member manifests",
+        alias = "amdiff"
+    )]
+    ArchiveMemberDiff(ArchiveMemberDiffArgs),
     #[command(about = "Create a plan for missing file copy", alias = "plan")]
     PlanCopyMissing(PlanCopyMissingArgs),
     #[command(about = "Build retry plan from resume state", alias = "resume")]
@@ -317,6 +322,22 @@ struct DossierArgs {
 
 #[derive(Args)]
 struct ExtractCheckArgs {
+    #[arg(long = "left-db")]
+    left_db: PathBuf,
+    #[arg(long = "right-db")]
+    right_db: PathBuf,
+    #[arg(long)]
+    left: String,
+    #[arg(long)]
+    right: String,
+    #[arg(long)]
+    out_json: Option<PathBuf>,
+    #[arg(long)]
+    out_csv: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct ArchiveMemberDiffArgs {
     #[arg(long = "left-db")]
     left_db: PathBuf,
     #[arg(long = "right-db")]
@@ -783,6 +804,34 @@ struct ExtractCheckReport {
     matched_by_stem: Vec<ExtractCheckMatch>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+struct ArchiveMemberDiffEntry {
+    rel_path: String,
+    virtual_member: String,
+    archive_family: Option<String>,
+    payload_signature: Option<String>,
+    archive_depth: usize,
+    size: u64,
+    mtime_ns: i64,
+    fast_hash: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ArchiveMemberDiffReport {
+    report_schema: String,
+    report_version: u32,
+    left_label: String,
+    right_label: String,
+    left_members: usize,
+    right_members: usize,
+    exact_member_matches: usize,
+    payload_family_matches: usize,
+    left_only_count: usize,
+    right_only_count: usize,
+    left_only: Vec<ArchiveMemberDiffEntry>,
+    right_only: Vec<ArchiveMemberDiffEntry>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct CopyPlan {
     mode: String,
@@ -1166,6 +1215,7 @@ fn main() -> Result<()> {
         Commands::Brief(args) => brief_command(args),
         Commands::Dossier(args) => dossier_command(args),
         Commands::ExtractCheck(args) => extract_check_command(args),
+        Commands::ArchiveMemberDiff(args) => archive_member_diff_command(args),
         Commands::PlanCopyMissing(args) => plan_copy_missing_command(args),
         Commands::ResumePlan(args) => resume_plan_command(args),
         Commands::ExecuteCopyMissing(args) => execute_copy_missing_command(args),
@@ -1855,6 +1905,120 @@ fn extract_check_command(args: ExtractCheckArgs) -> Result<()> {
     Ok(())
 }
 
+fn archive_member_diff_command(args: ArchiveMemberDiffArgs) -> Result<()> {
+    let left_conn = open_db(&args.left_db)?;
+    let right_conn = open_db(&args.right_db)?;
+
+    let mut left_entries = load_virtual_archive_entries(&left_conn, &args.left)?;
+    if left_entries.is_empty() {
+        let left_rows = load_label(&left_conn, &args.left)?;
+        left_entries = build_archive_entries(&left_rows)?;
+    }
+    let mut right_entries = load_virtual_archive_entries(&right_conn, &args.right)?;
+    if right_entries.is_empty() {
+        let right_rows = load_label(&right_conn, &args.right)?;
+        right_entries = build_archive_entries(&right_rows)?;
+    }
+
+    let mut left_map: HashMap<String, ExtractCheckEntry> =
+        HashMap::with_capacity(left_entries.len());
+    let mut right_map: HashMap<String, ExtractCheckEntry> =
+        HashMap::with_capacity(right_entries.len());
+    for entry in left_entries {
+        left_map.insert(entry.virtual_member.clone(), entry);
+    }
+    for entry in right_entries {
+        right_map.insert(entry.virtual_member.clone(), entry);
+    }
+
+    let mut exact_member_matches = 0usize;
+    let mut payload_family_matches = 0usize;
+    let mut left_only = Vec::new();
+    let mut right_only = Vec::new();
+
+    for (member, left_entry) in &left_map {
+        if right_map.contains_key(member) {
+            exact_member_matches += 1;
+        } else {
+            left_only.push(ArchiveMemberDiffEntry {
+                rel_path: left_entry.path.clone(),
+                virtual_member: left_entry.virtual_member.clone(),
+                archive_family: left_entry.archive_family.clone(),
+                payload_signature: left_entry.payload_signature.clone(),
+                archive_depth: left_entry.archive_depth,
+                size: left_entry.size,
+                mtime_ns: left_entry.mtime_ns,
+                fast_hash: left_entry.fast_hash.clone(),
+            });
+        }
+    }
+    for (member, right_entry) in &right_map {
+        if !left_map.contains_key(member) {
+            right_only.push(ArchiveMemberDiffEntry {
+                rel_path: right_entry.path.clone(),
+                virtual_member: right_entry.virtual_member.clone(),
+                archive_family: right_entry.archive_family.clone(),
+                payload_signature: right_entry.payload_signature.clone(),
+                archive_depth: right_entry.archive_depth,
+                size: right_entry.size,
+                mtime_ns: right_entry.mtime_ns,
+                fast_hash: right_entry.fast_hash.clone(),
+            });
+        }
+    }
+
+    let mut left_payloads = HashSet::new();
+    for item in &left_only {
+        if let (Some(fam), Some(sig)) = (&item.archive_family, &item.payload_signature) {
+            left_payloads.insert(format!("{fam}|{sig}"));
+        }
+    }
+    for item in &right_only {
+        if let (Some(fam), Some(sig)) = (&item.archive_family, &item.payload_signature) {
+            if left_payloads.contains(&format!("{fam}|{sig}")) {
+                payload_family_matches += 1;
+            }
+        }
+    }
+
+    left_only.sort_by(|a, b| a.virtual_member.cmp(&b.virtual_member));
+    right_only.sort_by(|a, b| a.virtual_member.cmp(&b.virtual_member));
+
+    let report = ArchiveMemberDiffReport {
+        report_schema: "nightindex.archive_member_diff".to_string(),
+        report_version: 1,
+        left_label: args.left,
+        right_label: args.right,
+        left_members: left_map.len(),
+        right_members: right_map.len(),
+        exact_member_matches,
+        payload_family_matches,
+        left_only_count: left_only.len(),
+        right_only_count: right_only.len(),
+        left_only,
+        right_only,
+    };
+    let json = serde_json::to_string_pretty(&report)?;
+    println!("{json}");
+    if let Some(path) = args.out_json {
+        std::fs::write(&path, format!("{json}\n"))
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    if let Some(path) = args.out_csv {
+        let csv = build_archive_member_diff_csv(&report);
+        std::fs::write(&path, csv)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    eprintln!(
+        "[archive-member-diff] summary: {} exact, {} payload-family, {} left-only, {} right-only",
+        report.exact_member_matches,
+        report.payload_family_matches,
+        report.left_only_count,
+        report.right_only_count
+    );
+    Ok(())
+}
+
 fn build_archive_entries(rows: &[FileRecord]) -> Result<Vec<ExtractCheckEntry>> {
     let mut entries = Vec::new();
     for row in rows {
@@ -2238,6 +2402,70 @@ fn build_extract_check_csv(report: &ExtractCheckReport) -> String {
                 csv_escape(&report.right_label),
                 csv_escape(&entry.virtual_path),
                 csv_escape(&entry.payload_signature.clone().unwrap_or_default())
+            ),
+        );
+    }
+    csv
+}
+
+fn build_archive_member_diff_csv(report: &ArchiveMemberDiffReport) -> String {
+    let mut csv = String::new();
+    csv.push_str("section,left_label,right_label,metric,value\n");
+    let _ = std::fmt::Write::write_fmt(
+        &mut csv,
+        format_args!(
+            "summary,{},{},left_members,{}\n",
+            csv_escape(&report.left_label),
+            csv_escape(&report.right_label),
+            report.left_members
+        ),
+    );
+    let _ = std::fmt::Write::write_fmt(
+        &mut csv,
+        format_args!(
+            "summary,{},{},right_members,{}\n",
+            csv_escape(&report.left_label),
+            csv_escape(&report.right_label),
+            report.right_members
+        ),
+    );
+    let _ = std::fmt::Write::write_fmt(
+        &mut csv,
+        format_args!(
+            "summary,{},{},exact_member_matches,{}\n",
+            csv_escape(&report.left_label),
+            csv_escape(&report.right_label),
+            report.exact_member_matches
+        ),
+    );
+    let _ = std::fmt::Write::write_fmt(
+        &mut csv,
+        format_args!(
+            "summary,{},{},payload_family_matches,{}\n",
+            csv_escape(&report.left_label),
+            csv_escape(&report.right_label),
+            report.payload_family_matches
+        ),
+    );
+    for item in &report.left_only {
+        let _ = std::fmt::Write::write_fmt(
+            &mut csv,
+            format_args!(
+                "left_only,{},{},virtual_member,{}\n",
+                csv_escape(&report.left_label),
+                csv_escape(&report.right_label),
+                csv_escape(&item.virtual_member)
+            ),
+        );
+    }
+    for item in &report.right_only {
+        let _ = std::fmt::Write::write_fmt(
+            &mut csv,
+            format_args!(
+                "right_only,{},{},virtual_member,{}\n",
+                csv_escape(&report.left_label),
+                csv_escape(&report.right_label),
+                csv_escape(&item.virtual_member)
             ),
         );
     }
@@ -10969,6 +11197,56 @@ def collect_results(path):
         assert!(raw.contains("\"label\": \"left\""));
         assert!(raw.contains("\"with_text_signature\""));
         assert!(raw.contains("\"with_binary_signature\""));
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn archive_member_diff_reports_exact_and_left_only() -> Result<()> {
+        let root = temp_dir("archive_member_diff");
+        let left_root = root.join("left");
+        let right_root = root.join("right");
+        fs::create_dir_all(&left_root)?;
+        fs::create_dir_all(&right_root)?;
+        fs::write(left_root.join("same.tar.gz"), b"same")?;
+        fs::write(left_root.join("only_left.tar.gz"), b"left")?;
+        fs::write(right_root.join("same.tar.gz"), b"same")?;
+
+        let left_db = root.join("left.sqlite");
+        let right_db = root.join("right.sqlite");
+        scan_command(ScanArgs {
+            db: left_db.clone(),
+            label: "left".to_string(),
+            root: left_root,
+            exclude_prefixes: vec![],
+            exclude_if_present: vec![],
+            policy: None,
+            hash: true,
+        })?;
+        scan_command(ScanArgs {
+            db: right_db.clone(),
+            label: "right".to_string(),
+            root: right_root,
+            exclude_prefixes: vec![],
+            exclude_if_present: vec![],
+            policy: None,
+            hash: true,
+        })?;
+
+        let out_json = root.join("archive_diff.json");
+        archive_member_diff_command(ArchiveMemberDiffArgs {
+            left_db: left_db.clone(),
+            right_db: right_db.clone(),
+            left: "left".to_string(),
+            right: "right".to_string(),
+            out_json: Some(out_json.clone()),
+            out_csv: None,
+        })?;
+
+        let raw = fs::read_to_string(out_json)?;
+        assert!(raw.contains("\"report_schema\": \"nightindex.archive_member_diff\""));
+        assert!(raw.contains("\"exact_member_matches\": 1"));
+        assert!(raw.contains("\"left_only_count\": 1"));
         fs::remove_dir_all(root).ok();
         Ok(())
     }

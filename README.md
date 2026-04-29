@@ -193,6 +193,18 @@ nightindex extcheck \
   [--out-json <file>] [--out-csv <file>]
 ```
 
+`archive-member-diff` (alias: `amdiff`)  
+Diff persisted virtual archive-member manifests between two labels/DBs.
+
+```bash
+nightindex archive-member-diff \
+  --left-db <left.sqlite> \
+  --right-db <right.sqlite> \
+  --left <left_label> \
+  --right <right_label> \
+  [--out-json <file>] [--out-csv <file>]
+```
+
 `logs`  
 Summarize NDJSON copy logs produced by `--log` during execute/sync/compat copy runs.
 
