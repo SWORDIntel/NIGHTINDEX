@@ -318,6 +318,10 @@ struct ResumePlanArgs {
     db: PathBuf,
     #[arg(long = "session-id")]
     session_id: Option<String>,
+    #[arg(long = "only-failed")]
+    only_failed: bool,
+    #[arg(long = "max-attempts")]
+    max_attempts: Option<u64>,
     #[arg(long = "out-json")]
     out_json: Option<PathBuf>,
     #[arg(long)]
@@ -2177,10 +2181,26 @@ impl ResumeRecorder {
     }
 }
 
-fn load_resume_pending_items(conn: &Connection, session_id: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT rel_path FROM copy_resume_items WHERE session_id = ?1 AND status IN ('pending', 'copying', 'failed') ORDER BY rel_path",
-    )?;
+fn load_resume_pending_items(
+    conn: &Connection,
+    session_id: &str,
+    only_failed: bool,
+    max_attempts: Option<u64>,
+) -> Result<Vec<String>> {
+    let status_sql = if only_failed {
+        "status = 'failed'"
+    } else {
+        "status IN ('pending', 'copying', 'failed')"
+    };
+    let mut sql = format!(
+        "SELECT rel_path FROM copy_resume_items WHERE session_id = ?1 AND {}",
+        status_sql
+    );
+    if let Some(max_attempts) = max_attempts {
+        sql.push_str(&format!(" AND attempts <= {}", max_attempts));
+    }
+    sql.push_str(" ORDER BY rel_path");
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?;
     let mut out = Vec::new();
     for row in rows {
@@ -2235,12 +2255,17 @@ fn load_resume_session_meta(
     .map_err(Into::into)
 }
 
-fn build_resume_copy_plan(db: &Path, session_id: Option<&str>) -> Result<CopyPlan> {
+fn build_resume_copy_plan(
+    db: &Path,
+    session_id: Option<&str>,
+    only_failed: bool,
+    max_attempts: Option<u64>,
+) -> Result<CopyPlan> {
     let conn = open_db(db)?;
     let Some(meta) = load_resume_session_meta(&conn, session_id)? else {
         bail!("no resume session found");
     };
-    let pending = load_resume_pending_items(&conn, &meta.session_id)?;
+    let pending = load_resume_pending_items(&conn, &meta.session_id, only_failed, max_attempts)?;
     let mut items = Vec::new();
     let mut bytes_to_copy = 0u64;
     for rel_path in pending {
@@ -3568,7 +3593,12 @@ fn plan_copy_missing_command(args: PlanCopyMissingArgs) -> Result<()> {
 }
 
 fn resume_plan_command(args: ResumePlanArgs) -> Result<()> {
-    let plan = build_resume_copy_plan(&args.db, args.session_id.as_deref())?;
+    let plan = build_resume_copy_plan(
+        &args.db,
+        args.session_id.as_deref(),
+        args.only_failed,
+        args.max_attempts,
+    )?;
     if let Some(path) = args.out_json.as_ref() {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -7316,7 +7346,7 @@ mod tests {
         recorder.finish(1, 0)?;
 
         let conn = open_readonly_db(&db)?;
-        let pending = load_resume_pending_items(&conn, &recorder.session_id)?;
+        let pending = load_resume_pending_items(&conn, &recorder.session_id, false, None)?;
         assert!(pending.is_empty());
         let status: String = conn.query_row(
             "SELECT status FROM copy_resume_items WHERE session_id = ?1 AND rel_path = 'a.bin'",
@@ -7381,7 +7411,7 @@ mod tests {
             params![],
         )?;
         recorder.mark_status("a.bin", "failed", 0, Some("x"), true)?;
-        let resume_plan = build_resume_copy_plan(&db, Some(&recorder.session_id))?;
+        let resume_plan = build_resume_copy_plan(&db, Some(&recorder.session_id), false, None)?;
         assert_eq!(resume_plan.items.len(), 1);
         assert_eq!(resume_plan.items[0].rel_path, "a.bin");
         assert_eq!(resume_plan.left_label, "left");
@@ -7447,6 +7477,8 @@ mod tests {
         resume_plan_command(ResumePlanArgs {
             db: db.clone(),
             session_id: Some(recorder.session_id),
+            only_failed: false,
+            max_attempts: None,
             out_json: None,
             execute: true,
             from: Some(src),
@@ -7458,6 +7490,76 @@ mod tests {
             log: None,
             progress_every: 1000,
         })?;
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn resume_plan_filters_failed_and_max_attempts() -> Result<()> {
+        let root = temp_dir("resume_filters");
+        let db = root.join("resume.sqlite");
+        let src = root.join("src");
+        let dst = root.join("dst");
+        fs::create_dir_all(&src)?;
+        fs::create_dir_all(&dst)?;
+        fs::write(src.join("a.bin"), b"a")?;
+        fs::write(src.join("b.bin"), b"b")?;
+        fs::write(src.join("c.bin"), b"c")?;
+
+        let plan = CopyPlan {
+            mode: "copy-missing".to_string(),
+            left_label: "left".to_string(),
+            right_label: "right".to_string(),
+            left_db: Some(db.display().to_string()),
+            right_db: None,
+            generated_at_ns: 0,
+            summary: CopyPlanSummary {
+                files_to_copy: 3,
+                bytes_to_copy: 3,
+                left_files: 3,
+                right_files: 0,
+            },
+            items: vec![],
+        };
+        let args = CopyRunArgs {
+            source_root: src.clone(),
+            destination_root: dst.clone(),
+            backup_dir: None,
+            overwrite: false,
+            dry_run: false,
+            stop_on_error: false,
+            log: None,
+            progress_every: 1000,
+            size_only: false,
+            hash: false,
+            copy_links_as_files: false,
+        };
+        let recorder = ResumeRecorder::start(&plan, &args, 3)?.expect("recorder");
+        let conn = open_db(&db)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO files(label, rel_path, file_type, size, mtime_ns, fast_hash, scanned_at) VALUES('left','a.bin','file',1,0,NULL,0)",
+            params![],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO files(label, rel_path, file_type, size, mtime_ns, fast_hash, scanned_at) VALUES('left','b.bin','file',1,0,NULL,0)",
+            params![],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO files(label, rel_path, file_type, size, mtime_ns, fast_hash, scanned_at) VALUES('left','c.bin','file',1,0,NULL,0)",
+            params![],
+        )?;
+        recorder.mark_status("a.bin", "failed", 0, Some("x"), true)?;
+        recorder.mark_status("b.bin", "failed", 0, Some("x"), true)?;
+        recorder.mark_status("b.bin", "failed", 0, Some("x"), true)?;
+        recorder.mark_status("c.bin", "pending", 0, None, true)?;
+
+        let failed_only = build_resume_copy_plan(&db, Some(&recorder.session_id), true, None)?;
+        assert_eq!(failed_only.items.len(), 2);
+        let failed_limited =
+            build_resume_copy_plan(&db, Some(&recorder.session_id), true, Some(1))?;
+        assert_eq!(failed_limited.items.len(), 1);
+        assert_eq!(failed_limited.items[0].rel_path, "a.bin");
 
         fs::remove_dir_all(root).ok();
         Ok(())
