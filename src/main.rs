@@ -94,6 +94,9 @@ CREATE TABLE IF NOT EXISTS file_fingerprints (
     binary_descriptor TEXT,
     text_signature TEXT,
     archive_signature TEXT,
+    binary_similarity_key TEXT,
+    text_similarity_key TEXT,
+    archive_similarity_key TEXT,
     scanned_at INTEGER NOT NULL,
     PRIMARY KEY (label, rel_path)
 );
@@ -373,6 +376,8 @@ struct ArchiveMemberDiffArgs {
     out_json: Option<PathBuf>,
     #[arg(long)]
     out_csv: Option<PathBuf>,
+    #[arg(long = "nested-stats")]
+    nested_stats: bool,
 }
 
 #[derive(Args)]
@@ -640,6 +645,8 @@ struct MergePlan {
     policy: MergePolicy,
     imports_root: String,
     canonical_root: String,
+    #[serde(default)]
+    summary: MergePlanSummary,
     items: Vec<MergePlanItem>,
 }
 
@@ -651,6 +658,14 @@ struct MergePlanItem {
     destination: String,
     decision: String,
     reason: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct MergePlanSummary {
+    total_items: usize,
+    apply_items: usize,
+    keep_both_items: usize,
+    manual_items: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -771,6 +786,12 @@ struct FileFingerprintProfile {
     binary_descriptor: Option<String>,
     text_signature: Option<String>,
     archive_signature: Option<String>,
+    #[serde(default)]
+    binary_similarity_key: Option<String>,
+    #[serde(default)]
+    text_similarity_key: Option<String>,
+    #[serde(default)]
+    archive_similarity_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -883,8 +904,32 @@ struct ArchiveMemberDiffReport {
     payload_family_matches: usize,
     left_only_count: usize,
     right_only_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nested_stats: Option<ArchiveMemberNestedStats>,
     left_only: Vec<ArchiveMemberDiffEntry>,
     right_only: Vec<ArchiveMemberDiffEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct ArchiveMemberNestedDepthStat {
+    archive_depth: usize,
+    left_members: usize,
+    right_members: usize,
+    exact_member_overlaps: usize,
+    left_only_members: usize,
+    right_only_members: usize,
+    payload_family_overlaps: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ArchiveMemberNestedStats {
+    left_nested_members: usize,
+    right_nested_members: usize,
+    nested_exact_member_overlaps: usize,
+    nested_payload_family_overlaps: usize,
+    left_max_depth: usize,
+    right_max_depth: usize,
+    depth_stats: Vec<ArchiveMemberNestedDepthStat>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1556,7 +1601,7 @@ fn scan_command(args: ScanArgs) -> Result<()> {
 
         let existing_profile = if file_meta_unchanged {
             conn.query_row(
-                "SELECT normalized_name, normalized_folder, ext, is_binary, is_archive, archive_family, language, size_class, binary_signature, binary_descriptor, text_signature, archive_signature FROM file_fingerprints WHERE label = ?1 AND rel_path = ?2",
+                "SELECT normalized_name, normalized_folder, ext, is_binary, is_archive, archive_family, language, size_class, binary_signature, binary_descriptor, text_signature, archive_signature, binary_similarity_key, text_similarity_key, archive_similarity_key FROM file_fingerprints WHERE label = ?1 AND rel_path = ?2",
                 params![&args.label, &rel_path],
                 |row| {
                     let is_binary: i64 = row.get(3)?;
@@ -1574,6 +1619,9 @@ fn scan_command(args: ScanArgs) -> Result<()> {
                         binary_descriptor: row.get(9)?,
                         text_signature: row.get(10)?,
                         archive_signature: row.get(11)?,
+                        binary_similarity_key: row.get(12)?,
+                        text_similarity_key: row.get(13)?,
+                        archive_similarity_key: row.get(14)?,
                     })
                 },
             )
@@ -1616,6 +1664,12 @@ fn scan_command(args: ScanArgs) -> Result<()> {
             {
                 profile.text_signature = Some(text_signature);
             }
+            profile.binary_similarity_key =
+                infer_similarity_key("b", profile.binary_signature.as_deref());
+            profile.text_similarity_key =
+                infer_similarity_key("t", profile.text_signature.as_deref());
+            profile.archive_similarity_key =
+                infer_similarity_key("a", profile.archive_signature.as_deref());
             store_cached_file_fingerprint_profile(
                 &conn,
                 &rel_path,
@@ -1668,9 +1722,12 @@ fn scan_command(args: ScanArgs) -> Result<()> {
                 binary_descriptor,
                 text_signature,
                 archive_signature,
+                binary_similarity_key,
+                text_similarity_key,
+                archive_similarity_key,
                 scanned_at
             )
-            VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
             ON CONFLICT(label, rel_path) DO UPDATE SET
                 normalized_name = excluded.normalized_name,
                 normalized_folder = excluded.normalized_folder,
@@ -1684,6 +1741,9 @@ fn scan_command(args: ScanArgs) -> Result<()> {
                 binary_descriptor = excluded.binary_descriptor,
                 text_signature = excluded.text_signature,
                 archive_signature = excluded.archive_signature,
+                binary_similarity_key = excluded.binary_similarity_key,
+                text_similarity_key = excluded.text_similarity_key,
+                archive_similarity_key = excluded.archive_similarity_key,
                 scanned_at = excluded.scanned_at
             "#,
             params![
@@ -1701,6 +1761,9 @@ fn scan_command(args: ScanArgs) -> Result<()> {
                 &fingerprint_profile.binary_descriptor,
                 &fingerprint_profile.text_signature,
                 &fingerprint_profile.archive_signature,
+                &fingerprint_profile.binary_similarity_key,
+                &fingerprint_profile.text_similarity_key,
+                &fingerprint_profile.archive_similarity_key,
                 scanned_at
             ],
         )?;
@@ -2021,8 +2084,13 @@ fn extract_check_command(args: ExtractCheckArgs) -> Result<()> {
 fn archive_member_diff_command(args: ArchiveMemberDiffArgs) -> Result<()> {
     let left_conn = open_readonly_db(&args.left_db)?;
     let right_conn = open_readonly_db(&args.right_db)?;
-    let report =
-        build_archive_member_diff_report(&left_conn, &right_conn, &args.left, &args.right)?;
+    let report = build_archive_member_diff_report(
+        &left_conn,
+        &right_conn,
+        &args.left,
+        &args.right,
+        args.nested_stats,
+    )?;
     let json = serde_json::to_string_pretty(&report)?;
     println!("{json}");
     if let Some(path) = args.out_json {
@@ -2049,6 +2117,7 @@ fn build_archive_member_diff_report(
     right_conn: &Connection,
     left_label: &str,
     right_label: &str,
+    include_nested_stats: bool,
 ) -> Result<ArchiveMemberDiffReport> {
     let mut left_entries = load_virtual_archive_entries(left_conn, left_label)?;
     if left_entries.is_empty() {
@@ -2124,6 +2193,16 @@ fn build_archive_member_diff_report(
 
     left_only.sort_by(|a, b| a.virtual_member.cmp(&b.virtual_member));
     right_only.sort_by(|a, b| a.virtual_member.cmp(&b.virtual_member));
+    let nested_stats = if include_nested_stats {
+        Some(build_archive_member_nested_stats(
+            &left_map,
+            &right_map,
+            &left_only,
+            &right_only,
+        ))
+    } else {
+        None
+    };
 
     Ok(ArchiveMemberDiffReport {
         report_schema: ARCHIVE_MEMBER_DIFF_REPORT_SCHEMA.to_string(),
@@ -2136,6 +2215,7 @@ fn build_archive_member_diff_report(
         payload_family_matches,
         left_only_count: left_only.len(),
         right_only_count: right_only.len(),
+        nested_stats,
         left_only,
         right_only,
     })
@@ -2230,10 +2310,134 @@ fn build_archive_member_plan_rows(report: &ArchiveMemberDiffReport) -> Vec<Archi
     rows
 }
 
+fn build_archive_member_nested_stats(
+    left_map: &HashMap<String, ExtractCheckEntry>,
+    right_map: &HashMap<String, ExtractCheckEntry>,
+    left_only: &[ArchiveMemberDiffEntry],
+    right_only: &[ArchiveMemberDiffEntry],
+) -> ArchiveMemberNestedStats {
+    let mut left_depth_counts: HashMap<usize, usize> = HashMap::new();
+    let mut right_depth_counts: HashMap<usize, usize> = HashMap::new();
+    let mut exact_depth_counts: HashMap<usize, usize> = HashMap::new();
+    let mut left_only_depth_counts: HashMap<usize, usize> = HashMap::new();
+    let mut right_only_depth_counts: HashMap<usize, usize> = HashMap::new();
+    let mut payload_overlap_depth_counts: HashMap<usize, usize> = HashMap::new();
+
+    let mut left_nested_members = 0usize;
+    let mut right_nested_members = 0usize;
+    let mut nested_exact_member_overlaps = 0usize;
+    let mut nested_payload_family_overlaps = 0usize;
+    let mut left_max_depth = 0usize;
+    let mut right_max_depth = 0usize;
+
+    for entry in left_map.values() {
+        *left_depth_counts.entry(entry.archive_depth).or_insert(0) += 1;
+        if entry.archive_depth > 1 {
+            left_nested_members += 1;
+        }
+        left_max_depth = left_max_depth.max(entry.archive_depth);
+    }
+    for entry in right_map.values() {
+        *right_depth_counts.entry(entry.archive_depth).or_insert(0) += 1;
+        if entry.archive_depth > 1 {
+            right_nested_members += 1;
+        }
+        right_max_depth = right_max_depth.max(entry.archive_depth);
+    }
+
+    for (member, left_entry) in left_map {
+        if right_map.contains_key(member) {
+            *exact_depth_counts
+                .entry(left_entry.archive_depth)
+                .or_insert(0) += 1;
+            if left_entry.archive_depth > 1 {
+                nested_exact_member_overlaps += 1;
+            }
+        }
+    }
+
+    for item in left_only {
+        *left_only_depth_counts
+            .entry(item.archive_depth)
+            .or_insert(0) += 1;
+    }
+    for item in right_only {
+        *right_only_depth_counts
+            .entry(item.archive_depth)
+            .or_insert(0) += 1;
+    }
+
+    let mut left_nested_payloads = HashSet::new();
+    for item in left_only {
+        if item.archive_depth > 1 {
+            if let (Some(fam), Some(sig)) = (&item.archive_family, &item.payload_signature) {
+                left_nested_payloads.insert(format!("{fam}|{sig}"));
+            }
+        }
+    }
+    for item in right_only {
+        if item.archive_depth > 1 {
+            if let (Some(fam), Some(sig)) = (&item.archive_family, &item.payload_signature) {
+                if left_nested_payloads.contains(&format!("{fam}|{sig}")) {
+                    nested_payload_family_overlaps += 1;
+                    *payload_overlap_depth_counts
+                        .entry(item.archive_depth)
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    let mut depths = left_depth_counts
+        .keys()
+        .chain(right_depth_counts.keys())
+        .chain(exact_depth_counts.keys())
+        .chain(left_only_depth_counts.keys())
+        .chain(right_only_depth_counts.keys())
+        .chain(payload_overlap_depth_counts.keys())
+        .copied()
+        .collect::<Vec<_>>();
+    depths.sort_unstable();
+    depths.dedup();
+
+    let depth_stats = depths
+        .into_iter()
+        .map(|archive_depth| ArchiveMemberNestedDepthStat {
+            archive_depth,
+            left_members: left_depth_counts.get(&archive_depth).copied().unwrap_or(0),
+            right_members: right_depth_counts.get(&archive_depth).copied().unwrap_or(0),
+            exact_member_overlaps: exact_depth_counts.get(&archive_depth).copied().unwrap_or(0),
+            left_only_members: left_only_depth_counts
+                .get(&archive_depth)
+                .copied()
+                .unwrap_or(0),
+            right_only_members: right_only_depth_counts
+                .get(&archive_depth)
+                .copied()
+                .unwrap_or(0),
+            payload_family_overlaps: payload_overlap_depth_counts
+                .get(&archive_depth)
+                .copied()
+                .unwrap_or(0),
+        })
+        .collect::<Vec<_>>();
+
+    ArchiveMemberNestedStats {
+        left_nested_members,
+        right_nested_members,
+        nested_exact_member_overlaps,
+        nested_payload_family_overlaps,
+        left_max_depth,
+        right_max_depth,
+        depth_stats,
+    }
+}
+
 fn archive_member_plan_command(args: ArchiveMemberPlanArgs) -> Result<()> {
     let left_conn = open_readonly_db(&args.left_db)?;
     let right_conn = open_readonly_db(&args.right_db)?;
-    let diff = build_archive_member_diff_report(&left_conn, &right_conn, &args.left, &args.right)?;
+    let diff =
+        build_archive_member_diff_report(&left_conn, &right_conn, &args.left, &args.right, false)?;
     let rows = build_archive_member_plan_rows(&diff);
     let report = ArchiveMemberPlanReport {
         report_schema: ARCHIVE_MEMBER_PLAN_REPORT_SCHEMA.to_string(),
@@ -2322,6 +2526,7 @@ fn archive_member_merge_plan_command(args: ArchiveMemberMergePlanArgs) -> Result
         policy: args.policy,
         imports_root: args.imports_root.display().to_string(),
         canonical_root: args.canonical_root.display().to_string(),
+        summary: build_merge_plan_summary(&items),
         items,
     };
 
@@ -2339,9 +2544,12 @@ fn archive_member_merge_plan_command(args: ArchiveMemberMergePlanArgs) -> Result
     }
     println!("{json}");
     eprintln!(
-        "[archive-member-merge-plan] items: {} from rows: {}",
+        "[archive-member-merge-plan] items: {} from rows: {} (apply={} keep_both={} manual={})",
         plan.items.len(),
-        report.rows.len()
+        report.rows.len(),
+        plan.summary.apply_items,
+        plan.summary.keep_both_items,
+        plan.summary.manual_items
     );
     Ok(())
 }
@@ -2774,6 +2982,79 @@ fn build_archive_member_diff_csv(report: &ArchiveMemberDiffReport) -> String {
             report.payload_family_matches
         ),
     );
+    if let Some(stats) = &report.nested_stats {
+        let _ = std::fmt::Write::write_fmt(
+            &mut csv,
+            format_args!(
+                "nested_summary,{},{},left_nested_members,{}\n",
+                csv_escape(&report.left_label),
+                csv_escape(&report.right_label),
+                stats.left_nested_members
+            ),
+        );
+        let _ = std::fmt::Write::write_fmt(
+            &mut csv,
+            format_args!(
+                "nested_summary,{},{},right_nested_members,{}\n",
+                csv_escape(&report.left_label),
+                csv_escape(&report.right_label),
+                stats.right_nested_members
+            ),
+        );
+        let _ = std::fmt::Write::write_fmt(
+            &mut csv,
+            format_args!(
+                "nested_summary,{},{},nested_exact_member_overlaps,{}\n",
+                csv_escape(&report.left_label),
+                csv_escape(&report.right_label),
+                stats.nested_exact_member_overlaps
+            ),
+        );
+        let _ = std::fmt::Write::write_fmt(
+            &mut csv,
+            format_args!(
+                "nested_summary,{},{},nested_payload_family_overlaps,{}\n",
+                csv_escape(&report.left_label),
+                csv_escape(&report.right_label),
+                stats.nested_payload_family_overlaps
+            ),
+        );
+        let _ = std::fmt::Write::write_fmt(
+            &mut csv,
+            format_args!(
+                "nested_summary,{},{},left_max_depth,{}\n",
+                csv_escape(&report.left_label),
+                csv_escape(&report.right_label),
+                stats.left_max_depth
+            ),
+        );
+        let _ = std::fmt::Write::write_fmt(
+            &mut csv,
+            format_args!(
+                "nested_summary,{},{},right_max_depth,{}\n",
+                csv_escape(&report.left_label),
+                csv_escape(&report.right_label),
+                stats.right_max_depth
+            ),
+        );
+        for row in &stats.depth_stats {
+            let _ = std::fmt::Write::write_fmt(
+                &mut csv,
+                format_args!(
+                    "nested_depth,{},{},depth:{},left_members={},right_members={},exact_member_overlaps={},left_only_members={},right_only_members={},payload_family_overlaps={}\n",
+                    csv_escape(&report.left_label),
+                    csv_escape(&report.right_label),
+                    row.archive_depth,
+                    row.left_members,
+                    row.right_members,
+                    row.exact_member_overlaps,
+                    row.left_only_members,
+                    row.right_only_members,
+                    row.payload_family_overlaps
+                ),
+            );
+        }
+    }
     for item in &report.left_only {
         let _ = std::fmt::Write::write_fmt(
             &mut csv,
@@ -3148,6 +3429,9 @@ struct InspectCacheLabelRow {
     with_binary_descriptor: usize,
     with_text_signature: usize,
     with_archive_signature: usize,
+    with_binary_similarity_key: usize,
+    with_text_similarity_key: usize,
+    with_archive_similarity_key: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -3238,14 +3522,26 @@ fn inspect_cache_command(args: InspectCacheArgs) -> Result<()> {
             params![&label],
             |row| row.get(0),
         )?;
-        let (profiles, with_binary_signature, with_binary_descriptor, with_text_signature, with_archive_signature): (i64, i64, i64, i64, i64) =
+        let (
+            profiles,
+            with_binary_signature,
+            with_binary_descriptor,
+            with_text_signature,
+            with_archive_signature,
+            with_binary_similarity_key,
+            with_text_similarity_key,
+            with_archive_similarity_key,
+        ): (i64, i64, i64, i64, i64, i64, i64, i64) =
             conn.query_row(
                 "SELECT
                     COUNT(*),
                     SUM(CASE WHEN binary_signature IS NOT NULL AND binary_signature <> '' THEN 1 ELSE 0 END),
                     SUM(CASE WHEN binary_descriptor IS NOT NULL AND binary_descriptor <> '' THEN 1 ELSE 0 END),
                     SUM(CASE WHEN text_signature IS NOT NULL AND text_signature <> '' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN archive_signature IS NOT NULL AND archive_signature <> '' THEN 1 ELSE 0 END)
+                    SUM(CASE WHEN archive_signature IS NOT NULL AND archive_signature <> '' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN binary_similarity_key IS NOT NULL AND binary_similarity_key <> '' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN text_similarity_key IS NOT NULL AND text_similarity_key <> '' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN archive_similarity_key IS NOT NULL AND archive_similarity_key <> '' THEN 1 ELSE 0 END)
                  FROM file_fingerprints
                  WHERE label = ?1",
                 params![&label],
@@ -3256,6 +3552,9 @@ fn inspect_cache_command(args: InspectCacheArgs) -> Result<()> {
                         row.get::<_, Option<i64>>(2)?.unwrap_or(0),
                         row.get::<_, Option<i64>>(3)?.unwrap_or(0),
                         row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                        row.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                        row.get::<_, Option<i64>>(6)?.unwrap_or(0),
+                        row.get::<_, Option<i64>>(7)?.unwrap_or(0),
                     ))
                 },
             )?;
@@ -3276,6 +3575,9 @@ fn inspect_cache_command(args: InspectCacheArgs) -> Result<()> {
             with_binary_descriptor: with_binary_descriptor.max(0) as usize,
             with_text_signature: with_text_signature.max(0) as usize,
             with_archive_signature: with_archive_signature.max(0) as usize,
+            with_binary_similarity_key: with_binary_similarity_key.max(0) as usize,
+            with_text_similarity_key: with_text_similarity_key.max(0) as usize,
+            with_archive_similarity_key: with_archive_similarity_key.max(0) as usize,
         });
     }
 
@@ -3365,6 +3667,21 @@ fn merge_decision_for(row: &MergeActionCsvRow, policy: MergePolicy) -> (&'static
     }
 }
 
+fn build_merge_plan_summary(items: &[MergePlanItem]) -> MergePlanSummary {
+    let mut summary = MergePlanSummary {
+        total_items: items.len(),
+        ..MergePlanSummary::default()
+    };
+    for item in items {
+        match item.decision.as_str() {
+            "apply" => summary.apply_items += 1,
+            "keep_both" => summary.keep_both_items += 1,
+            _ => summary.manual_items += 1,
+        }
+    }
+    summary
+}
+
 fn merge_plan_command(args: MergePlanArgs) -> Result<()> {
     let rows = parse_merge_actions_csv(&args.actions_csv)?;
     let mut items = Vec::new();
@@ -3395,6 +3712,7 @@ fn merge_plan_command(args: MergePlanArgs) -> Result<()> {
         policy: args.policy,
         imports_root: args.imports_root.display().to_string(),
         canonical_root: args.canonical_root.display().to_string(),
+        summary: build_merge_plan_summary(&items),
         items,
     };
     if let Some(parent) = args.out_json.parent() {
@@ -3405,6 +3723,13 @@ fn merge_plan_command(args: MergePlanArgs) -> Result<()> {
     std::fs::write(&args.out_json, format!("{json}\n"))
         .with_context(|| format!("failed to write {}", args.out_json.display()))?;
     println!("{json}");
+    eprintln!(
+        "[merge-plan] items={} apply={} keep_both={} manual={}",
+        plan.summary.total_items,
+        plan.summary.apply_items,
+        plan.summary.keep_both_items,
+        plan.summary.manual_items
+    );
     Ok(())
 }
 
@@ -3503,7 +3828,7 @@ fn merge_apply_command(args: MergeApplyArgs) -> Result<()> {
         }
     }
     println!(
-        "{{\"applied\":{},\"manual\":{},\"kept_both\":{},\"skipped_existing\":{},\"conflicts\":{},\"failed\":{},\"renamed_targets\":{},\"dry_run\":{},\"policy\":\"{}\"}}",
+        "{{\"applied\":{},\"manual\":{},\"kept_both\":{},\"skipped_existing\":{},\"conflicts\":{},\"failed\":{},\"renamed_targets\":{},\"dry_run\":{},\"policy\":\"{}\",\"planned_items\":{},\"plan_apply_items\":{},\"plan_keep_both_items\":{},\"plan_manual_items\":{},\"conflicts_label\":\"destination_exists_skip_without_overwrite\",\"conflicts_non_destructive\":true}}",
         applied,
         manual,
         kept_both,
@@ -3512,7 +3837,11 @@ fn merge_apply_command(args: MergeApplyArgs) -> Result<()> {
         failed,
         renamed_targets,
         args.dry_run,
-        plan.policy
+        plan.policy,
+        plan.summary.total_items,
+        plan.summary.apply_items,
+        plan.summary.keep_both_items,
+        plan.summary.manual_items
     );
     Ok(())
 }
@@ -4647,6 +4976,9 @@ fn build_file_fingerprint_profile(
             binary_descriptor: None,
             text_signature: None,
             archive_signature: None,
+            binary_similarity_key: None,
+            text_similarity_key: None,
+            archive_similarity_key: None,
         };
     }
 
@@ -4689,6 +5021,9 @@ fn build_file_fingerprint_profile(
     } else {
         None
     };
+    let binary_similarity_key = infer_similarity_key("b", binary_signature.as_deref());
+    let text_similarity_key = infer_similarity_key("t", text_signature.as_deref());
+    let archive_similarity_key = infer_similarity_key("a", archive_signature.as_deref());
 
     FileFingerprintProfile {
         normalized_name,
@@ -4703,6 +5038,9 @@ fn build_file_fingerprint_profile(
         binary_descriptor,
         text_signature,
         archive_signature,
+        binary_similarity_key,
+        text_similarity_key,
+        archive_similarity_key,
     }
 }
 
@@ -5315,6 +5653,22 @@ fn infer_text_signature(rel_path: &str, language: &str, normalized_name: &str) -
         normalized_name.to_string()
     };
     format!("{language}:{semantic_name}")
+}
+
+fn infer_similarity_key(kind: &str, value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(kind.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(value.as_bytes());
+    let digest = hasher.finalize().to_hex().to_string();
+    Some(format!(
+        "{kind}:{}",
+        digest.chars().take(12).collect::<String>()
+    ))
 }
 
 fn infer_semantic_text_signature_from_file(
@@ -8034,6 +8388,24 @@ fn ensure_file_fingerprint_columns(conn: &Connection) -> Result<()> {
             (),
         )?;
     }
+    if !cols.contains("binary_similarity_key") {
+        conn.execute(
+            "ALTER TABLE file_fingerprints ADD COLUMN binary_similarity_key TEXT",
+            (),
+        )?;
+    }
+    if !cols.contains("text_similarity_key") {
+        conn.execute(
+            "ALTER TABLE file_fingerprints ADD COLUMN text_similarity_key TEXT",
+            (),
+        )?;
+    }
+    if !cols.contains("archive_similarity_key") {
+        conn.execute(
+            "ALTER TABLE file_fingerprints ADD COLUMN archive_similarity_key TEXT",
+            (),
+        )?;
+    }
     Ok(())
 }
 
@@ -8171,6 +8543,9 @@ fn load_file_fingerprint_profiles(
     let has_language = columns.contains("language");
     let has_size_class = columns.contains("size_class");
     let has_binary_descriptor = columns.contains("binary_descriptor");
+    let has_similarity_columns = columns.contains("binary_similarity_key")
+        && columns.contains("text_similarity_key")
+        && columns.contains("archive_similarity_key");
     let has_signature_columns = columns.contains("binary_signature")
         && columns.contains("text_signature")
         && columns.contains("archive_signature");
@@ -8182,8 +8557,14 @@ fn load_file_fingerprint_profiles(
         return Ok(HashMap::new());
     }
 
-    let query = if has_language && has_size_class && has_signature_columns && has_binary_descriptor
+    let query = if has_language
+        && has_size_class
+        && has_signature_columns
+        && has_binary_descriptor
+        && has_similarity_columns
     {
+        "SELECT rel_path, normalized_name, normalized_folder, ext, is_binary, is_archive, archive_family, language, size_class, binary_signature, binary_descriptor, text_signature, archive_signature, binary_similarity_key, text_similarity_key, archive_similarity_key FROM file_fingerprints WHERE label = ?1 ORDER BY rel_path"
+    } else if has_language && has_size_class && has_signature_columns && has_binary_descriptor {
         "SELECT rel_path, normalized_name, normalized_folder, ext, is_binary, is_archive, archive_family, language, size_class, binary_signature, binary_descriptor, text_signature, archive_signature FROM file_fingerprints WHERE label = ?1 ORDER BY rel_path"
     } else if has_language && has_size_class && has_signature_columns {
         "SELECT rel_path, normalized_name, normalized_folder, ext, is_binary, is_archive, archive_family, language, size_class, binary_signature, text_signature, archive_signature FROM file_fingerprints WHERE label = ?1 ORDER BY rel_path"
@@ -8202,8 +8583,9 @@ fn load_file_fingerprint_profiles(
                 has_size_class,
                 has_signature_columns,
                 has_binary_descriptor,
+                has_similarity_columns,
             ) {
-                (true, true, true, true) => (
+                (true, true, true, true, true) => (
                     row.get::<_, String>(0)?,
                     FileFingerprintProfile {
                         normalized_name: row.get(1)?,
@@ -8218,9 +8600,32 @@ fn load_file_fingerprint_profiles(
                         binary_descriptor: row.get(10)?,
                         text_signature: row.get(11)?,
                         archive_signature: row.get(12)?,
+                        binary_similarity_key: row.get(13)?,
+                        text_similarity_key: row.get(14)?,
+                        archive_similarity_key: row.get(15)?,
                     },
                 ),
-                (true, true, true, false) => (
+                (true, true, true, true, false) => (
+                    row.get::<_, String>(0)?,
+                    FileFingerprintProfile {
+                        normalized_name: row.get(1)?,
+                        normalized_folder: row.get(2)?,
+                        ext: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        is_binary: is_binary != 0,
+                        is_archive: is_archive != 0,
+                        archive_family: row.get(6)?,
+                        language: row.get(7)?,
+                        size_class: row.get(8)?,
+                        binary_signature: row.get(9)?,
+                        binary_descriptor: row.get(10)?,
+                        text_signature: row.get(11)?,
+                        archive_signature: row.get(12)?,
+                        binary_similarity_key: None,
+                        text_similarity_key: None,
+                        archive_similarity_key: None,
+                    },
+                ),
+                (true, true, true, false, _) => (
                     row.get::<_, String>(0)?,
                     FileFingerprintProfile {
                         normalized_name: row.get(1)?,
@@ -8235,9 +8640,12 @@ fn load_file_fingerprint_profiles(
                         binary_descriptor: None,
                         text_signature: row.get(10)?,
                         archive_signature: row.get(11)?,
+                        binary_similarity_key: None,
+                        text_similarity_key: None,
+                        archive_similarity_key: None,
                     },
                 ),
-                (true, true, false, _) => (
+                (true, true, false, _, _) => (
                     row.get::<_, String>(0)?,
                     FileFingerprintProfile {
                         normalized_name: row.get(1)?,
@@ -8252,6 +8660,9 @@ fn load_file_fingerprint_profiles(
                         binary_descriptor: None,
                         text_signature: None,
                         archive_signature: None,
+                        binary_similarity_key: None,
+                        text_similarity_key: None,
+                        archive_similarity_key: None,
                     },
                 ),
                 _ => (
@@ -8269,6 +8680,9 @@ fn load_file_fingerprint_profiles(
                         binary_descriptor: None,
                         text_signature: None,
                         archive_signature: None,
+                        binary_similarity_key: None,
+                        text_similarity_key: None,
+                        archive_similarity_key: None,
                     },
                 ),
             },
@@ -10536,6 +10950,12 @@ mod tests {
             out_json: plan_path.clone(),
         })?;
         assert!(plan_path.exists());
+        let plan_raw = fs::read_to_string(&plan_path)?;
+        let plan_json: serde_json::Value = serde_json::from_str(&plan_raw)?;
+        assert_eq!(plan_json["summary"]["total_items"], 1);
+        assert_eq!(plan_json["summary"]["apply_items"], 1);
+        assert_eq!(plan_json["summary"]["keep_both_items"], 0);
+        assert_eq!(plan_json["summary"]["manual_items"], 0);
         merge_apply_command(MergeApplyArgs {
             plan: plan_path,
             dry_run: true,
@@ -10571,6 +10991,9 @@ mod tests {
             policy: MergePolicy::PreferNewer,
             out_json: apply_plan.clone(),
         })?;
+        let apply_plan_raw = fs::read_to_string(&apply_plan)?;
+        let apply_plan_json: serde_json::Value = serde_json::from_str(&apply_plan_raw)?;
+        assert_eq!(apply_plan_json["summary"]["apply_items"], 1);
         merge_apply_command(MergeApplyArgs {
             plan: apply_plan,
             dry_run: false,
@@ -10585,6 +11008,9 @@ mod tests {
             policy: MergePolicy::KeepBoth,
             out_json: keep_both_plan.clone(),
         })?;
+        let keep_both_plan_raw = fs::read_to_string(&keep_both_plan)?;
+        let keep_both_plan_json: serde_json::Value = serde_json::from_str(&keep_both_plan_raw)?;
+        assert_eq!(keep_both_plan_json["summary"]["keep_both_items"], 1);
         merge_apply_command(MergeApplyArgs {
             plan: keep_both_plan,
             dry_run: false,
@@ -10593,6 +11019,45 @@ mod tests {
         let keep_both_path = canonical.join("010001.from_import/sub/poc.bin");
         assert!(keep_both_path.exists());
         assert_eq!(fs::read(keep_both_path)?, b"abc");
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn merge_apply_supports_legacy_plan_without_summary_field() -> Result<()> {
+        let root = temp_dir("merge_apply_legacy_plan");
+        let imports = root.join("imports");
+        let canonical = root.join("canonical");
+        fs::create_dir_all(imports.join("A"))?;
+        fs::create_dir_all(canonical.join("010001"))?;
+        fs::write(imports.join("A/poc.bin"), b"abc")?;
+        let plan = root.join("legacy-plan.json");
+        fs::write(
+            &plan,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "schema_version": 1,
+                    "generated_at_ns": now_ns()?,
+                    "policy": "prefer-newer",
+                    "imports_root": imports.display().to_string(),
+                    "canonical_root": canonical.display().to_string(),
+                    "items": [{
+                        "left_folder": "A",
+                        "right_folder": "010001",
+                        "source": imports.join("A/poc.bin").display().to_string(),
+                        "destination": canonical.join("010001/poc.bin").display().to_string(),
+                        "decision": "apply",
+                        "reason": "legacy plan"
+                    }]
+                })
+            ),
+        )?;
+        merge_apply_command(MergeApplyArgs {
+            plan,
+            dry_run: false,
+        })?;
+        assert_eq!(fs::read(canonical.join("010001/poc.bin"))?, b"abc");
         fs::remove_dir_all(root).ok();
         Ok(())
     }
@@ -11306,6 +11771,9 @@ mod tests {
                 binary_descriptor: None,
                 text_signature: Some("markdown:readme".to_string()),
                 archive_signature: None,
+                binary_similarity_key: None,
+                text_similarity_key: None,
+                archive_similarity_key: None,
             },
         );
         profiles.insert(
@@ -11323,6 +11791,9 @@ mod tests {
                 binary_descriptor: Some("desc".to_string()),
                 text_signature: None,
                 archive_signature: Some("tar+gz".to_string()),
+                binary_similarity_key: None,
+                text_similarity_key: None,
+                archive_similarity_key: None,
             },
         );
 
@@ -11671,6 +12142,44 @@ mod tests {
     }
 
     #[test]
+    fn open_db_migrates_legacy_file_fingerprint_columns() -> Result<()> {
+        let root = temp_dir("legacy_fp_migration");
+        let db_path = root.join("legacy.sqlite");
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS file_fingerprints (
+                label TEXT NOT NULL,
+                rel_path TEXT NOT NULL,
+                normalized_name TEXT NOT NULL,
+                normalized_folder TEXT NOT NULL,
+                ext TEXT,
+                is_binary INTEGER NOT NULL,
+                is_archive INTEGER NOT NULL,
+                archive_family TEXT,
+                scanned_at INTEGER NOT NULL,
+                PRIMARY KEY (label, rel_path)
+            );
+            "#,
+        )?;
+        drop(conn);
+
+        let migrated = open_db(&db_path)?;
+        let mut stmt = migrated.prepare("PRAGMA table_info(file_fingerprints)")?;
+        let mut cols = HashSet::new();
+        let mut rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for row in rows.by_ref() {
+            cols.insert(row?);
+        }
+        assert!(cols.contains("binary_similarity_key"));
+        assert!(cols.contains("text_similarity_key"));
+        assert!(cols.contains("archive_similarity_key"));
+        assert!(cols.contains("binary_descriptor"));
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
     fn signature_cache_reuses_and_invalidates_fingerprint_profiles() -> Result<()> {
         let root = temp_dir("signature_cache");
         let db_path = root.join("cache.sqlite");
@@ -11720,6 +12229,52 @@ mod tests {
     }
 
     #[test]
+    fn load_cached_profile_accepts_legacy_json_without_similarity_keys() -> Result<()> {
+        let root = temp_dir("legacy_cache_profile_json");
+        let db_path = root.join("cache.sqlite");
+        let conn = open_db(&db_path)?;
+        let rel_path = "010001/poc_final.py";
+        let file_type = "file";
+        let size = 128u64;
+        let mtime_ns = 10i64;
+        let fast_hash = Some("hash-a");
+        let cache_key = file_signature_cache_key(
+            "file_fingerprint_profile",
+            rel_path,
+            file_type,
+            size,
+            mtime_ns,
+            fast_hash,
+        );
+        let legacy_json = r#"{"normalized_name":"poc","normalized_folder":"010001","ext":"py","is_binary":false,"is_archive":false,"archive_family":null,"language":"python","size_class":"small","binary_signature":null,"binary_descriptor":null,"text_signature":"python:poc","archive_signature":null}"#;
+        conn.execute(
+            "INSERT INTO signature_cache(cache_key, kind, rel_path, file_type, size, mtime_ns, fast_hash, value_json, computed_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                cache_key,
+                "file_fingerprint_profile",
+                rel_path,
+                file_type,
+                size,
+                mtime_ns,
+                fast_hash,
+                legacy_json,
+                1i64
+            ],
+        )?;
+        let loaded = load_cached_file_fingerprint_profile(
+            &conn, rel_path, file_type, size, mtime_ns, fast_hash,
+        )?
+        .expect("legacy cache hit");
+        assert_eq!(loaded.text_signature, Some("python:poc".to_string()));
+        assert_eq!(loaded.binary_similarity_key, None);
+        assert_eq!(loaded.text_similarity_key, None);
+        assert_eq!(loaded.archive_similarity_key, None);
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
     fn fingerprint_profiles_include_cached_signature_classes() {
         let archive = build_file_fingerprint_profile(
             "fw/qcom_payload_final.tar.gz",
@@ -11738,6 +12293,8 @@ mod tests {
             archive.archive_signature,
             Some("tar:qcom_payload".to_string())
         );
+        assert!(archive.binary_similarity_key.is_some());
+        assert!(archive.archive_similarity_key.is_some());
 
         let source = build_file_fingerprint_profile(
             "01_EXPLOITS/010001/poc_final.py",
@@ -11747,6 +12304,7 @@ mod tests {
         );
         assert_eq!(source.language, "python");
         assert_eq!(source.text_signature, Some("python:poc".to_string()));
+        assert!(source.text_similarity_key.is_some());
         assert!(source.binary_signature.is_none());
         assert!(source.binary_descriptor.is_none());
     }
@@ -11938,6 +12496,9 @@ bad::::line
         assert!(raw.contains("\"label\": \"left\""));
         assert!(raw.contains("\"with_text_signature\""));
         assert!(raw.contains("\"with_binary_signature\""));
+        assert!(raw.contains("\"with_binary_similarity_key\""));
+        assert!(raw.contains("\"with_text_similarity_key\""));
+        assert!(raw.contains("\"with_archive_similarity_key\""));
         fs::remove_dir_all(root).ok();
         Ok(())
     }
@@ -11982,6 +12543,7 @@ bad::::line
             right: "right".to_string(),
             out_json: Some(out_json.clone()),
             out_csv: None,
+            nested_stats: false,
         })?;
 
         let raw = fs::read_to_string(out_json)?;
@@ -11990,6 +12552,164 @@ bad::::line
         assert!(raw.contains("\"left_only_count\": 1"));
         fs::remove_dir_all(root).ok();
         Ok(())
+    }
+
+    #[test]
+    fn archive_member_diff_nested_stats_are_opt_in() -> Result<()> {
+        let root = temp_dir("archive_member_diff_nested_stats");
+        let left_root = root.join("left");
+        let right_root = root.join("right");
+        fs::create_dir_all(&left_root)?;
+        fs::create_dir_all(&right_root)?;
+        fs::write(left_root.join("same.tar.gz"), b"same")?;
+        fs::write(left_root.join("left_only.iso"), b"left")?;
+        fs::write(right_root.join("same.tar.gz"), b"same")?;
+        fs::write(right_root.join("right_only.tar.gz"), b"right")?;
+
+        let left_db = root.join("left.sqlite");
+        let right_db = root.join("right.sqlite");
+        scan_command(ScanArgs {
+            db: left_db.clone(),
+            label: "left".to_string(),
+            root: left_root,
+            exclude_prefixes: vec![],
+            exclude_if_present: vec![],
+            policy: None,
+            hash: true,
+        })?;
+        scan_command(ScanArgs {
+            db: right_db.clone(),
+            label: "right".to_string(),
+            root: right_root,
+            exclude_prefixes: vec![],
+            exclude_if_present: vec![],
+            policy: None,
+            hash: true,
+        })?;
+
+        let out_json = root.join("archive_diff_nested.json");
+        let out_csv = root.join("archive_diff_nested.csv");
+        archive_member_diff_command(ArchiveMemberDiffArgs {
+            left_db,
+            right_db,
+            left: "left".to_string(),
+            right: "right".to_string(),
+            out_json: Some(out_json.clone()),
+            out_csv: Some(out_csv.clone()),
+            nested_stats: true,
+        })?;
+
+        let raw_json = fs::read_to_string(out_json)?;
+        assert!(raw_json.contains("\"nested_stats\""));
+        assert!(raw_json.contains("\"nested_exact_member_overlaps\": 1"));
+        let raw_csv = fs::read_to_string(out_csv)?;
+        assert!(raw_csv.contains("nested_summary,left,right,left_nested_members,1"));
+        assert!(raw_csv.contains("nested_depth,left,right,depth:1,"));
+        assert!(raw_csv.contains("nested_depth,left,right,depth:2,"));
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn archive_member_nested_stats_depth_rows_are_deterministic() {
+        let mut left_map = HashMap::new();
+        left_map.insert(
+            "vm/a".to_string(),
+            ExtractCheckEntry {
+                path: "left/a.iso".to_string(),
+                folder: "left".to_string(),
+                stem: "a".to_string(),
+                virtual_path: "a/@iso".to_string(),
+                virtual_member: "vm/a".to_string(),
+                archive_family: Some("iso".to_string()),
+                payload_signature: Some("iso:a".to_string()),
+                archive_depth: 1,
+                size: 1,
+                mtime_ns: 1,
+                fast_hash: None,
+            },
+        );
+        left_map.insert(
+            "vm/b".to_string(),
+            ExtractCheckEntry {
+                path: "left/b.tar.gz".to_string(),
+                folder: "left".to_string(),
+                stem: "b".to_string(),
+                virtual_path: "b/@tar/gz".to_string(),
+                virtual_member: "vm/b".to_string(),
+                archive_family: Some("tar.gz".to_string()),
+                payload_signature: Some("tar:b".to_string()),
+                archive_depth: 2,
+                size: 1,
+                mtime_ns: 1,
+                fast_hash: None,
+            },
+        );
+
+        let mut right_map = HashMap::new();
+        right_map.insert(
+            "vm/a".to_string(),
+            ExtractCheckEntry {
+                path: "right/a.iso".to_string(),
+                folder: "right".to_string(),
+                stem: "a".to_string(),
+                virtual_path: "a/@iso".to_string(),
+                virtual_member: "vm/a".to_string(),
+                archive_family: Some("iso".to_string()),
+                payload_signature: Some("iso:a".to_string()),
+                archive_depth: 1,
+                size: 1,
+                mtime_ns: 1,
+                fast_hash: None,
+            },
+        );
+        right_map.insert(
+            "vm/c".to_string(),
+            ExtractCheckEntry {
+                path: "right/c.tar.gz".to_string(),
+                folder: "right".to_string(),
+                stem: "c".to_string(),
+                virtual_path: "c/@tar/gz".to_string(),
+                virtual_member: "vm/c".to_string(),
+                archive_family: Some("tar.gz".to_string()),
+                payload_signature: Some("tar:b".to_string()),
+                archive_depth: 2,
+                size: 1,
+                mtime_ns: 1,
+                fast_hash: None,
+            },
+        );
+
+        let left_only = vec![ArchiveMemberDiffEntry {
+            rel_path: "left/b.tar.gz".to_string(),
+            virtual_member: "vm/b".to_string(),
+            archive_family: Some("tar.gz".to_string()),
+            payload_signature: Some("tar:b".to_string()),
+            archive_depth: 2,
+            size: 1,
+            mtime_ns: 1,
+            fast_hash: None,
+        }];
+        let right_only = vec![ArchiveMemberDiffEntry {
+            rel_path: "right/c.tar.gz".to_string(),
+            virtual_member: "vm/c".to_string(),
+            archive_family: Some("tar.gz".to_string()),
+            payload_signature: Some("tar:b".to_string()),
+            archive_depth: 2,
+            size: 1,
+            mtime_ns: 1,
+            fast_hash: None,
+        }];
+
+        let stats =
+            build_archive_member_nested_stats(&left_map, &right_map, &left_only, &right_only);
+        assert_eq!(stats.left_nested_members, 1);
+        assert_eq!(stats.right_nested_members, 1);
+        assert_eq!(stats.nested_exact_member_overlaps, 0);
+        assert_eq!(stats.nested_payload_family_overlaps, 1);
+        assert_eq!(stats.depth_stats.len(), 2);
+        assert_eq!(stats.depth_stats[0].archive_depth, 1);
+        assert_eq!(stats.depth_stats[1].archive_depth, 2);
     }
 
     #[test]
@@ -12005,6 +12725,7 @@ bad::::line
             payload_family_matches: 1,
             left_only_count: 2,
             right_only_count: 2,
+            nested_stats: None,
             left_only: vec![
                 ArchiveMemberDiffEntry {
                     rel_path: "left/match.tar.gz".to_string(),
@@ -12180,6 +12901,7 @@ bad::::line
 
         let raw = fs::read_to_string(&out_json)?;
         assert!(raw.contains("\"policy\": \"prefer-newer\""));
+        assert!(raw.contains("\"summary\""));
         assert!(raw.contains("\"decision\": \"apply\""));
         assert!(raw.contains("\"decision\": \"manual\""));
         let csv = fs::read_to_string(&out_csv)?;

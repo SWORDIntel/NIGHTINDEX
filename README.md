@@ -345,6 +345,20 @@ nightindex rclone \
 `merge-plan` and `merge-apply`  
 Materialize merge actions from dossier action CSV into an executable merge plan.
 
+`merge-plan` JSON now includes a `summary` object:
+- `summary.total_items`
+- `summary.apply_items`
+- `summary.keep_both_items`
+- `summary.manual_items`
+
+`merge-apply` final JSON summary retains existing counters and also includes:
+- `planned_items`
+- `plan_apply_items`
+- `plan_keep_both_items`
+- `plan_manual_items`
+- `conflicts_label` (`destination_exists_skip_without_overwrite`)
+- `conflicts_non_destructive` (`true`, clarifies conflict counts are skip-only and non-destructive)
+
 ```bash
 nightindex merge-plan \
   --actions-csv /tank/nightindex/probable_renamed_actions.csv \
