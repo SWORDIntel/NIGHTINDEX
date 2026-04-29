@@ -3859,6 +3859,26 @@ fn resume_plan_command(args: ResumePlanArgs) -> Result<()> {
     }
 
     if args.execute {
+        let filter_mode = if args.only_failed {
+            "failed-only"
+        } else {
+            "pending+copying+failed"
+        };
+        let attempts_text = args
+            .max_attempts
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        eprintln!(
+            "[resume preflight] session={} files={} bytes={} filter={} max_attempts={} dry_run={} overwrite={}",
+            args.session_id.as_deref().unwrap_or("latest"),
+            plan.items.len(),
+            plan.summary.bytes_to_copy,
+            filter_mode,
+            attempts_text,
+            args.dry_run,
+            args.overwrite
+        );
+
         let source_root = resolve_copy_source_root(
             args.from.as_deref().ok_or_else(|| anyhow!("--from is required with --execute"))?,
             "source",
