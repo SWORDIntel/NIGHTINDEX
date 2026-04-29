@@ -4051,14 +4051,25 @@ fn parse_merge_actions_csv(path: &Path) -> Result<Vec<MergeActionCsvRow>> {
 }
 
 fn merge_decision_for(row: &MergeActionCsvRow, policy: MergePolicy) -> (&'static str, String) {
+    let evidence = format!(
+        "tier={} overlap={:.3} hashes={} norm_names={} shared_files={}",
+        row.confidence_tier,
+        row.overlap_ratio,
+        row.shared_hash_count,
+        row.shared_normalized_file_name_count,
+        row.shared_rel_file_count
+    );
     if row.next_action.contains("manual") {
-        return ("manual", "dossier suggested manual review".to_string());
+        return (
+            "manual",
+            format!("dossier suggested manual review ({evidence})"),
+        );
     }
     match policy {
-        MergePolicy::PreferNewer => ("apply", "prefer-newer policy".to_string()),
-        MergePolicy::PreferLarger => ("apply", "prefer-larger policy".to_string()),
-        MergePolicy::KeepBoth => ("keep_both", "keep-both policy".to_string()),
-        MergePolicy::Manual => ("manual", "manual policy".to_string()),
+        MergePolicy::PreferNewer => ("apply", format!("prefer-newer policy ({evidence})")),
+        MergePolicy::PreferLarger => ("apply", format!("prefer-larger policy ({evidence})")),
+        MergePolicy::KeepBoth => ("keep_both", format!("keep-both policy ({evidence})")),
+        MergePolicy::Manual => ("manual", format!("manual policy ({evidence})")),
     }
 }
 

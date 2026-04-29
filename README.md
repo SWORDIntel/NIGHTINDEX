@@ -508,22 +508,24 @@ Each execute/sync run prints one final summary JSON object with:
 
 ## Roadmap (next phases)
 
-- Upcoming command surfaces (operator planning, not yet wired):
-  - `binary-diff-summary`: fast binary descriptor/delta summary output for rename/noise-heavy payload sets.
-  - `archive-recursive-compare`: recursive cross-archive compare with nested payload reporting.
-  - `merge-apply` policy tuning knobs: `prefer-newer`, `prefer-larger`, `keep-both`, `manual`, with
-    non-destructive conflict labeling retained in run summaries.
-
-Operator-facing prep examples (for runbooks/checklists while wiring lands):
+Operator-facing compare/merge runbook:
 
 ```bash
-# Binary-diff summaries (planned): reserve report path and parse as read-only summary data.
-# nightindex binary-diff-summary --left-db <left.sqlite> --right-db <right.sqlite> ...
+nightindex binary-diff-summary \
+  --left-file /tank/recovery/A.bin \
+  --right-file /tank/recovery/B.bin \
+  --db /tank/nightindex/nightindex.sqlite \
+  --tag nightly-diff
 
-# Archive-recursive compare v2 metrics (planned): track totals by depth/family for regressions.
-# nightindex archive-recursive-compare --left-db <left.sqlite> --right-db <right.sqlite> ...
+nightindex archive-recursive-compare \
+  --left-db /tank/nightindex/left.sqlite \
+  --right-db /tank/nightindex/right.sqlite \
+  --left left \
+  --right right \
+  --max-bucket-items 2000 \
+  --db /tank/nightindex/nightindex.sqlite \
+  --tag nightly-arcmp
 
-# Merge execution policy tuning (available now on merge-plan/merge-apply pipelines):
 nightindex merge-plan \
   --actions-csv /tank/nightindex/actions.csv \
   --imports-root /tank/recovery/_imports \
@@ -532,6 +534,9 @@ nightindex merge-plan \
   --out-json /tmp/merge-plan.json
 nightindex merge-apply --plan /tmp/merge-plan.json --dry-run
 ```
+
+Scale note:
+- `archive-recursive-compare` now supports `--max-bucket-items` to cap heavy bucket vectors while preserving full overlap totals in reported counts.
 
 - Binary diffing: add fast, content-derived binary descriptors and delta-oriented comparison signals to improve same-family file decisions where names/hashes drift.
 - Archive-recursive compare: extend archive-aware matching from member-level diff into recursive cross-archive compare/reporting for nested payload trees.
