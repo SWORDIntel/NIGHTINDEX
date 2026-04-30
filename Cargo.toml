@@ -3,6 +3,9 @@ name = "nightindex"
 version = "0.1.0"
 edition = "2024"
 
+[package.metadata.release]
+check_script = "scripts/release_check.sh"
+
 [[bin]]
 name = "nightindex"
 path = "src/main.rs"

@@ -411,4 +411,78 @@ mod tests {
         assert!(report.buckets.nested_path_overlap_total >= 2);
         assert_eq!(report.buckets.nested_path_overlap.len(), 1);
     }
+
+    #[test]
+    fn high_scale_cap_preserves_totals_and_scores() {
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+
+        for i in 0..120 {
+            let path = format!("exact/shared-{i:04}.tar.gz");
+            left.push(row(&path, 2, "tar.gz"));
+            right.push(row(&path, 2, "tar.gz"));
+        }
+        for i in 0..80 {
+            let path = format!("conflict/shared-{i:04}.zip");
+            left.push(row(&path, 2, "zip"));
+            right.push(row(&path, 2, "rar"));
+        }
+        right.push(row("nestedroot", 1, "tar"));
+        for i in 0..300 {
+            left.push(row(&format!("nestedroot/dir-{i:04}/item.bin"), 3, "binary"));
+        }
+        for i in 0..40 {
+            left.push(row(&format!("left-iso/item-{i:04}.iso"), 2, "iso"));
+        }
+        for i in 0..35 {
+            right.push(row(&format!("right-iso/item-{i:04}.iso"), 2, "iso"));
+        }
+
+        let capped = compare_archive_rows_with_cap(left.clone(), right.clone(), 10);
+        let full = compare_archive_rows(left, right);
+
+        assert_eq!(
+            capped.scores.exact_overlap_score,
+            full.scores.exact_overlap_score
+        );
+        assert_eq!(
+            capped.scores.nested_overlap_score,
+            full.scores.nested_overlap_score
+        );
+        assert_eq!(
+            capped.scores.depth_weighted_overlap_score,
+            full.scores.depth_weighted_overlap_score
+        );
+
+        assert_eq!(
+            capped.buckets.exact_path_overlap_total,
+            full.buckets.exact_path_overlap_total
+        );
+        assert_eq!(
+            capped.buckets.nested_path_overlap_total,
+            full.buckets.nested_path_overlap_total
+        );
+        assert_eq!(
+            capped.buckets.path_payload_conflict_total,
+            full.buckets.path_payload_conflict_total
+        );
+        assert_eq!(
+            capped.buckets.payload_family_only_overlap_total,
+            full.buckets.payload_family_only_overlap_total
+        );
+
+        assert_eq!(full.buckets.exact_path_overlap_total, 200);
+        assert_eq!(full.buckets.nested_path_overlap_total, 300);
+        assert_eq!(full.buckets.path_payload_conflict_total, 80);
+        assert_eq!(full.buckets.payload_family_only_overlap_total, 1);
+        assert_eq!(
+            full.buckets.payload_family_only_overlap,
+            vec!["iso".to_string()]
+        );
+
+        assert_eq!(capped.buckets.exact_path_overlap.len(), 10);
+        assert_eq!(capped.buckets.nested_path_overlap.len(), 10);
+        assert_eq!(capped.buckets.path_payload_conflict.len(), 10);
+        assert_eq!(capped.buckets.payload_family_only_overlap.len(), 1);
+    }
 }

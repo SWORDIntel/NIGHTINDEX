@@ -27,6 +27,31 @@ Alias map:
 - `execute-copy-missing` also has the `execute` alias.
 - `extract-check` also has the `extcheck` alias.
 
+## Release Checklist
+
+Run the reproducible pre-release gate from the repository root:
+
+```bash
+bash scripts/release_check.sh
+```
+
+The script enforces:
+- `cargo fmt --all -- --check`
+- `cargo test --locked --all-targets`
+- `cargo build --release --locked`
+
+Optional strict lint gate:
+
+```bash
+NIGHTINDEX_STRICT_CLIPPY=1 bash scripts/release_check.sh
+```
+
+When `NIGHTINDEX_STRICT_CLIPPY` is unset, clippy runs in non-blocking mode so release checks can still complete on legacy lint debt.
+
+Versioning notes:
+- Bump `[package].version` in `Cargo.toml` before a tagged release.
+- Keep `Cargo.lock` committed so `--locked` checks remain reproducible.
+
 ## Progress Snapshot (2026-04-29)
 
 Implemented and shipping on the active branch:
@@ -247,9 +272,27 @@ ndex merge-apply --plan /tank/nightindex/archive-merge-plan.json
 
 `report-history`  
 Query persisted analysis results recorded by `binary-diff-summary` and `archive-recursive-compare`.
+JSON output includes explicit metadata fields:
+- `report_schema: "nightindex.report_history"`
+- `report_version: 1`
+
+Each `rows[]` item includes:
+- `id`, `report_kind`, `tag`, `left_ref`, `right_ref`
+- `score_primary`, `score_secondary`, `created_at`
 
 ```bash
 nightindex report-history --db /tank/nightindex/nightindex.sqlite --kind binary_diff_summary --limit 50
+
+# Optional quality-of-life filters and sort:
+nightindex report-history \
+  --db /tank/nightindex/nightindex.sqlite \
+  --kind binary_diff_summary \
+  --tag smoke \
+  --left-ref /path/to/left.bin \
+  --right-ref /path/to/right.bin \
+  --min-score-primary 0.80 \
+  --sort score-primary-desc \
+  --limit 25
 ```
 
 `logs`  

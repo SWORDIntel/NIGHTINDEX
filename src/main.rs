@@ -660,8 +660,42 @@ struct ReportHistoryArgs {
     db: PathBuf,
     #[arg(long = "kind")]
     kind: Option<String>,
+    #[arg(long = "tag")]
+    tag: Option<String>,
+    #[arg(long = "left-ref")]
+    left_ref: Option<String>,
+    #[arg(long = "right-ref")]
+    right_ref: Option<String>,
+    #[arg(long = "min-score-primary")]
+    min_score_primary: Option<f64>,
+    #[arg(long = "max-score-primary")]
+    max_score_primary: Option<f64>,
+    #[arg(long = "sort", default_value_t = ReportHistorySort::CreatedDesc)]
+    sort: ReportHistorySort,
     #[arg(long = "limit", default_value_t = 50)]
     limit: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+#[value(rename_all = "kebab-case")]
+enum ReportHistorySort {
+    CreatedDesc,
+    CreatedAsc,
+    ScorePrimaryDesc,
+    ScorePrimaryAsc,
+}
+
+impl std::fmt::Display for ReportHistorySort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::CreatedDesc => "created-desc",
+            Self::CreatedAsc => "created-asc",
+            Self::ScorePrimaryDesc => "score-primary-desc",
+            Self::ScorePrimaryAsc => "score-primary-asc",
+        };
+        f.write_str(value)
+    }
 }
 
 #[derive(Args)]
@@ -3830,18 +3864,22 @@ fn status_command(args: StatusArgs) -> Result<()> {
 }
 
 fn report_history_command(args: ReportHistoryArgs) -> Result<()> {
+    let report = build_report_history_report(args)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn build_report_history_report(args: ReportHistoryArgs) -> Result<ReportHistoryReport> {
     let conn = open_db(&args.db)?;
-    let limit = args.limit.max(1) as i64;
     let mut rows = Vec::new();
     if let Some(kind) = args.kind {
         let mut stmt = conn.prepare(
             "SELECT id, report_kind, tag, left_ref, right_ref, score_primary, score_secondary, created_at
              FROM analysis_reports
              WHERE report_kind = ?1
-             ORDER BY created_at DESC
-             LIMIT ?2",
+             ORDER BY created_at DESC",
         )?;
-        let mapped = stmt.query_map(params![kind, limit], |row| {
+        let mapped = stmt.query_map(params![kind], |row| {
             Ok(ReportHistoryRow {
                 id: row.get(0)?,
                 report_kind: row.get(1)?,
@@ -3860,10 +3898,9 @@ fn report_history_command(args: ReportHistoryArgs) -> Result<()> {
         let mut stmt = conn.prepare(
             "SELECT id, report_kind, tag, left_ref, right_ref, score_primary, score_secondary, created_at
              FROM analysis_reports
-             ORDER BY created_at DESC
-             LIMIT ?1",
+             ORDER BY created_at DESC",
         )?;
-        let mapped = stmt.query_map(params![limit], |row| {
+        let mapped = stmt.query_map([], |row| {
             Ok(ReportHistoryRow {
                 id: row.get(0)?,
                 report_kind: row.get(1)?,
@@ -3879,13 +3916,73 @@ fn report_history_command(args: ReportHistoryArgs) -> Result<()> {
             rows.push(row?);
         }
     }
+    if let Some(tag) = args.tag.as_deref() {
+        rows.retain(|row| row.tag.as_deref() == Some(tag));
+    }
+    if let Some(left_ref) = args.left_ref.as_deref() {
+        rows.retain(|row| row.left_ref.as_deref() == Some(left_ref));
+    }
+    if let Some(right_ref) = args.right_ref.as_deref() {
+        rows.retain(|row| row.right_ref.as_deref() == Some(right_ref));
+    }
+    if let Some(min) = args.min_score_primary {
+        rows.retain(|row| row.score_primary.is_some_and(|score| score >= min));
+    }
+    if let Some(max) = args.max_score_primary {
+        rows.retain(|row| row.score_primary.is_some_and(|score| score <= max));
+    }
+    match args.sort {
+        ReportHistorySort::CreatedDesc => {
+            rows.sort_by(|a, b| {
+                b.created_at
+                    .cmp(&a.created_at)
+                    .then_with(|| b.id.cmp(&a.id))
+            });
+        }
+        ReportHistorySort::CreatedAsc => {
+            rows.sort_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+        }
+        ReportHistorySort::ScorePrimaryDesc => {
+            rows.sort_by(|a, b| {
+                compare_optional_score(a.score_primary, b.score_primary, false)
+                    .then_with(|| b.created_at.cmp(&a.created_at))
+                    .then_with(|| b.id.cmp(&a.id))
+            });
+        }
+        ReportHistorySort::ScorePrimaryAsc => {
+            rows.sort_by(|a, b| {
+                compare_optional_score(a.score_primary, b.score_primary, true)
+                    .then_with(|| b.created_at.cmp(&a.created_at))
+                    .then_with(|| b.id.cmp(&a.id))
+            });
+        }
+    }
+    rows.truncate(args.limit.max(1));
     let report = ReportHistoryReport {
         report_schema: "nightindex.report_history".to_string(),
         report_version: REPORT_VERSION_V1,
         rows,
     };
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    Ok(())
+    Ok(report)
+}
+
+fn compare_optional_score(left: Option<f64>, right: Option<f64>, asc: bool) -> Ordering {
+    match (left, right) {
+        (Some(a), Some(b)) if a.is_finite() && b.is_finite() => {
+            if asc {
+                a.total_cmp(&b)
+            } else {
+                b.total_cmp(&a)
+            }
+        }
+        (Some(a), None) if a.is_finite() => Ordering::Less,
+        (None, Some(b)) if b.is_finite() => Ordering::Greater,
+        _ => Ordering::Equal,
+    }
 }
 
 fn persist_analysis_report(
@@ -13576,6 +13673,105 @@ bad::::line
     }
 
     #[test]
+    fn archive_recursive_compare_high_scale_cap_reports_stable_totals_and_quality() -> Result<()> {
+        let root = temp_dir("archive_recursive_compare_high_scale");
+        let left_db = root.join("left.sqlite");
+        let right_db = root.join("right.sqlite");
+        let left_conn = open_db(&left_db)?;
+        let right_conn = open_db(&right_db)?;
+        let scanned_at = now_ns()?;
+
+        for i in 0..420usize {
+            let rel = format!("bulk/shared-{i:04}.tar.gz");
+            persist_virtual_archive_member(
+                &left_conn,
+                "left",
+                &rel,
+                1,
+                scanned_at,
+                Some("h"),
+                scanned_at,
+            )?;
+            persist_virtual_archive_member(
+                &right_conn,
+                "right",
+                &rel,
+                1,
+                scanned_at,
+                Some("h"),
+                scanned_at,
+            )?;
+        }
+
+        let capped_json = root.join("archive-recursive-capped.json");
+        archive_recursive_compare_command(ArchiveRecursiveCompareArgs {
+            left_db: left_db.clone(),
+            right_db: right_db.clone(),
+            left: "left".to_string(),
+            right: "right".to_string(),
+            out_json: Some(capped_json.clone()),
+            out_csv: None,
+            db: None,
+            tag: None,
+            max_bucket_items: 25,
+        })?;
+        let capped: serde_json::Value = serde_json::from_str(&fs::read_to_string(capped_json)?)?;
+        assert_eq!(capped["left_members"], 420);
+        assert_eq!(capped["right_members"], 420);
+        assert_eq!(capped["exact_path_overlap_count"], 420);
+        assert_eq!(capped["nested_path_overlap_count"], 0);
+        assert_eq!(capped["path_payload_conflict_count"], 0);
+        assert_eq!(capped["payload_family_only_overlap_count"], 0);
+        assert_eq!(capped["max_bucket_items"], 25);
+        assert_eq!(capped["bucket_output_truncated"], true);
+        assert_eq!(capped["quality_band"], "high");
+        assert_eq!(capped["exact_overlap_score"], 1.0);
+        assert_eq!(capped["nested_overlap_score"], 1.0);
+        assert_eq!(capped["depth_weighted_overlap_score"], 1.0);
+
+        let full_json = root.join("archive-recursive-full.json");
+        archive_recursive_compare_command(ArchiveRecursiveCompareArgs {
+            left_db,
+            right_db,
+            left: "left".to_string(),
+            right: "right".to_string(),
+            out_json: Some(full_json.clone()),
+            out_csv: None,
+            db: None,
+            tag: None,
+            max_bucket_items: 5000,
+        })?;
+        let full: serde_json::Value = serde_json::from_str(&fs::read_to_string(full_json)?)?;
+        assert_eq!(
+            full["exact_path_overlap_count"],
+            capped["exact_path_overlap_count"]
+        );
+        assert_eq!(
+            full["nested_path_overlap_count"],
+            capped["nested_path_overlap_count"]
+        );
+        assert_eq!(
+            full["path_payload_conflict_count"],
+            capped["path_payload_conflict_count"]
+        );
+        assert_eq!(
+            full["payload_family_only_overlap_count"],
+            capped["payload_family_only_overlap_count"]
+        );
+        assert_eq!(full["quality_band"], capped["quality_band"]);
+        assert_eq!(full["exact_overlap_score"], capped["exact_overlap_score"]);
+        assert_eq!(full["nested_overlap_score"], capped["nested_overlap_score"]);
+        assert_eq!(
+            full["depth_weighted_overlap_score"],
+            capped["depth_weighted_overlap_score"]
+        );
+        assert_eq!(full["bucket_output_truncated"], false);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
     fn report_history_command_lists_persisted_rows() -> Result<()> {
         let root = temp_dir("report_history_lists");
         let db = root.join("history.sqlite");
@@ -13592,8 +13788,124 @@ bad::::line
         report_history_command(ReportHistoryArgs {
             db,
             kind: Some("binary_diff_summary".to_string()),
+            tag: None,
+            left_ref: None,
+            right_ref: None,
+            min_score_primary: None,
+            max_score_primary: None,
+            sort: ReportHistorySort::CreatedDesc,
             limit: 10,
         })?;
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn report_history_filters_by_tag_refs_and_score() -> Result<()> {
+        let root = temp_dir("report_history_filtering");
+        let db = root.join("history.sqlite");
+        persist_analysis_report(
+            &db,
+            "binary_diff_summary",
+            Some("keep"),
+            Some("left.bin"),
+            Some("right.bin"),
+            Some(0.91),
+            Some(0.8),
+            "{\"ok\":true}",
+        )?;
+        persist_analysis_report(
+            &db,
+            "binary_diff_summary",
+            Some("drop"),
+            Some("left.bin"),
+            Some("other.bin"),
+            Some(0.87),
+            Some(0.8),
+            "{\"ok\":true}",
+        )?;
+        persist_analysis_report(
+            &db,
+            "archive_recursive_compare",
+            Some("keep"),
+            Some("left.tree"),
+            Some("right.tree"),
+            Some(0.95),
+            Some(0.9),
+            "{\"ok\":true}",
+        )?;
+
+        let report = build_report_history_report(ReportHistoryArgs {
+            db,
+            kind: Some("binary_diff_summary".to_string()),
+            tag: Some("keep".to_string()),
+            left_ref: Some("left.bin".to_string()),
+            right_ref: Some("right.bin".to_string()),
+            min_score_primary: Some(0.9),
+            max_score_primary: Some(1.0),
+            sort: ReportHistorySort::CreatedDesc,
+            limit: 10,
+        })?;
+        assert_eq!(report.rows.len(), 1);
+        assert_eq!(report.rows[0].report_kind, "binary_diff_summary");
+        assert_eq!(report.rows[0].tag.as_deref(), Some("keep"));
+        assert_eq!(report.rows[0].right_ref.as_deref(), Some("right.bin"));
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn report_history_sorts_by_score_primary_desc_and_none_last() -> Result<()> {
+        let root = temp_dir("report_history_score_sort");
+        let db = root.join("history.sqlite");
+        persist_analysis_report(
+            &db,
+            "binary_diff_summary",
+            Some("mid"),
+            Some("left-a"),
+            Some("right-a"),
+            Some(0.5),
+            None,
+            "{\"ok\":true}",
+        )?;
+        persist_analysis_report(
+            &db,
+            "binary_diff_summary",
+            Some("high"),
+            Some("left-b"),
+            Some("right-b"),
+            Some(0.9),
+            None,
+            "{\"ok\":true}",
+        )?;
+        persist_analysis_report(
+            &db,
+            "binary_diff_summary",
+            Some("none"),
+            Some("left-c"),
+            Some("right-c"),
+            None,
+            None,
+            "{\"ok\":true}",
+        )?;
+
+        let report = build_report_history_report(ReportHistoryArgs {
+            db,
+            kind: Some("binary_diff_summary".to_string()),
+            tag: None,
+            left_ref: None,
+            right_ref: None,
+            min_score_primary: None,
+            max_score_primary: None,
+            sort: ReportHistorySort::ScorePrimaryDesc,
+            limit: 10,
+        })?;
+        assert_eq!(report.rows.len(), 3);
+        assert_eq!(report.rows[0].tag.as_deref(), Some("high"));
+        assert_eq!(report.rows[1].tag.as_deref(), Some("mid"));
+        assert_eq!(report.rows[2].tag.as_deref(), Some("none"));
+
         fs::remove_dir_all(root).ok();
         Ok(())
     }
