@@ -19,6 +19,23 @@ still identify the best copy to keep.
 - Provides bounded binary similarity reports for rename-heavy binary payloads.
 - Accepts `ndex rsync ...`, `ndex rclone ...`, and `ndex copy ...` compatibility frontends for familiar workflows.
 
+## Why Not Just `rsync` Or `rclone`?
+
+`rsync` and `rclone` are excellent transfer tools. Nightindex is for the layer above transfer: figuring out
+what should be transferred when the trees are incomplete, renamed, partially corrupt, or assembled from
+several backups.
+
+Nightindex adds:
+- A reusable SQLite manifest, so you can inspect and compare without repeatedly walking a failing source.
+- Resume state and retry planning for copies that hit unreadable files or transient disconnects.
+- Folder identity scoring when directories were renamed, renumbered, or restored under different parents.
+- Archive and binary similarity reports for payloads where filenames and exact checksums are not enough.
+- Merge planning with `prefer-newer`, `prefer-larger`, `keep-both`, and manual review queues.
+- Report history, cache inspection, and NDJSON logs for long recovery sessions.
+
+Use `rsync`/`rclone` when paths are trustworthy and the job is straightforward. Use Nightindex when you need
+evidence, resumability, and reviewable decisions before moving more data.
+
 ## Good Use Cases
 
 - Recovering a failing external drive onto a ZFS/Btrfs pool.
@@ -55,16 +72,16 @@ Scan a source and destination:
 
 ```bash
 nightindex scan \
-  --root /media/john/DSMIL1 \
-  --label dsmil1 \
-  --db /tank/nightindex/dsmil1.sqlite \
-  --exclude 03_FIRMWARE \
+  --root /mnt/recovery-source \
+  --label source \
+  --db /var/tmp/nightindex/source.sqlite \
+  --exclude firmware-cache \
   --hash
 
 nightindex scan \
-  --root /tank/btrfs-recovery/BUGBOUNTY \
-  --label tank \
-  --db /tank/nightindex/tank.sqlite \
+  --root /srv/recovered-dataset \
+  --label recovered \
+  --db /var/tmp/nightindex/recovered.sqlite \
   --hash
 ```
 
@@ -72,26 +89,26 @@ Review the gap:
 
 ```bash
 nightindex brief \
-  --left-db /tank/nightindex/dsmil1.sqlite \
-  --right-db /tank/nightindex/tank.sqlite \
-  --left dsmil1 \
-  --right tank
+  --left-db /var/tmp/nightindex/source.sqlite \
+  --right-db /var/tmp/nightindex/recovered.sqlite \
+  --left source \
+  --right recovered
 ```
 
 Copy missing or changed files with a saved plan and NDJSON log:
 
 ```bash
 nightindex sync \
-  --left-db /tank/nightindex/dsmil1.sqlite \
-  --right-db /tank/nightindex/tank.sqlite \
-  --left dsmil1 \
-  --right tank \
-  --from /media/john/DSMIL1 \
-  --to /tank/btrfs-recovery/BUGBOUNTY \
-  --write-plan /tank/nightindex/plan-dsmil1-tank.json \
-  --policy /home/john/.config/nightindex/policy.yaml \
+  --left-db /var/tmp/nightindex/source.sqlite \
+  --right-db /var/tmp/nightindex/recovered.sqlite \
+  --left source \
+  --right recovered \
+  --from /mnt/recovery-source \
+  --to /srv/recovered-dataset \
+  --write-plan /var/tmp/nightindex/source-to-recovered-plan.json \
+  --policy ./examples/recovery-policy.yaml \
   --progress-every 500 \
-  --log /tank/nightindex/sync-dsmil1-tank.ndjson
+  --log /var/tmp/nightindex/source-to-recovered.ndjson
 ```
 
 ## Command Map
@@ -271,8 +288,8 @@ Convert `archive-member-plan` JSON into a `merge-apply` plan.
 ```bash
 nightindex archive-member-merge-plan \
   --archive-member-plan-json /tmp/archive-member-plan.json \
-  --imports-root /tank/recovery/_imports \
-  --canonical-root /tank/recovery \
+  --imports-root /srv/recovered-dataset/_imports \
+  --canonical-root /srv/recovered-dataset \
   --policy prefer-newer \
   --out-json /tmp/archive-merge-plan.json \
   --out-csv /tmp/archive-merge-plan.csv
@@ -289,7 +306,7 @@ nightindex archive-recursive-compare \
   --left <left_label> \
   --right <right_label> \
   --max-bucket-items 2000 \
-  [--db /tank/nightindex/reports.sqlite] \
+  [--db /var/tmp/nightindex/reports.sqlite] \
   [--tag nightly-arcmp] \
   [--out-json <file>] [--out-csv <file>]
 ```
@@ -310,11 +327,11 @@ Compare two binary files with bounded sampling and compact digest output.
 
 ```bash
 nightindex binary-diff-summary \
-  --left-file /tank/recovery/A.bin \
-  --right-file /tank/recovery/B.bin \
+  --left-file /srv/recovered-dataset/_imports/payload-a.bin \
+  --right-file /srv/recovered-dataset/canonical/payload-b.bin \
   [--window-size 4096] \
   [--max-windows 24] \
-  [--db /tank/nightindex/reports.sqlite] \
+  [--db /var/tmp/nightindex/reports.sqlite] \
   [--tag nightly-diff] \
   [--out-json <file>]
 ```
@@ -333,9 +350,9 @@ Convert dossier or archive action rows into materialized merge plans, then dry-r
 
 ```bash
 nightindex merge-plan \
-  --actions-csv /tank/nightindex/probable_renamed_actions.csv \
-  --imports-root /tank/recovery/_imports \
-  --canonical-root /tank/recovery \
+  --actions-csv /var/tmp/nightindex/probable-renames.csv \
+  --imports-root /srv/recovered-dataset/_imports \
+  --canonical-root /srv/recovered-dataset \
   --policy prefer-newer \
   --out-json /tmp/merge-plan.json
 
@@ -427,7 +444,7 @@ Query persisted `binary-diff-summary` and `archive-recursive-compare` reports.
 
 ```bash
 nightindex report-history \
-  --db /tank/nightindex/reports.sqlite \
+  --db /var/tmp/nightindex/reports.sqlite \
   [--kind binary_diff_summary] \
   [--tag smoke] \
   [--left-ref /path/to/left.bin] \
@@ -449,9 +466,9 @@ Output schema:
 Nightindex copy logic. Unsupported flags are reported to stderr.
 
 ```bash
-ndex rsync --dry-run --delete-after --ignore-existing --stop-on-error /mnt/source /tank/dest
-ndex rclone --checksum --include 'QCOM/**' --filter '- QCOM/tmp/**' /mnt/source /tank/dest
-ndex copy --progress-every 250 /mnt/source /tank/dest
+ndex rsync --dry-run --delete-after --ignore-existing --stop-on-error /mnt/source /srv/destination
+ndex rclone --checksum --include 'archives/**' --filter '- scratch/**' /mnt/source /srv/destination
+ndex copy --progress-every 250 /mnt/source /srv/destination
 ```
 
 Mapped options include:
@@ -481,7 +498,7 @@ Accepted compatibility no-ops include `--perms`, `--times`, `--group`, `--owner`
 
 ```yaml
 directory_prefixes:
-  - 03_FIRMWARE
+  - firmware-cache
   - tmp/cache
 folder_name_additions:
   - cache
@@ -504,9 +521,9 @@ Default noise folders include common caches, recycle bins, VCS folders, temp fol
 Copy logs are NDJSON when `--log` is provided.
 
 ```json
-{"schema_version":2,"rel_path":"BUGBOUNTY/01_EXPLOITS/note.txt","action":"copy","existing_bytes":null,"bytes":1234,"dry_run":false,"overwrite":false,"reason":null}
-{"schema_version":2,"rel_path":"BUGBOUNTY/old.bin","action":"skip_conflict","existing_bytes":4096,"bytes":4096,"dry_run":false,"overwrite":false,"reason":"destination conflict: existing size 4096"}
-{"schema_version":2,"rel_path":"03_FIRMWARE/legacy.img","action":"source_missing","existing_bytes":null,"bytes":0,"dry_run":false,"overwrite":false,"reason":"source file missing"}
+{"schema_version":2,"rel_path":"projects/tooling/note.txt","action":"copy","existing_bytes":null,"bytes":1234,"dry_run":false,"overwrite":false,"reason":null}
+{"schema_version":2,"rel_path":"archives/old.bin","action":"skip_conflict","existing_bytes":4096,"bytes":4096,"dry_run":false,"overwrite":false,"reason":"destination conflict: existing size 4096"}
+{"schema_version":2,"rel_path":"firmware-cache/legacy.img","action":"source_missing","existing_bytes":null,"bytes":0,"dry_run":false,"overwrite":false,"reason":"source file missing"}
 ```
 
 Common actions:
