@@ -1,13 +1,41 @@
 # Nightindex
 
-Nightindex is an indexed, policy-aware replacement workflow for damaged file trees.
-It is designed for rescue/recovery jobs where directory trees are noisy, renamed, and partially
-corrupted but file content can still be matched reliably.
+Nightindex is a recovery-first file tree indexer, comparer, and copy engine for messy data rescue jobs.
+It is built for damaged disks, incomplete backups, renamed project trees, mixed archive dumps, and large
+collections where `rsync` or `rclone` alone cannot tell what is already recovered.
 
-The process is:
-1. Scan each side into a SQLite manifest.
-2. Diff/manually compare manifests.
-3. Execute a filtered copy plan.
+Use `nightindex` when paths are unreliable but content, fingerprints, archive shape, and folder context can
+still identify the best copy to keep.
+
+## What It Does
+
+- Scans huge directory trees into SQLite manifests with optional hashing and persistent fingerprint caches.
+- Compares source and destination manifests to estimate missing, changed, and already recovered files.
+- Copies only what is needed, with resume state, structured logs, progress output, and conflict handling.
+- Matches renamed folders with dossier scoring built from hashes, normalized names, archive families,
+  binary/text signatures, size classes, and semantic source-code hints.
+- Compares archive-heavy trees without extraction by using virtual archive members, payload families, depth,
+  recursive overlap scores, and capped conflict buckets.
+- Provides bounded binary similarity reports for rename-heavy binary payloads.
+- Accepts `ndex rsync ...`, `ndex rclone ...`, and `ndex copy ...` compatibility frontends for familiar workflows.
+
+## Good Use Cases
+
+- Recovering a failing external drive onto a ZFS/Btrfs pool.
+- Merging several old backups into one canonical dataset.
+- Comparing renamed exploit, firmware, source, or research folders after numbering schemes changed.
+- Copying everything that still reads while preserving provenance for manual review.
+- Auditing what a partial copy already recovered before reconnecting a suspect disk.
+- Finding likely duplicates or newer variants when checksums and paths disagree.
+- Tracking repeated compare runs with stored report history.
+
+## Workflow
+
+1. Scan each source or destination into a SQLite manifest.
+2. Review aggregate differences with `brief`, `compare-summary`, `dossier`, or archive/binary compare reports.
+3. Generate a copy or merge plan.
+4. Dry-run the operation.
+5. Execute, monitor logs, and resume failed rows if needed.
 
 ## Build
 
@@ -15,70 +43,15 @@ The process is:
 cargo build --release
 ```
 
-Binary output: `target/release/nightindex`.
-The same binary is also installed as `target/release/ndex` (executable alias only).
+Binary output:
+- `target/release/nightindex`
+- `target/release/ndex`
 
-Alias map:
-- `nightindex` is the full command name.
-- `ndex` is the executable alias for `nightindex`.
-- `dossier` also has the `intel` alias.
-- `plan-copy-missing` also has the `plan` alias.
-- `sync-copy-missing` also has the `sync` alias.
-- `execute-copy-missing` also has the `execute` alias.
-- `extract-check` also has the `extcheck` alias.
+`ndex` is the compact alias for the same CLI.
 
-## Release Checklist
+## Quick Start
 
-Run the reproducible pre-release gate from the repository root:
-
-```bash
-bash scripts/release_check.sh
-```
-
-The script enforces:
-- `cargo fmt --all -- --check`
-- `cargo test --locked --all-targets`
-- `cargo build --release --locked`
-
-Optional strict lint gate:
-
-```bash
-NIGHTINDEX_STRICT_CLIPPY=1 bash scripts/release_check.sh
-```
-
-When `NIGHTINDEX_STRICT_CLIPPY` is unset, clippy runs in non-blocking mode so release checks can still complete on legacy lint debt.
-
-Versioning notes:
-- Bump `[package].version` in `Cargo.toml` before a tagged release.
-- Keep `Cargo.lock` committed so `--locked` checks remain reproducible.
-
-## Progress Snapshot (2026-04-29)
-
-Implemented and shipping on the active branch:
-- Resume workflow: `resume`/`resume-plan`, direct execute, session listing/stats, filtered retries,
-  prune/vacuum maintenance, JSONL export.
-- Dossier workflow: confidence tiers, action filtering, archive-signal coverage metrics.
-- Compatibility workflow: `ndex rsync ...` and `ndex rclone ...` frontends with mapped flag support.
-- Ops visibility: `status` command for DB/run health summary, richer `logs` error-class summaries.
-- Merge workflow: `merge-plan` + hardened `merge-apply` with recursive directory materialization,
-  deterministic `keep-both` naming, and richer apply summary counters.
-- Persistent cache v2: cross-label file fingerprint profile cache in SQLite with size/mtime/hash
-  invalidation, `status` visibility, and cached binary/text/archive signature fields for dossier
-  matching.
-- Archive-recursive foundation: `extract-check` reports virtual archive paths/families/depth, and
-  dossier scoring consumes virtual archive shape tokens.
-- Semantic text signatures: scan enriches text-like files with lightweight import/function/key
-  signals that become stable `TEXTSIG` evidence for dossier ranking.
-
-In progress:
-- Archive-recursive indexing without extraction and semantic code/text signatures.
-- Extend cached signatures from lightweight semantic signals into deeper content-derived
-  binary/text/archive descriptors.
-
-## Recommended recovery use-case
-
-Example for your scenario: copy from NVMe backup source to `/tank/btrfs-recovery/BUGBOUNTY`, while
-keeping firmware folders out of the initial pass.
+Scan a source and destination:
 
 ```bash
 nightindex scan \
@@ -93,13 +66,21 @@ nightindex scan \
   --label tank \
   --db /tank/nightindex/tank.sqlite \
   --hash
+```
 
+Review the gap:
+
+```bash
 nightindex brief \
   --left-db /tank/nightindex/dsmil1.sqlite \
   --right-db /tank/nightindex/tank.sqlite \
   --left dsmil1 \
   --right tank
+```
 
+Copy missing or changed files with a saved plan and NDJSON log:
+
+```bash
 nightindex sync \
   --left-db /tank/nightindex/dsmil1.sqlite \
   --right-db /tank/nightindex/tank.sqlite \
@@ -113,33 +94,44 @@ nightindex sync \
   --log /tank/nightindex/sync-dsmil1-tank.ndjson
 ```
 
-## Commands
+## Command Map
 
-`scan`  
-Build or refresh a tree manifest. Prints a short stderr summary with file, symlink, hash, reuse, and exclude counts.
+- `scan`: build or refresh a manifest.
+- `brief`: compact copy estimate.
+- `compare-summary`: aggregate manifest diff metrics.
+- `dossier` / `intel`: renamed folder and project identity scoring.
+- `extract-check` / `extcheck`: archive-family comparison.
+- `archive-member-diff` / `amdiff`: virtual archive-member diff.
+- `archive-member-plan` / `amplan`: read-only archive reconcile action planning.
+- `archive-member-merge-plan` / `am2merge`: convert archive plan rows into a merge plan.
+- `archive-recursive-compare` / `arcmp`: recursive archive overlap metrics.
+- `binary-diff-summary` / `bdiff`: bounded binary similarity report.
+- `plan-copy-missing` / `plan`: write a copy plan.
+- `sync-copy-missing` / `sync`: plan and execute in one command.
+- `execute-copy-missing` / `execute`: run a saved copy plan.
+- `resume-plan` / `resume`: inspect, export, prune, or execute resume rows.
+- `logs`: summarize copy NDJSON logs.
+- `status`: summarize DB and recent run health.
+- `inspect-cache`: inspect fingerprint/signature cache coverage.
+- `report-history`: query persisted analysis reports.
+- `merge-plan`: convert dossier action CSV to a merge plan.
+- `merge-apply`: apply a merge plan.
+- `copy`, `rsync`, `rclone`: compatibility copy frontends.
+
+## Core Commands
+
+### `scan`
+
+Build or refresh a manifest. With `--hash`, file hashes become strong anchors for compare and dossier matching.
 
 ```bash
 nightindex scan --root <path> --label <name> --db <manifest.sqlite> \
-  [--exclude <prefix>] [--policy <policy.yaml|json>] [--hash]
+  [--exclude <prefix>] [--exclude-if-present <marker>] [--policy <policy.yaml|json>] [--hash]
 ```
 
-`compare-summary`  
-Quick aggregate diff metrics for two manifests.
-JSON output includes `report_schema: "nightindex.compare_summary"`, `report_version: 1`,
-and stable cache counters under `cache_metrics.left_profile_cache` /
-`cache_metrics.right_profile_cache` (`hits`, `misses`).
+### `brief`
 
-```bash
-nightindex compare-summary \
-  --left-db <left.sqlite> \
-  --right-db <right.sqlite> \
-  --left <left_label> \
-  --right <right_label> \
-  [--out-json <file>] [--out-csv <file>]
-```
-
-`brief`  
-Compact aggregate diff with copy estimate. Prints JSON plus a short stderr summary with copy counts and ETA when available.
+Compact difference and copy estimate.
 
 ```bash
 nightindex brief \
@@ -150,43 +142,68 @@ nightindex brief \
   [--out-json <file>] [--out-csv <file>]
 ```
 
-`dossier` (alias: `intel`)  
-Read-only folder identity scoring between two manifests. Useful for matching renamed
-folders and renumbered exploit buckets where paths drift but semantic content stays related.
+### `compare-summary`
 
-`dossier` now combines legacy dossier signals with normalized fingerprint signals:
-- `N:` exact file names, `S:` stems, `E:` extensions, `ES:` archive-aware extension stems, `H:` hashes, and folder tokens.
-- `NF:` normalized file-name aliases from `file_fingerprints`.
-- `NFP:` normalized parent-folder aliases and prefix variants.
-- `BIN` / `TEXT`: binaryity class.
-- `ARCH:<family>` and `ARCHFAM:<family>`: archive family grouping.
-- `ARCHSIG:<payload>`: archive payload signature for related compressions (`tar` for both `tar.gz` and `tar.xz`).
-- `ARCHPAY`, `ARCHVIRT`, and `ARCHDEPTH`: cached payload/virtual-path archive signals used before extraction.
+Aggregate manifest diff metrics with stable schema fields:
 
-Confidence tiers are interpreted as follows:
+- `report_schema: "nightindex.compare_summary"`
+- `report_version: 1`
+- `cache_metrics.left_profile_cache`
+- `cache_metrics.right_profile_cache`
 
-`identical`
-- Multiple `N:` exact-name overlaps plus at least one `H:` file hash overlap.
-- High overlap ratio and strong matching anchor counts.
+```bash
+nightindex compare-summary \
+  --left-db <left.sqlite> \
+  --right-db <right.sqlite> \
+  --left <left_label> \
+  --right <right_label> \
+  [--out-json <file>] [--out-csv <file>]
+```
 
-`similar`
-- `NF:` and `NFP:` signal clusters match while exact names diverge.
-- Archive family (`ARCH`, `ARCHFAM`) and binaryity (`BIN`, `TEXT`) alignment.
+### `sync` and `execute`
 
-`possible`
-- Folder structure, extension/family overlap, or hash overlap without stronger anchors.
+`sync` plans and copies in one command. `execute` runs a saved plan.
 
-`manual`
-- Weak or conflicting evidence only.
+```bash
+nightindex plan \
+  --left-db <left.sqlite> \
+  --right-db <right.sqlite> \
+  --left <left_label> \
+  --right <right_label> \
+  [--policy <policy>] \
+  --out-json /tmp/plan.json
 
-Compatibility expectation
-- If a database lacks `file_fingerprints` rows, `dossier` gracefully falls back to legacy scoring.
-- Output remains read-only JSON/CSV and does not mutate the source/destination databases.
-- Dossier JSON includes explicit report metadata fields:
-  `report_schema: "nightindex.dossier"` and `report_version: 1`.
-- Cache counters are surfaced in stable nested fields:
-  `cache_metrics.left_profile_cache` / `cache_metrics.right_profile_cache` (`hits`, `misses`).
-  Legacy top-level `left_profile_cache` / `right_profile_cache` fields are still emitted.
+nightindex execute \
+  --plan /tmp/plan.json \
+  --from <left_root> \
+  --to <right_root> \
+  [--overwrite] [--dry-run] [--stop-on-error] \
+  [--progress-every <N>] \
+  [--log /tmp/events.ndjson] \
+  [--policy <policy>]
+```
+
+## Renamed Folder Matching
+
+### `dossier` / `intel`
+
+`dossier` scores likely folder matches when directory names, numbering schemes, or version suffixes changed.
+It is read-only and can emit both review reports and action CSV files for merge planning.
+
+Signals include:
+- Exact names, stems, extensions, folder tokens, and hashes.
+- Normalized file and parent-folder aliases.
+- Binary/text/archive classification.
+- Archive family and payload signatures.
+- Virtual archive shape tokens and depth.
+- Lightweight semantic source/text signatures.
+- Size classes and binary descriptors.
+
+Confidence tiers:
+- `identical`: strong exact-name/hash anchors and high overlap.
+- `similar`: normalized names, archive family, binaryity, or semantic signals align.
+- `possible`: weaker folder, extension, family, or hash evidence.
+- `manual`: low or conflicting evidence.
 
 ```bash
 nightindex dossier \
@@ -198,16 +215,17 @@ nightindex dossier \
   [--confidence <manual|possible|similar|identical>] \
   [--only-action <apply|review|manual>] \
   [--one-per-left] \
-  --out-json <file> \
-  --out-csv <file> \
-  [--out-actions-csv <file>] \
-  [--policy <policy>]
+  [--policy <policy>] \
+  [--out-json <file>] \
+  [--out-csv <file>] \
+  [--out-actions-csv <file>]
 ```
 
-`extcheck`  
-Compare archive-like payload families and extraction potential between two trees. Prints JSON plus
-a short stderr summary of exact and stem matches. Archive entries include virtual paths such as
-`qcom_payload/@tar/gz`, archive family, payload signature, and nested archive depth.
+## Archive-Aware Reports
+
+### `extcheck`
+
+Compare archive-like payload families and extraction potential between two trees.
 
 ```bash
 nightindex extcheck \
@@ -218,8 +236,9 @@ nightindex extcheck \
   [--out-json <file>] [--out-csv <file>]
 ```
 
-`archive-member-diff` (alias: `amdiff`)  
-Diff persisted virtual archive-member manifests between two labels/DBs.
+### `archive-member-diff` / `amdiff`
+
+Diff persisted virtual archive-member manifests.
 
 ```bash
 nightindex archive-member-diff \
@@ -227,96 +246,134 @@ nightindex archive-member-diff \
   --right-db <right.sqlite> \
   --left <left_label> \
   --right <right_label> \
+  [--nested-stats] \
   [--out-json <file>] [--out-csv <file>]
 ```
 
-`archive-member-merge-plan` (alias: `am2merge`)  
-Bridge archive-member matches into merge actions/plan inputs for `merge-plan` and `merge-apply`.
+### `archive-member-plan` / `amplan`
+
+Generate read-only archive reconcile rows from archive-member diff signals.
 
 ```bash
-nightindex archive-member-merge-plan \
+nightindex archive-member-plan \
   --left-db <left.sqlite> \
   --right-db <right.sqlite> \
   --left <left_label> \
   --right <right_label> \
-  --out-actions-csv /tmp/archive-actions.csv \
-  [--confidence <manual|possible|similar|identical>] \
-  [--one-per-left]
+  --out-json /tmp/archive-member-plan.json \
+  --out-csv /tmp/archive-member-plan.csv
 ```
 
-Practical examples:
+### `archive-member-merge-plan` / `am2merge`
+
+Convert `archive-member-plan` JSON into a `merge-apply` plan.
 
 ```bash
-# 1) Generate archive-driven action candidates (review first)
-ndex am2merge \
-  --left-db /tank/nightindex/src.sqlite \
-  --right-db /tank/nightindex/dst.sqlite \
-  --left src \
-  --right dst \
-  --confidence similar \
-  --one-per-left \
-  --out-actions-csv /tank/nightindex/archive-actions.csv
-
-# 2) Convert actions to an executable merge plan
-ndex merge-plan \
-  --actions-csv /tank/nightindex/archive-actions.csv \
+nightindex archive-member-merge-plan \
+  --archive-member-plan-json /tmp/archive-member-plan.json \
   --imports-root /tank/recovery/_imports \
   --canonical-root /tank/recovery \
   --policy prefer-newer \
-  --out-json /tank/nightindex/archive-merge-plan.json
-
-# 3) Apply with dry-run, then execute
-ndex merge-apply --plan /tank/nightindex/archive-merge-plan.json --dry-run
-ndex merge-apply --plan /tank/nightindex/archive-merge-plan.json
+  --out-json /tmp/archive-merge-plan.json \
+  --out-csv /tmp/archive-merge-plan.csv
 ```
 
-`report-history`  
-Query persisted analysis results recorded by `binary-diff-summary` and `archive-recursive-compare`.
-JSON output includes explicit metadata fields:
-- `report_schema: "nightindex.report_history"`
-- `report_version: 1`
+### `archive-recursive-compare` / `arcmp`
 
-Each `rows[]` item includes:
-- `id`, `report_kind`, `tag`, `left_ref`, `right_ref`
-- `score_primary`, `score_secondary`, `created_at`
+Compute recursive virtual archive overlap metrics without extracting archives to disk.
 
 ```bash
-nightindex report-history --db /tank/nightindex/nightindex.sqlite --kind binary_diff_summary --limit 50
-
-# Optional quality-of-life filters and sort:
-nightindex report-history \
-  --db /tank/nightindex/nightindex.sqlite \
-  --kind binary_diff_summary \
-  --tag smoke \
-  --left-ref /path/to/left.bin \
-  --right-ref /path/to/right.bin \
-  --min-score-primary 0.80 \
-  --sort score-primary-desc \
-  --limit 25
+nightindex archive-recursive-compare \
+  --left-db <left.sqlite> \
+  --right-db <right.sqlite> \
+  --left <left_label> \
+  --right <right_label> \
+  --max-bucket-items 2000 \
+  [--db /tank/nightindex/reports.sqlite] \
+  [--tag nightly-arcmp] \
+  [--out-json <file>] [--out-csv <file>]
 ```
 
-`logs`  
-Summarize NDJSON copy logs produced by `--log` during execute/sync/compat copy runs.
+Report fields include:
+- `exact_overlap_score`
+- `nested_overlap_score`
+- `depth_weighted_overlap_score`
+- `quality_band`
+- `bucket_output_truncated`
+- full conflict totals, even when bucket output is capped by `--max-bucket-items`
+
+## Binary Similarity
+
+### `binary-diff-summary` / `bdiff`
+
+Compare two binary files with bounded sampling and compact digest output.
 
 ```bash
-nightindex logs \
-  --file <copy.ndjson> \
-  [--tail 200] \
-  [--failures-only]
-```
-
-`inspect-cache`  
-Read-only per-label cache and signature-density report.
-
-```bash
-nightindex inspect-cache \
-  --db <manifest.sqlite> \
-  [--label <label>] \
+nightindex binary-diff-summary \
+  --left-file /tank/recovery/A.bin \
+  --right-file /tank/recovery/B.bin \
+  [--window-size 4096] \
+  [--max-windows 24] \
+  [--db /tank/nightindex/reports.sqlite] \
+  [--tag nightly-diff] \
   [--out-json <file>]
 ```
 
-`resume` (alias for `resume-plan`)  
-Build a retry plan from resume-state rows stored during prior copy runs.
+Useful fields:
+- `similarity`
+- `aligned_similarity`
+- `shifted_alignment_similarity`
+- `content_similarity`
+- `histogram_similarity`
+- left/right full hashes and sizes
+
+## Merge Workflow
+
+Convert dossier or archive action rows into materialized merge plans, then dry-run and apply.
+
+```bash
+nightindex merge-plan \
+  --actions-csv /tank/nightindex/probable_renamed_actions.csv \
+  --imports-root /tank/recovery/_imports \
+  --canonical-root /tank/recovery \
+  --policy prefer-newer \
+  --out-json /tmp/merge-plan.json
+
+nightindex merge-apply \
+  --plan /tmp/merge-plan.json \
+  --dry-run
+
+nightindex merge-apply \
+  --plan /tmp/merge-plan.json \
+  --only-decision apply \
+  --max-items 100
+```
+
+Policies:
+- `prefer-newer`
+- `prefer-larger`
+- `keep-both`
+- `manual`
+
+`merge-plan` JSON includes:
+- `summary.total_items`
+- `summary.apply_items`
+- `summary.keep_both_items`
+- `summary.manual_items`
+
+`merge-apply` summary includes:
+- `planned_items`
+- `selected_items`
+- `skipped_by_filter`
+- `skipped_by_limit`
+- `conflicts_label`
+- `conflicts_non_destructive`
+
+## Resume, Logs, And Reports
+
+### `resume`
+
+Build retry plans from prior copy run state.
 
 ```bash
 nightindex resume \
@@ -332,149 +389,95 @@ nightindex resume \
   [--execute --from <left_root> --to <right_root>]
 ```
 
-`plan-copy-missing` (alias: `plan`)  
-Generate a deterministic copy plan for missing or changed files.
+### `logs`
+
+Summarize copy NDJSON logs.
 
 ```bash
-nightindex plan \
-  --left-db <left.sqlite> \
-  --right-db <right.sqlite> \
-  --left <left_label> \
-  --right <right_label> \
-  [--policy <policy>] \
-  --out-json /tmp/plan.json
+nightindex logs \
+  --file <copy.ndjson> \
+  [--tail 200] \
+  [--failures-only] \
+  [--top-errors 5] \
+  [--retry-jsonl-out /tmp/retry.jsonl]
 ```
 
-`execute`  
-Execute a saved plan.
+### `status`
+
+Summarize manifest and copy-run health.
 
 ```bash
-nightindex execute \
-  --plan /tmp/plan.json \
-  --from <left_root> \
-  --to <right_root> \
-  [--overwrite] [--dry-run] [--stop-on-error] \
-  [--progress-every <N>] \
-  [--log /tmp/events.ndjson] \
-  [--policy <policy>]
+nightindex status --db <manifest.sqlite> [--window-minutes 180]
 ```
 
-`sync-copy-missing` (alias: `sync`)  
-Plan and execute in one command.
+### `inspect-cache`
+
+Inspect fingerprint/signature cache coverage.
 
 ```bash
-nightindex sync \
-  --left-db <left.sqlite> \
-  --right-db <right.sqlite> \
-  --left <left_label> \
-  --right <right_label> \
-  --from <left_root> \
-  --to <right_root> \
-  [--overwrite] [--dry-run] [--stop-on-error] \
-  --write-plan <file> \
-  [--policy <policy>] \
-  [--log /tmp/events.ndjson]
+nightindex inspect-cache \
+  --db <manifest.sqlite> \
+  [--label <label>] \
+  [--out-json <file>]
 ```
 
-`rclone` and `rsync`  
-Compatibility frontends that accept common transfer flags and execute the same copy plan logic.
-Mapped and accepted options are applied; unsupported ones are reported to stderr.
-Positional source and destination arguments are treated as roots; a trailing slash is accepted but
-does not switch the command into a separate "copy contents" mode.
+### `report-history`
+
+Query persisted `binary-diff-summary` and `archive-recursive-compare` reports.
 
 ```bash
-nightindex rsync \
-  [rsync flags...] \
-  <source> <destination>
-  
-nightindex rclone \
-  [rclone flags...] \
-  <source> <destination>
+nightindex report-history \
+  --db /tank/nightindex/reports.sqlite \
+  [--kind binary_diff_summary] \
+  [--tag smoke] \
+  [--left-ref /path/to/left.bin] \
+  [--right-ref /path/to/right.bin] \
+  [--min-score-primary 0.80] \
+  [--max-score-primary 1.00] \
+  [--sort created-desc|created-asc|score-primary-desc|score-primary-asc] \
+  [--limit 50]
 ```
 
-`merge-plan` and `merge-apply`  
-Materialize merge actions from dossier action CSV into an executable merge plan.
+Output schema:
+- `report_schema: "nightindex.report_history"`
+- `report_version: 1`
+- rows with `id`, `report_kind`, `tag`, `left_ref`, `right_ref`, `score_primary`, `score_secondary`, `created_at`
 
-`merge-plan` JSON now includes a `summary` object:
-- `summary.total_items`
-- `summary.apply_items`
-- `summary.keep_both_items`
-- `summary.manual_items`
+## Compatibility Frontends
 
-`merge-apply` final JSON summary retains existing counters and also includes:
-- `planned_items`
-- `plan_apply_items`
-- `plan_keep_both_items`
-- `plan_manual_items`
-- `conflicts_label` (`destination_exists_skip_without_overwrite`)
-- `conflicts_non_destructive` (`true`, clarifies conflict counts are skip-only and non-destructive)
+`nightindex copy`, `nightindex rsync`, and `nightindex rclone` accept common transfer flags and run
+Nightindex copy logic. Unsupported flags are reported to stderr.
 
 ```bash
-nightindex merge-plan \
-  --actions-csv /tank/nightindex/probable_renamed_actions.csv \
-  --imports-root /tank/btrfs-recovery/BUGBOUNTY/_imports \
-  --canonical-root /tank/btrfs-recovery/BUGBOUNTY \
-  --policy prefer-newer \
-  --out-json /tmp/merge-plan.json
-
-nightindex merge-apply \
-  --plan /tmp/merge-plan.json \
-  [--dry-run] \
-  [--only-decision apply|keep_both|manual] \
-  [--max-items N] \
-  [--apply-manual]
-```
-
-`merge-apply` tuning knobs:
-- `--only-decision <apply|keep_both|manual>`: run only selected decision class from the plan.
-- `--max-items <N>`: cap processed items for bounded batch runs.
-- `--apply-manual`: execute manual items as apply semantics (use with dry-run first).
-
-Common mapped options:
-
-- `-n`, `--dry-run` → dry-run mode  
-- `--ignore-existing`, `--update`, `-u` → skip existing files (no overwrite)  
-- `--checksum`, `-c` → force hash-based file matching  
-- `--files-from <file>` → allowlist relative paths from a newline-delimited file  
-- `--exclude-if-present <name>` → skip any directory containing the named marker file  
-- `--stop-on-error` → fail fast on the first copy error  
-- `--exclude <pattern>` and `--exclude-from <file>` → import excludes into scan policy  
-- `--delete`, `--delete-before`, `--delete-during`, `--delete-after` → delete destination-only files  
-- `--delete-excluded` → delete destination files matched by exclude policy as well
-- `--include <pattern>`, `--include-from <file>` → include allowlist patterns  
-- `--filter <rule>`, `--filter-from <file>` → `+` rules add allowlist patterns and `-` rules add blocklist patterns  
-- `--log-file <path>`, `--log <path>` and `--policy <path>`  
-- `--progress-every <n>` → override progress interval  
-- `--size-only`, `--ignore-times` → recovery mode: treat same-size files as equivalent when destination
-  conflict checks are made (helps when timestamps/mtime drift is common)
-- `--max-age <age>` → exclude files older than the specified age; accepts seconds or suffixes like
-  `10m`, `2h`, or `7d`
-- `--copy-links`, `--copy-unsafe-links` → dereference symlinks and copy target contents
-- `--links` → preserve symlinks
-- `--backup`, `--backup-dir <path>` → back up overwritten or deleted destination entries before replacement
-  (`--backup` uses a local `.nightindex-backup` tree under the destination root)
-- `--stats`, `--human-readable`, `-h`, `--verbose`, `-v` → accepted compatibility flags that add stderr notes
-- Accepted and ignored: `--perms`, `--times`, `--group`, `--owner`, `--chmod`, `--progress`
-- Accepted compat flag: `--inplace`
-- Still unsupported in direct compat mode: `--rsh`, `--ssh`, `--dry-run-mode`
-
-Usage examples:
-
-```bash
-ndex rsync --dry-run --delete-after --ignore-existing --stop-on-error --progress-every 250 /mnt/source /tank/dest
+ndex rsync --dry-run --delete-after --ignore-existing --stop-on-error /mnt/source /tank/dest
 ndex rclone --checksum --include 'QCOM/**' --filter '- QCOM/tmp/**' /mnt/source /tank/dest
+ndex copy --progress-every 250 /mnt/source /tank/dest
 ```
 
-Terminal shortcuts:
+Mapped options include:
+- `-n`, `--dry-run`
+- `--ignore-existing`, `--update`, `-u`
+- `--checksum`, `-c`
+- `--files-from <file>`
+- `--exclude <pattern>`, `--exclude-from <file>`
+- `--include <pattern>`, `--include-from <file>`
+- `--filter <rule>`, `--filter-from <file>`
+- `--exclude-if-present <name>`
+- `--max-age <10m|2h|7d|seconds>`
+- `--delete`, `--delete-before`, `--delete-during`, `--delete-after`, `--delete-excluded`
+- `--copy-links`, `--copy-unsafe-links`, `--links`
+- `--backup`, `--backup-dir <path>`
+- `--log-file <path>`, `--log <path>`, `--policy <path>`
+- `--progress-every <N>`
+- `--size-only`, `--ignore-times`
+- `--stats`, `--human-readable`, `--verbose`, `-v`
 
-- `nightindex` full binary name  
-- `ndex` compact alias for quick calls
+Accepted compatibility no-ops include `--perms`, `--times`, `--group`, `--owner`, `--chmod`,
+`--progress`, and `--inplace`.
 
-`ndex` and `nightindex` are built from the same binary; use either in scripts.
+## Policy Format
 
-## Policy format
-
-`--policy` accepts YAML (`.yml/.yaml`), JSON, or JSON5-like files.
+`--policy` accepts YAML, JSON, or JSON5-style files.
 
 ```yaml
 directory_prefixes:
@@ -489,36 +492,16 @@ subtree_overrides:
     - node_modules
 ```
 
-`directory_prefixes` (a.k.a. `paths`, `prefix`, `exclude_prefixes`) are relative path prefixes.
+Fields:
+- `directory_prefixes`: relative path prefixes to exclude.
+- `folder_name_additions`: extra folder names treated as noise anywhere in the tree.
+- `subtree_overrides`: extra noise folders only under a subtree prefix.
 
-`folder_name_additions` (a.k.a. `tokens`, `noise_dirs`, `folder_overrides`, `ignore_tokens`)
-extends the noise-folder set anywhere in tree.
+Default noise folders include common caches, recycle bins, VCS folders, temp folders, and recovered-file trash.
 
-`subtree_overrides` (a.k.a. `overrides`, `subtree_rules`) adds noise folders only when traversal is
-already inside that subtree prefix.
+## Event Logs
 
-### Default noise folders
-
-- `.cache`
-- `.DS_Store`
-- `.git`
-- `.nobackup`
-- `.svn`
-- `.Trash`
-- `.Trashes`
-- `$RECYCLE.BIN`
-- `$RECYCLE`
-- `Desktop.ini`
-- `Recovered Files`
-- `System Volume Information`
-- `Temporary Items`
-- `Thumbs.db`
-- `tmp`
-- `temp`
-
-## Event logs
-
-Execution logging uses NDJSON (`schema_version:2`) when `--log` is provided:
+Copy logs are NDJSON when `--log` is provided.
 
 ```json
 {"schema_version":2,"rel_path":"BUGBOUNTY/01_EXPLOITS/note.txt","action":"copy","existing_bytes":null,"bytes":1234,"dry_run":false,"overwrite":false,"reason":null}
@@ -526,61 +509,47 @@ Execution logging uses NDJSON (`schema_version:2`) when `--log` is provided:
 {"schema_version":2,"rel_path":"03_FIRMWARE/legacy.img","action":"source_missing","existing_bytes":null,"bytes":0,"dry_run":false,"overwrite":false,"reason":"source file missing"}
 ```
 
-`action` values:
-
-- `source_missing`
-- `skip_existing`
-- `skip_conflict`
+Common actions:
 - `copy`
 - `overwrite`
+- `skip_existing`
+- `skip_conflict`
+- `source_missing`
 - `fail`
 
-Each execute/sync run prints one final summary JSON object with:
+## Release
 
-- `mode`
-- `dry_run`
-- `overwrite`
-- `planned_files`
-- `copied_files`
-- `skipped_existing`
-- `skipped_conflict`
-- `overwritten_files`
-- `missing_source`
-- `failed_files`
-- `copied_bytes`
-
-## Roadmap (next phases)
-
-Operator-facing compare/merge runbook:
+Run the pre-release gate:
 
 ```bash
-nightindex binary-diff-summary \
-  --left-file /tank/recovery/A.bin \
-  --right-file /tank/recovery/B.bin \
-  --db /tank/nightindex/nightindex.sqlite \
-  --tag nightly-diff
-
-nightindex archive-recursive-compare \
-  --left-db /tank/nightindex/left.sqlite \
-  --right-db /tank/nightindex/right.sqlite \
-  --left left \
-  --right right \
-  --max-bucket-items 2000 \
-  --db /tank/nightindex/nightindex.sqlite \
-  --tag nightly-arcmp
-
-nightindex merge-plan \
-  --actions-csv /tank/nightindex/actions.csv \
-  --imports-root /tank/recovery/_imports \
-  --canonical-root /tank/recovery \
-  --policy prefer-newer \
-  --out-json /tmp/merge-plan.json
-nightindex merge-apply --plan /tmp/merge-plan.json --dry-run
+bash scripts/release_check.sh
 ```
 
-Scale note:
-- `archive-recursive-compare` now supports `--max-bucket-items` to cap heavy bucket vectors while preserving full overlap totals in reported counts.
+Strict clippy mode:
 
-- Binary diffing: add fast, content-derived binary descriptors and delta-oriented comparison signals to improve same-family file decisions where names/hashes drift.
-- Archive-recursive compare: extend archive-aware matching from member-level diff into recursive cross-archive compare/reporting for nested payload trees.
-- Persistent fingerprint DB expansion: broaden cached fingerprint schema and reuse coverage (binary/text/archive signals, richer invalidation/stats) for faster re-scans and stronger dossier/merge confidence.
+```bash
+NIGHTINDEX_STRICT_CLIPPY=1 bash scripts/release_check.sh
+```
+
+The default gate enforces:
+- `cargo fmt --all -- --check`
+- `cargo test --locked --all-targets`
+- `cargo build --release --locked`
+
+It also runs clippy in non-blocking mode unless strict mode is enabled.
+
+Versioning:
+- Bump `[package].version` in `Cargo.toml` before a tagged release.
+- Keep `Cargo.lock` committed so `--locked` checks remain reproducible.
+
+Benchmark archive compare on real manifests:
+
+```bash
+scripts/bench_archive_compare.sh <left.sqlite> <right.sqlite> <left_label> <right_label> [runs]
+```
+
+## Status
+
+Nightindex v1 is functionally complete for recovery, compare, merge, and report workflows. The remaining
+work is normal product hardening: more real-world fixtures, stricter lint cleanup, and expanded compatibility
+coverage for uncommon `rsync`/`rclone` flags.
