@@ -4289,17 +4289,17 @@ fn merge_apply_command(args: MergeApplyArgs) -> Result<()> {
     }
 
     for item in &plan.items {
-        if let Some(decision) = only_decision
-            && item.decision != decision
-        {
-            skipped_by_filter += 1;
-            continue;
+        if let Some(decision) = only_decision {
+            if item.decision != decision {
+                skipped_by_filter += 1;
+                continue;
+            }
         }
-        if let Some(max_items) = args.max_items
-            && selected_items >= max_items
-        {
-            skipped_by_limit += 1;
-            continue;
+        if let Some(max_items) = args.max_items {
+            if selected_items >= max_items {
+                skipped_by_limit += 1;
+                continue;
+            }
         }
         selected_items += 1;
 
@@ -6289,11 +6289,12 @@ fn infer_semantic_text_signature_from_file(
         return Ok(None);
     }
 
-    let mut content = String::new();
+    let mut bytes = Vec::new();
     File::open(path)
         .with_context(|| format!("failed to open {}", path.display()))?
-        .read_to_string(&mut content)
+        .read_to_end(&mut bytes)
         .with_context(|| format!("failed to read {}", path.display()))?;
+    let content = String::from_utf8_lossy(&bytes);
     let semantic = infer_semantic_text_signature_from_content(
         &profile.language,
         &profile.normalized_name,
@@ -13134,6 +13135,26 @@ bad::::line
         assert!(signature.contains("i:urllib"));
         assert!(signature.contains("s:main_service"));
         assert!(signature.len() <= DESCRIPTOR_MAX_COMPOSITE_LEN);
+    }
+
+    #[test]
+    fn semantic_text_signature_tolerates_invalid_utf8_files() -> Result<()> {
+        let root = temp_dir("semantic_invalid_utf8");
+        let source = root.join("collector.py");
+        fs::write(
+            &source,
+            b"import urllib.request\n\xff\ndef collect_results(path):\n",
+        )?;
+        let profile = build_file_fingerprint_profile("collector.py", "file", 44, None);
+
+        let signature = infer_semantic_text_signature_from_file(&source, &profile)?
+            .expect("semantic signature");
+
+        assert!(signature.starts_with("python:collector"));
+        assert!(signature.contains("i:urllib"));
+        assert!(signature.contains("f:collect_results"));
+        fs::remove_dir_all(root).ok();
+        Ok(())
     }
 
     #[test]
