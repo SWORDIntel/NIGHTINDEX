@@ -2,7 +2,11 @@
 
 ## Current Status
 
-V1 is complete for the recovery, compare, merge, and report workflows targeted by this branch.
+This file records the original V1 CLI milestone for the compare, copy, merge and report workflows.
+The [commercialisation dossier](COMMERCIALISATION.md) and [roadmap](ROADMAP.md) define the proposed product
+work beyond that milestone. The [source baseline](docs/commercialisation/BASELINE_AND_SOURCES.md) records
+implementation limits; the [feature register](docs/commercialisation/FEATURES.md) and
+[validation plan](docs/commercialisation/VALIDATION.md) define additions and release acceptance.
 
 Shipped:
 - `nightindex` and `ndex` binaries.
@@ -19,9 +23,12 @@ Shipped:
 - Report persistence and `report-history` query/filter/sort UX.
 - Release and benchmark helper scripts.
 
-Current validation baseline:
-- `cargo test -q` passes 102 tests for both binaries.
-- `bash scripts/release_check.sh` passes in default mode.
+Historical validation recorded for V1:
+- `cargo test -q` was recorded as passing 102 tests for both binaries.
+- `bash scripts/release_check.sh` was recorded as passing in default mode.
+
+The commercialisation review counted 103 test attributes statically in the pinned source. It did not rerun
+tests or builds; the historical results above are not fresh validation of the proposed commercial features.
 
 ## Design Goals
 

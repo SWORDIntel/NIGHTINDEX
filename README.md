@@ -7,15 +7,29 @@ collections where `rsync` or `rclone` alone cannot tell what is already recovere
 Use `nightindex` when paths are unreliable but content, fingerprints, archive shape, and folder context can
 still identify the best copy to keep.
 
+## Commercialisation Plan
+
+The [commercialisation dossier](COMMERCIALISATION.md) and [phased roadmap](ROADMAP.md) describe the proposed
+desktop product: persistent historical file knowledge, loss accounting, physical-media awareness and
+verified reconciliation. The [feature register](docs/commercialisation/FEATURES.md) maps 32 requirements
+to delivery phases and acceptance conditions; the [product specification](docs/commercialisation/PRODUCT_SPEC.md)
+defines the evidence model and GUI workflows.
+
+These are planning documents. The current CLI operates on accessible file trees and manifests. Its
+archive records are derived from paths and filenames; real archive-entry enumeration, a historical loss
+ledger, a GUI and block-level RAID/ZFS recovery are proposed additions. The
+[pinned source baseline](docs/commercialisation/BASELINE_AND_SOURCES.md) distinguishes implemented foundations
+from planned capabilities, and the [validation plan](docs/commercialisation/VALIDATION.md) defines release gates.
+
 ## What It Does
 
-- Scans huge directory trees into SQLite manifests with optional hashing and persistent fingerprint caches.
+- Scans directory trees into SQLite manifests with optional hashing and persistent fingerprint caches.
 - Compares source and destination manifests to estimate missing, changed, and already recovered files.
 - Copies only what is needed, with resume state, structured logs, progress output, and conflict handling.
 - Matches renamed folders with dossier scoring built from hashes, normalized names, archive families,
   binary/text signatures, size classes, and semantic source-code hints.
-- Compares archive-heavy trees without extraction by using virtual archive members, payload families, depth,
-  recursive overlap scores, and capped conflict buckets.
+- Compares archive-like paths using inferred virtual members, payload families, depth, recursive overlap
+  scores, and capped conflict buckets. These records do not enumerate files inside archive containers.
 - Provides bounded binary similarity reports for rename-heavy binary payloads.
 - Accepts `ndex rsync ...`, `ndex rclone ...`, and `ndex copy ...` compatibility frontends for familiar workflows.
 
@@ -140,6 +154,7 @@ nightindex sync \
 ### `scan`
 
 Build or refresh a manifest. With `--hash`, file hashes become strong anchors for compare and dossier matching.
+Hashes can be reused when file type, size and mtime match; a rescan is not necessarily a fresh read of the bytes.
 
 ```bash
 nightindex scan --root <path> --label <name> --db <manifest.sqlite> \
@@ -222,6 +237,9 @@ Confidence tiers:
 - `possible`: weaker folder, extension, family, or hash evidence.
 - `manual`: low or conflicting evidence.
 
+These are heuristic folder-match tiers. The `identical` label does not establish byte identity for every file
+in both trees; individual content verification requires separate evidence.
+
 ```bash
 nightindex dossier \
   --left-db <left.sqlite> \
@@ -255,7 +273,8 @@ nightindex extcheck \
 
 ### `archive-member-diff` / `amdiff`
 
-Diff persisted virtual archive-member manifests.
+Diff persisted virtual archive-member manifests derived from archive-like paths, names and inferred families.
+The current scanner does not list the actual entries inside an archive.
 
 ```bash
 nightindex archive-member-diff \
@@ -297,7 +316,7 @@ nightindex archive-member-merge-plan \
 
 ### `archive-recursive-compare` / `arcmp`
 
-Compute recursive virtual archive overlap metrics without extracting archives to disk.
+Compute recursive overlap metrics over the path-derived virtual archive records.
 
 ```bash
 nightindex archive-recursive-compare \
@@ -324,6 +343,8 @@ Report fields include:
 ### `binary-diff-summary` / `bdiff`
 
 Compare two binary files with bounded sampling and compact digest output.
+The command also reads full files for its digest/histogram; sampling limits are not a total I/O cap.
+Its `full_hash` uses FNV-1a64 for comparison and is distinct from the BLAKE3 file-manifest digest.
 
 ```bash
 nightindex binary-diff-summary \
@@ -567,6 +588,7 @@ scripts/bench_archive_compare.sh <left.sqlite> <right.sqlite> <left_label> <righ
 
 ## Status
 
-Nightindex v1 is functionally complete for recovery, compare, merge, and report workflows. The remaining
-work is normal product hardening: more real-world fixtures, stricter lint cleanup, and expanded compatibility
-coverage for uncommon `rsync`/`rclone` flags.
+The current CLI milestone is recorded in [PLAN.md](PLAN.md). Commercial development requires the additional
+catalogue, evidence, verification, interface and delivery work in [ROADMAP.md](ROADMAP.md), alongside existing
+fixture, lint and compatibility hardening. The commercialisation documents are proposals; their acceptance
+cases are not implemented features or passing test results.
